@@ -1,8 +1,15 @@
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 
-from services.persistence_service import PersistencePaths, PersistenceService
+from services.persistence_service import (
+    DEBUG_LOG_PATHS,
+    DEFAULT_CONFIG,
+    PersistencePaths,
+    PersistenceService,
+    should_log_sensitive,
+)
 
 
 class TestLogger:
@@ -23,6 +30,147 @@ class PersistenceServiceTests(unittest.TestCase):
                 logger=TestLogger(),
             )
             self.assertEqual(service.load_config({"model": "medium"}), {"model": "medium"})
+
+    def test_load_config_returns_default_when_corrupted(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Path(tmp_dir) / "config.json"
+            history = Path(tmp_dir) / "history.json"
+            config.write_text("{not valid json", encoding="utf-8")
+            logger = TestLogger()
+            service = PersistenceService(
+                PersistencePaths(str(config), str(history)),
+                logger=logger,
+            )
+            self.assertEqual(service.load_config({"model": "medium"}), {"model": "medium"})
+            self.assertEqual(len(logger.errors), 1)
+
+    def test_clear_all_local_data_removes_history_and_audio(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Path(tmp_dir) / "config.json"
+            history = Path(tmp_dir) / "history.json"
+            audio_dir = Path(tmp_dir) / "audio"
+            audio_dir.mkdir()
+            history.write_text('[{"text":"hello"}]', encoding="utf-8")
+            (audio_dir / "sample.wav").write_text("audio", encoding="utf-8")
+            service = PersistenceService(
+                PersistencePaths(str(config), str(history)),
+                logger=TestLogger(),
+            )
+
+            service.clear_all_local_data(str(audio_dir))
+
+            self.assertFalse(history.exists())
+            self.assertFalse(any(audio_dir.iterdir()))
+
+    def test_save_config_sets_restrictive_file_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Path(tmp_dir) / "config.json"
+            history = Path(tmp_dir) / "history.json"
+            service = PersistenceService(
+                PersistencePaths(str(config), str(history)),
+                logger=TestLogger(),
+            )
+
+            service.save_config({"model": "small", "save_audio": False})
+
+            mode = stat.S_IMODE(config.stat().st_mode)
+            self.assertEqual(mode, 0o600)
+
+    def test_save_history_sets_restrictive_file_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Path(tmp_dir) / "config.json"
+            history = Path(tmp_dir) / "history.json"
+            service = PersistenceService(
+                PersistencePaths(str(config), str(history)),
+                logger=TestLogger(),
+            )
+
+            service.save_history([{"text": "hello"}])
+
+            mode = stat.S_IMODE(history.stat().st_mode)
+            self.assertEqual(mode, 0o600)
+
+    def test_ensure_audio_dir_sets_restrictive_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_dir = Path(tmp_dir) / "audio"
+            service = PersistenceService(
+                PersistencePaths(str(Path(tmp_dir) / "config.json"), str(Path(tmp_dir) / "history.json")),
+                logger=TestLogger(),
+            )
+
+            service.ensure_audio_dir(str(audio_dir))
+
+            mode = stat.S_IMODE(audio_dir.stat().st_mode)
+            self.assertEqual(mode, 0o700)
+
+    def test_clear_debug_log_removes_known_log_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_paths = [
+                Path(tmp_dir) / "murmur.log",
+                Path(tmp_dir) / "murmur_debug.log",
+            ]
+            for path in log_paths:
+                path.write_text("debug", encoding="utf-8")
+
+            service = PersistenceService(
+                PersistencePaths(str(Path(tmp_dir) / "config.json"), str(Path(tmp_dir) / "history.json")),
+                logger=TestLogger(),
+            )
+            original_paths = DEBUG_LOG_PATHS
+            try:
+                import services.persistence_service as persistence_module
+
+                persistence_module.DEBUG_LOG_PATHS = tuple(str(path) for path in log_paths)
+                service.clear_debug_log()
+            finally:
+                persistence_module.DEBUG_LOG_PATHS = original_paths
+
+            for path in log_paths:
+                self.assertFalse(path.exists())
+
+    def test_clear_all_local_data_also_clears_debug_logs(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Path(tmp_dir) / "config.json"
+            history = Path(tmp_dir) / "history.json"
+            audio_dir = Path(tmp_dir) / "audio"
+            audio_dir.mkdir()
+            history.write_text('[{"text":"hello"}]', encoding="utf-8")
+            debug_log = Path(tmp_dir) / "murmur_debug.log"
+            debug_log.write_text("debug", encoding="utf-8")
+            service = PersistenceService(
+                PersistencePaths(str(config), str(history)),
+                logger=TestLogger(),
+            )
+            original_paths = DEBUG_LOG_PATHS
+            try:
+                import services.persistence_service as persistence_module
+
+                persistence_module.DEBUG_LOG_PATHS = (str(debug_log),)
+                service.clear_all_local_data(str(audio_dir))
+            finally:
+                persistence_module.DEBUG_LOG_PATHS = original_paths
+
+            self.assertFalse(history.exists())
+            self.assertFalse(debug_log.exists())
+
+    def test_should_log_sensitive_respects_privacy_defaults(self):
+        self.assertFalse(should_log_sensitive(DEFAULT_CONFIG))
+        self.assertFalse(
+            should_log_sensitive(
+                {"privacy_mode": True, "save_history": True, "save_audio": False}
+            )
+        )
+        self.assertTrue(
+            should_log_sensitive(
+                {"privacy_mode": False, "save_history": True, "save_audio": False}
+            )
+        )
+        self.assertTrue(should_log_sensitive({"save_history": True}))
+
+    def test_default_config_is_privacy_first(self):
+        self.assertFalse(DEFAULT_CONFIG["save_audio"])
+        self.assertFalse(DEFAULT_CONFIG["save_history"])
+        self.assertTrue(DEFAULT_CONFIG["privacy_mode"])
 
     def test_add_history_entry_keeps_latest_100(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

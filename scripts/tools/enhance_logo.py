@@ -32,4 +32,12 @@ def enhance_logo(input_path, output_path):
     print(f"Saved enhanced logo to {output_path}")
 
 if __name__ == "__main__":
-    enhance_logo("logo_transparent.png", "logo_menu.png")
+    import os
+
+    root = os.path.join(os.path.dirname(__file__), "..", "..")
+    logos = os.path.join(root, "assets", "logos")
+    icons = os.path.join(root, "assets", "icons")
+    enhance_logo(
+        os.path.join(logos, "logo_transparent.png"),
+        os.path.join(icons, "logo_menu.png"),
+    )

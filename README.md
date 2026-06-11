@@ -1,128 +1,116 @@
-# 🎤 Murmur
+<p align="center">
+  <img src="assets/logos/logo_rounded.png" alt="Murmur" width="120">
+</p>
 
-A simple, **100% local** speech-to-text app for macOS. Like SuperWhisper, but free!
+<h1 align="center">Murmur</h1>
 
-## Features
+<p align="center">
+  Local speech-to-text for macOS — press a hotkey, speak, text appears at your cursor.
+</p>
 
-- 🎯 **Simple**: Press hotkey → Speak → Text appears where your cursor is
-- 🔒 **100% Local**: All processing on your Mac, nothing sent to the cloud
-- ⚡ **Fast**: Uses OpenAI Whisper optimized for Apple Silicon
-- 📍 **Menu Bar**: Lives in your menu bar next to battery/wifi icons
+<p align="center">
+  <strong>100% on-device</strong> · Whisper · No cloud · Menu bar app
+</p>
 
-## Quick Start
+<br>
 
-### 1. Setup (one time)
+## Download
 
-```bash
-cd murmur
-chmod +x setup.sh run.sh
-./setup.sh
-```
+Get the latest **`.dmg`** from [GitHub Releases](https://github.com/Mbr0/murmur/releases).
 
-### 2. Run
+1. Open the DMG and drag **Murmur** to **Applications**
+2. Launch Murmur from Applications
+3. Grant **Microphone** when prompted
+4. For paste-at-cursor: menu bar → **Enable Shortcut Permission…** → allow **Accessibility**
 
-```bash
-./run.sh
-```
+## How it works
 
-Or manually:
-```bash
-cd murmur
-source venv/bin/activate
-python murmur.py
-```
+| Step | What to do |
+|------|------------|
+| 1 | Click where you want text |
+| 2 | Press **⌥ Space** to start recording |
+| 3 | Speak |
+| 4 | Press **⌥ Space** again to stop |
+| 5 | Text is pasted and copied to the clipboard |
 
-## Usage
+Change the shortcut anytime in **Settings**.
 
-| Action | Shortcut |
-|--------|----------|
-| Start/Stop Recording | `⌘ + ⌥ + Space` |
-| Cancel Recording | `Escape` |
+## Permissions
 
-1. Click where you want to type text
-2. Press `⌘ + ⌥ + Space` to start recording
-3. Speak clearly
-4. Press `⌘ + ⌥ + Space` again to stop
-5. Text is automatically typed and copied to clipboard!
+| Permission | Required for |
+|------------|--------------|
+| **Microphone** | Recording your voice |
+| **Accessibility** | Pasting text at the cursor |
 
-## Menu Bar Icon States
+The global shortcut does **not** require Input Monitoring.
 
-| Icon | State |
-|------|-------|
-| 🎤 | Ready |
-| ⏳ | Loading model / Transcribing |
-| 🔴 | Recording |
-| ❌ | Error |
+## Settings
 
-## Permissions Required
+Open **Settings** from the menu bar:
 
-Go to **System Settings → Privacy & Security** and grant access:
+- Whisper model (`tiny` → `large`)
+- Custom keyboard shortcut
+- Dark / light / system appearance
+- Optional local history and audio retention
+- Delete all local data
 
-1. **Microphone** - To record your voice
-2. **Accessibility** - To type text automatically  
-3. **Input Monitoring** - For global keyboard shortcuts
+## Menu bar
 
-## Configuration
+| State | What you see |
+|-------|----------------|
+| Ready | Waveform icon |
+| Recording | Red indicator |
+| Working | Processing spinner |
 
-Edit `murmur.py` to change:
+## Privacy
 
-```python
-MODEL_SIZE = "base"  # Options: tiny, base, small, medium, large
-```
-
-| Model | Size | Speed | Accuracy |
-|-------|------|-------|----------|
-| tiny | 39 MB | Fastest | Basic |
-| base | 142 MB | Fast | Good |
-| small | 466 MB | Medium | Better |
-| medium | 1.5 GB | Slow | Great |
-| large | 2.9 GB | Slowest | Best |
-
-For Apple Silicon, `base` or `small` works great!
-
-## Language
-
-By default, it's set to English. To auto-detect language or use another:
-
-```python
-# In transcribe() function, change:
-language="en"  # to your language code, or None for auto-detect
-```
+All transcription runs **locally** on your Mac using [OpenAI Whisper](https://github.com/openai/whisper). No audio or text is sent to the cloud. Optional history and audio files are stored only on your machine under `~/.murmur_*`.
 
 ## Troubleshooting
 
-### "Model is still loading..."
-Wait a few seconds on first launch while the model downloads.
+<details>
+<summary><strong>Shortcut not working</strong></summary>
 
-### Hotkey not working
-Grant **Input Monitoring** permission in System Settings.
+Check the shortcut in **Settings** (default: **⌥ Space**). Quit Murmur completely and reopen it after changing the shortcut.
+</details>
 
-### No text typed
-Grant **Accessibility** permission in System Settings.
+<details>
+<summary><strong>Nothing pasted at the cursor</strong></summary>
 
-### No audio recorded
-Grant **Microphone** permission in System Settings.
+Enable **Accessibility** for Murmur: menu bar → **Enable Shortcut Permission…**, then quit and reopen the app.
+</details>
 
-### Slow transcription
-Try `MODEL_SIZE = "tiny"` for faster (but less accurate) results.
+<details>
+<summary><strong>No audio / model loading forever</strong></summary>
 
-## Tech Stack
+Allow **Microphone** access in System Settings. On first launch, Whisper downloads a model — this can take a minute depending on your connection and model size.
+</details>
 
-- **rumps** - macOS menu bar app framework
-- **openai-whisper** - OpenAI's speech recognition model
-- **sounddevice** - Audio recording
-- **pynput** - Global keyboard shortcuts
+<details>
+<summary><strong>Transcription is slow</strong></summary>
+
+Use a smaller model in **Settings** (`tiny` or `base` for speed, `medium` or `large` for accuracy).
+</details>
+
+## Development
+
+Requires macOS and Python 3.12+.
+
+```bash
+git clone https://github.com/Mbr0/murmur.git
+cd murmur
+chmod +x scripts/setup.sh scripts/run.sh
+./scripts/setup.sh
+./scripts/run.sh
+```
+
+Run tests:
+
+```bash
+source venv/bin/activate
+python -m unittest discover -s tests -p "test_*.py"
+```
 
 ## License
 
-MIT - Do whatever you want with it! 🎉
-
-## Local-Private Launch Checklist
-
-- [ ] Runtime checks pass (`/usr/bin/python3 -m unittest discover -s tests -p "test_*.py"`)
-- [ ] App builds and signs locally (`./build_pyinstaller.sh`)
-- [ ] Production signing identity configured for release builds (`CODE_SIGN_IDENTITY`)
-- [ ] Optional notarization flow validated (`NOTARIZE=true` with Apple credentials)
-- [ ] Privacy claims match implementation (local-only processing + local storage)
-- [ ] Legacy migration works (`~/.mywhisper_*` migrates to `~/.murmur_*`)
-- [ ] Murmur page on `canopystudio.eu/murmur` includes download link (when public)
+[MIT](LICENSE)

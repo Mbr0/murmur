@@ -28,7 +28,8 @@ fi
 # Create virtual environment
 echo ""
 echo "📦 Creating virtual environment..."
-cd "$(dirname "$0")"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "${ROOT}"
 python3 -m venv venv
 source venv/bin/activate
 
@@ -50,7 +51,7 @@ echo "Or use: ./run.sh"
 echo ""
 echo "⚠️  First run will download the Whisper model (~140MB for 'base')"
 echo ""
-echo "📋 Grant these permissions in System Preferences → Privacy & Security:"
-echo "   - Microphone access"
-echo "   - Accessibility (for keyboard shortcuts)"
-echo "   - Input Monitoring (for global hotkeys)"
+echo "📋 Grant these permissions in System Settings → Privacy & Security:"
+echo "   - Microphone (recording)"
+echo "   - Accessibility (paste text at cursor)"
+echo "   Global shortcut (⌥ Space) works without extra permissions."

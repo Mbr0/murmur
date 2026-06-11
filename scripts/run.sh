@@ -1,6 +1,7 @@
 #!/bin/bash
 # Run Murmur
 
-cd "$(dirname "$0")"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "${ROOT}"
 source venv/bin/activate
 python murmur.py

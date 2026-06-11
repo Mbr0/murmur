@@ -23,5 +23,12 @@ def make_white_icon(input_path, output_path):
     print(f"Saved white icon to {output_path}")
 
 if __name__ == "__main__":
-    # Use the transparent one as source
-    make_white_icon("logo_transparent.png", "logo_menu_white.png")
+    import os
+
+    root = os.path.join(os.path.dirname(__file__), "..", "..")
+    logos = os.path.join(root, "assets", "logos")
+    icons = os.path.join(root, "assets", "icons")
+    make_white_icon(
+        os.path.join(logos, "logo_transparent.png"),
+        os.path.join(icons, "logo_menu_white.png"),
+    )

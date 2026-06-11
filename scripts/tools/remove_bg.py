@@ -19,4 +19,10 @@ def remove_white_background(input_path, output_path):
     print(f"Saved transparent image to {output_path}")
 
 if __name__ == "__main__":
-    remove_white_background("logo.png", "logo_transparent.png")
+    import os
+
+    logos = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "logos")
+    remove_white_background(
+        os.path.join(logos, "logo.png"),
+        os.path.join(logos, "logo_transparent.png"),
+    )

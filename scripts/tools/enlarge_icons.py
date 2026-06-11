@@ -1,5 +1,29 @@
 from PIL import Image, ImageEnhance
 
+def make_template_menubar_icon(input_path, output_path):
+    """Create a black template icon that adapts to light/dark menu bars."""
+    img = Image.open(input_path).convert("RGBA")
+    datas = img.getdata()
+    new_data = []
+    for r, g, b, a in datas:
+        if a > 0:
+            new_data.append((0, 0, 0, a))
+        else:
+            new_data.append((0, 0, 0, 0))
+    img.putdata(new_data)
+
+    bbox = img.getbbox()
+    if bbox:
+        img = img.crop(bbox)
+
+    img.thumbnail((42, 42), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (44, 44), (0, 0, 0, 0))
+    offset = ((44 - img.width) // 2, (44 - img.height) // 2)
+    canvas.paste(img, offset)
+    canvas.save(output_path, "PNG")
+    print(f"Saved template menu bar icon to {output_path}")
+
+
 def make_large_white_menubar_icon(input_path, output_path):
     """Create a larger white menu bar icon using more of the available space"""
     img = Image.open(input_path)
@@ -77,5 +101,21 @@ def make_high_quality_dock_icon(input_path, output_path, size=512):
     print(f"Saved high-quality dock icon to {output_path}")
 
 if __name__ == "__main__":
-    make_large_white_menubar_icon("logo_transparent.png", "logo_menu_white.png")
-    make_high_quality_dock_icon("logo.png", "logo_dock.png", 512)
+    import os
+
+    root = os.path.join(os.path.dirname(__file__), "..", "..")
+    logos = os.path.join(root, "assets", "logos")
+    icons = os.path.join(root, "assets", "icons")
+    make_template_menubar_icon(
+        os.path.join(logos, "logo_transparent.png"),
+        os.path.join(icons, "logo_menu_template.png"),
+    )
+    make_large_white_menubar_icon(
+        os.path.join(logos, "logo_transparent.png"),
+        os.path.join(icons, "logo_menu_white.png"),
+    )
+    make_high_quality_dock_icon(
+        os.path.join(logos, "logo.png"),
+        os.path.join(logos, "logo_dock.png"),
+        512,
+    )

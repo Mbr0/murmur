@@ -28,22 +28,63 @@ if hasattr(sys, '_MEIPASS'):
     
     subprocess.run = _patched_run
 
+import fcntl
 import rumps
 import sounddevice as sd
 import numpy as np
 import whisper
 import logging
 
-# Setup logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('/tmp/murmur_debug.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+
+def _configure_logging() -> logging.Logger:
+    """Configure production-safe logging (no transcription text in logs)."""
+    is_bundled = hasattr(sys, "_MEIPASS")
+    debug_flag_file = os.path.expanduser("~/.murmur_debug")
+    debug_enabled = (
+        os.environ.get("MURMUR_DEBUG", "").lower() in ("1", "true", "yes")
+        or os.path.isfile(debug_flag_file)
+    )
+    level = logging.DEBUG if debug_enabled else logging.WARNING
+
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if debug_enabled and not is_bundled:
+        handlers.append(logging.FileHandler("/tmp/murmur_debug.log"))
+    else:
+        log_dir = os.path.expanduser("~/Library/Logs/Murmur")
+        try:
+            os.makedirs(log_dir, mode=0o700, exist_ok=True)
+            log_path = os.path.join(log_dir, "murmur.log")
+            handlers.append(logging.FileHandler(log_path))
+        except OSError:
+            pass
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    app_logger = logging.getLogger(__name__)
+
+    for handler in handlers:
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        log_path = handler.baseFilename
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass
+        log_dir = os.path.dirname(log_path)
+        if os.path.isdir(log_dir):
+            try:
+                os.chmod(log_dir, 0o700)
+            except OSError:
+                pass
+
+    return app_logger
+
+
+logger = _configure_logging()
 
 if hasattr(sys, '_MEIPASS'):
     logger.info(f"Added bundled resources to PATH: {sys._MEIPASS}")
@@ -55,12 +96,33 @@ import subprocess
 import scipy.io.wavfile as wav
 import time
 import shutil
+import tempfile
 from transcription_filters import is_likely_hallucination, should_skip_audio
 from services.audio_capture_service import AudioCaptureService
-from services.hotkey_service import register_option_space_hotkey
+from services.hotkey_service import (
+    format_hotkey_from_config,
+    hotkey_diagnostics,
+    hotkey_from_config,
+    hotkey_permissions_ok,
+    is_bundled_app,
+    log_hotkey_diagnostics,
+    open_privacy_settings,
+    permission_status_message,
+    register_global_hotkey,
+    request_hotkey_permissions,
+    reset_accessibility_permission,
+    unregister_global_hotkey,
+)
 from services.model_profile_service import default_model_for_current_machine
-from services.persistence_service import PersistencePaths, PersistenceService
+from services.persistence_service import (
+    DEFAULT_CONFIG,
+    PersistencePaths,
+    PersistenceService,
+    should_log_sensitive,
+)
 from services.text_insertion_service import TextInsertionService
+from services.transcription_service import extract_text, transcribe_audio, transcribe_audio_file
+import ui_alerts
 
 import objc
 import Cocoa
@@ -70,15 +132,17 @@ from Cocoa import (
     NSTextView, NSFont, NSColor, NSBezelBorder, NSViewWidthSizable,
     NSViewHeightSizable, NSFloatingWindowLevel, NSButton,
     NSRoundedBezelStyle, NSMomentaryLightButton, NSCenterTextAlignment,
-    NSApplication
+    NSApplication, NSApplicationActivationPolicyAccessory, NSImage,
 )
 from objc import python_method
 from datetime import datetime
-from Foundation import NSObject
+from Foundation import NSNotificationCenter, NSObject
+from AppKit import NSApplicationDidBecomeActiveNotification, NSOpenPanel, NSWorkspace
 from PyObjCTools import AppHelper
 # Settings
 SAMPLE_RATE = 16000
 APP_NAME = "Murmur"
+APP_VERSION = "1.0.0"
 
 # Config file for settings
 CONFIG_FILE = os.path.expanduser("~/.murmur_config.json")
@@ -91,6 +155,9 @@ LEGACY_HISTORY_FILE = os.path.expanduser("~/.mywhisper_history.json")
 LEGACY_AUDIO_DIR = os.path.expanduser("~/.mywhisper_audio")
 PERSISTENCE_PATHS = PersistencePaths(config_file=CONFIG_FILE, history_file=HISTORY_FILE)
 PERSISTENCE = PersistenceService(paths=PERSISTENCE_PATHS, logger=logger)
+APP_INSTANCE = None
+# `python murmur.py` runs as __main__; window modules look up APP_INSTANCE via "murmur".
+sys.modules.setdefault("murmur", sys.modules[__name__])
 
 
 def migrate_legacy_data():
@@ -115,13 +182,11 @@ def migrate_legacy_data():
 
 migrate_legacy_data()
 
-# Ensure audio directory exists
-os.makedirs(AUDIO_DIR, exist_ok=True)
-
 # Load model from config
 default_model = default_model_for_current_machine()
-_config = PERSISTENCE.load_config(default={"model": default_model})
+_config = PERSISTENCE.load_config(default={"model": default_model, **DEFAULT_CONFIG})
 MODEL_SIZE = _config.get("model", default_model)
+PERSISTENCE.ensure_audio_dir(AUDIO_DIR)
 
 # Get resource path (works for both dev and PyInstaller bundle)
 def resource_path(relative_path):
@@ -137,29 +202,41 @@ _window_controllers = []
 _history_module = None
 _settings_module = None
 
+def _load_window_module(module_name, script_path):
+    """Load a window module once; PyObjC classes cannot be safely reloaded."""
+    import importlib.util
+
+    cached = sys.modules.get(module_name)
+    if cached is not None:
+        return cached
+
+    spec = importlib.util.spec_from_file_location(module_name, script_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    logger.info(f"{module_name} module loaded")
+    return module
+
+
 def _get_history_module():
-    """Get the history module, loading it once"""
+    """Load the history window module."""
     global _history_module
-    if _history_module is None:
-        script_path = resource_path("history_window.py")
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("history_window", script_path)
-        _history_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_history_module)
-        logger.info("History module loaded")
+    script_path = resource_path("history_window.py")
+    _history_module = _load_window_module("history_window", script_path)
     return _history_module
 
+
 def _get_settings_module():
-    """Get the settings module, loading it once"""
+    """Load the settings window module."""
     global _settings_module
-    if _settings_module is None:
-        script_path = resource_path("settings_window.py")
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("settings_window", script_path)
-        _settings_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_settings_module)
-        logger.info("Settings module loaded")
+    script_path = resource_path("settings_window.py")
+    _settings_module = _load_window_module("settings_window", script_path)
     return _settings_module
+
 
 def _cleanup_window_controllers():
     """Remove closed windows from the list"""
@@ -173,23 +250,45 @@ def _cleanup_window_controllers():
             logger.warning(f"Failed to validate window controller: {error}")
     _window_controllers = valid_controllers
 
+def _reload_ui_theme():
+    """Pick up theme changes without restarting the whole app."""
+    import importlib
+
+    if "ui_theme" in sys.modules:
+        importlib.reload(sys.modules["ui_theme"])
+    import ui_theme
+    config = PERSISTENCE.load_config(default={"model": default_model, **DEFAULT_CONFIG})
+    ui_theme.set_appearance_mode(config.get("appearance_mode", "system"))
+    logger.info(
+        f"UI theme {ui_theme.THEME_VERSION} ({ui_theme.appearance_mode()}) "
+        f"from {getattr(ui_theme, '__file__', 'unknown')}"
+    )
+
+
+def _close_window_controllers(class_name):
+    """Close and drop cached controllers so windows are rebuilt with current theme."""
+    global _window_controllers
+    remaining = []
+    for controller in _window_controllers:
+        if controller.__class__.__name__ == class_name:
+            try:
+                if hasattr(controller, "window") and controller.window is not None:
+                    controller.window.close()
+            except Exception as error:
+                logger.warning(f"Failed to close {class_name}: {error}")
+            continue
+        remaining.append(controller)
+    _window_controllers = remaining
+
+
 def show_history_window_direct():
     """Show history window directly in the same process"""
     global _window_controllers
     logger.info("show_history_window_direct called")
+    _reload_ui_theme()
     
     _cleanup_window_controllers()
-    
-    # Check if we already have an open history window and bring it to front
-    for controller in _window_controllers:
-        try:
-            if controller.__class__.__name__ == 'HistoryWindowController':
-                logger.info("Found existing history window, bringing to front")
-                controller.window.makeKeyAndOrderFront_(None)
-                NSApp.activateIgnoringOtherApps_(True)
-                return
-        except Exception as e:
-            logger.error(f"Error checking existing window: {e}")
+    _close_window_controllers("HistoryWindowController")
     
     # Create new window
     try:
@@ -206,19 +305,10 @@ def show_settings_window_direct():
     """Show settings window directly in the same process"""
     global _window_controllers
     logger.info("show_settings_window_direct called")
+    _reload_ui_theme()
     
     _cleanup_window_controllers()
-    
-    # Check if we already have an open settings window and bring it to front
-    for controller in _window_controllers:
-        try:
-            if controller.__class__.__name__ == 'SettingsWindowController':
-                logger.info("Found existing settings window, bringing to front")
-                controller.window.makeKeyAndOrderFront_(None)
-                NSApp.activateIgnoringOtherApps_(True)
-                return
-        except Exception as e:
-            logger.error(f"Error checking existing window: {e}")
+    _close_window_controllers("SettingsWindowController")
     
     # Create new window
     try:
@@ -231,25 +321,108 @@ def show_settings_window_direct():
         logger.error(f"Error creating settings window: {e}")
         raise
 
-# Custom menu bar icon
-ICON_PATH = resource_path("logo_menu_white.png")
-DOCK_ICON_PATH = resource_path("logo_rounded.png")  # Rounded logo for dock
-ICON_RECORDING = resource_path("icon_recording.png")
-ICON_PROCESSING = resource_path("icon_processing.png")
-ICON_ERROR = resource_path("icon_error.png")
+ICON_PATH = resource_path("assets/icons/logo_menu_template.png")
+ICON_RECORDING = resource_path("assets/icons/icon_recording.png")
+ICON_PROCESSING = resource_path("assets/icons/icon_processing.png")
+STATE_ICON_PATHS = {
+    "ready": ICON_PATH,
+    "recording": ICON_RECORDING,
+    "processing": ICON_PROCESSING,
+}
+_MENU_BAR_IMAGES = {}
+_INSTANCE_LOCK = None
+BUNDLE_ID = "com.canopystudio.murmur"
+
+
+class _HotkeyActivationObserver(NSObject):
+    """Re-register the shortcut when Murmur becomes active after permission grants."""
+
+    def initWithCallback_(self, callback):
+        self = objc.super(_HotkeyActivationObserver, self).init()
+        if self is None:
+            return None
+        self._callback = callback
+        NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            self,
+            "applicationDidBecomeActive:",
+            NSApplicationDidBecomeActiveNotification,
+            None,
+        )
+        return self
+
+    def applicationDidBecomeActive_(self, _notification):
+        self._callback()
+
+
+def _menu_bar_image(path):
+    """Load and cache a menu bar NSImage."""
+    cached = _MENU_BAR_IMAGES.get(path)
+    if cached is not None:
+        return cached
+
+    image = NSImage.alloc().initByReferencingFile_(os.path.abspath(path))
+    image.setScalesWhenResized_(True)
+    image.setSize_((20, 20))
+    if path == ICON_PATH:
+        image.setTemplate_(True)
+    _MENU_BAR_IMAGES[path] = image
+    return image
+
+
+def _activate_existing_instance():
+    """Bring an already-running Murmur to the foreground."""
+    try:
+        activate_opts = 1 << 1  # NSApplicationActivateIgnoringOtherApps
+        for app in NSWorkspace.sharedWorkspace().runningApplications():
+            bundle_id = app.bundleIdentifier() or ""
+            name = app.localizedName() or ""
+            if app.processIdentifier() == os.getpid():
+                continue
+            if bundle_id == BUNDLE_ID or name == APP_NAME:
+                app.activateWithOptions_(activate_opts)
+                return
+    except Exception:
+        pass
+
+
+def ensure_single_instance():
+    """Prevent duplicate menu bar icons from multiple Murmur processes."""
+    global _INSTANCE_LOCK
+
+    support_dir = os.path.expanduser("~/Library/Application Support/Murmur")
+    os.makedirs(support_dir, mode=0o700, exist_ok=True)
+    lock_path = os.path.join(support_dir, "murmur.lock")
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        lock_file.close()
+        _activate_existing_instance()
+        try:
+            rumps.notification(APP_NAME, "Already running", "Murmur is already in your menu bar.")
+        except Exception:
+            pass
+        sys.exit(0)
+
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    _INSTANCE_LOCK = lock_file
 
 
 class MurmurApp(rumps.App):
     def __init__(self):
+        global APP_INSTANCE
+        APP_INSTANCE = self
         super(MurmurApp, self).__init__(APP_NAME, icon=ICON_PATH, quit_button=None)
+        self.template = True
         self.title = None
         
         # State
         self.is_recording = False
+        self.persistence = PERSISTENCE
         self.history = self.load_history()
         self.audio_capture = AudioCaptureService(sample_rate=SAMPLE_RATE, logger=logger)
         self.model = None
-        self.persistence = PERSISTENCE
         self.text_inserter = TextInsertionService(logger=logger)
         
         # Menu items - SuperWhisper style
@@ -259,6 +432,10 @@ class MurmurApp(rumps.App):
         self.settings_item = rumps.MenuItem("Settings", callback=self.open_settings)
         
         logger.info("Menu items created with callbacks")
+        if hasattr(sys, "_MEIPASS"):
+            logger.info(f"Murmur running from bundle: {sys._MEIPASS}")
+        else:
+            logger.info(f"Murmur running from source: {os.path.dirname(os.path.abspath(__file__))}")
         
         # Microphone submenu
         self.mic_menu = rumps.MenuItem("Microphone")
@@ -271,8 +448,10 @@ class MurmurApp(rumps.App):
             self.settings_item,
             self.mic_menu,
             None,  # Separator
-            rumps.MenuItem(f"Version {MODEL_SIZE}", callback=None),
+            rumps.MenuItem(f"Model: {MODEL_SIZE.capitalize()}", callback=None),
+            rumps.MenuItem(f"Murmur {APP_VERSION}", callback=None),
             rumps.MenuItem("Check for Updates...", callback=self.check_updates),
+            rumps.MenuItem("Enable Shortcut Permission...", callback=self.enable_shortcut_permission),
             None,
             rumps.MenuItem("Quit", callback=self.quit_app, key="q"),
         ]
@@ -281,12 +460,32 @@ class MurmurApp(rumps.App):
         self.loading = True
         threading.Thread(target=self.load_model, daemon=True).start()
         
-        # Setup keyboard listener
-        self.setup_keyboard_listener()
+        # Register global shortcut after the run loop is active.
+        self._hotkey_registration = None
+        self._hotkey_retry_timer = None
+        self._hotkey_permission_notified = False
+        self._hotkey_activation_observer = _HotkeyActivationObserver.alloc().initWithCallback_(
+            self._on_application_active
+        )
+        self._hotkey_startup_timer = rumps.Timer(self._register_hotkey, 0.3)
+        self._hotkey_startup_timer.start()
 
-        # Set Dock Icon
-        self.set_dock_icon()
-    
+    def _apply_menu_bar_state(self, state):
+        """Update the existing NSStatusItem image directly (avoids rumps icon swap bugs)."""
+        path = STATE_ICON_PATHS.get(state, ICON_PATH)
+        image = _menu_bar_image(path)
+        self.title = None
+        self._icon = path
+        self._icon_nsimage = image
+        nsapp = getattr(self, "_nsapp", None)
+        if nsapp is not None:
+            nsapp.nsstatusitem.setImage_(image)
+            nsapp.fallbackOnName()
+
+    def _set_menu_bar_state(self, state):
+        """Update the lone menu bar status icon (ready/recording/processing)."""
+        self.run_on_main_thread(lambda: self._apply_menu_bar_state(state))
+
     def update_microphone_menu(self):
         """Update the microphone selection submenu"""
         # Clear existing items
@@ -323,21 +522,25 @@ class MurmurApp(rumps.App):
         """Open settings window"""
         try:
             show_settings_window_direct()
-        except Exception as e:
-            logger.error(f"Could not open settings: {e}")
+        except Exception:
+            logger.error("Could not open settings", exc_info=True)
+            ui_alerts.show_alert(APP_NAME, "Could not open Settings.")
     
+    def open_history_window(self, _, selected_index=0):
+        """Open the SuperWhisper-style history window"""
+        try:
+            show_history_window_direct()
+        except Exception:
+            logger.error("Could not open history", exc_info=True)
+            ui_alerts.show_alert(APP_NAME, "Could not open History.")
+
     def check_updates(self, _):
         """Check for updates (placeholder)"""
-        rumps.alert(APP_NAME, "You're running the latest version!")
-    
-    def set_dock_icon(self):
-        """Set the application dock icon"""
-        try:
-            if os.path.exists(DOCK_ICON_PATH):
-                image = Cocoa.NSImage.alloc().initByReferencingFile_(os.path.abspath(DOCK_ICON_PATH))
-                Cocoa.NSApplication.sharedApplication().setApplicationIconImage_(image)
-        except Exception as e:
-            print(f"Failed to set dock icon: {e}")
+        ui_alerts.show_alert(
+            APP_NAME,
+            f"You're on Murmur {APP_VERSION}.\n"
+            "Release downloads will appear at canopystudio.eu/murmur when available.",
+        )
     
     def run_on_main_thread(self, func):
         """Run a function on the main thread - required for UI updates from background threads"""
@@ -350,6 +553,11 @@ class MurmurApp(rumps.App):
     def load_history(self):
         """Load transcription history from file"""
         return self.persistence.load_history()
+
+    def runtime_config(self):
+        """Load current config from disk (includes privacy retention settings)."""
+        default = {"model": default_model_for_current_machine(), **DEFAULT_CONFIG}
+        return self.persistence.load_config(default)
     
     def save_history(self):
         """Save transcription history to file"""
@@ -357,6 +565,8 @@ class MurmurApp(rumps.App):
     
     def add_to_history(self, text, source_type, filename=None, audio_path=None):
         """Add a transcription to history"""
+        if not self.runtime_config().get("save_history", DEFAULT_CONFIG["save_history"]):
+            return
         self.history = self.persistence.add_history_entry(
             self.history,
             text=text,
@@ -370,38 +580,153 @@ class MurmurApp(rumps.App):
         """Load Whisper model"""
         logger.info(f"Loading model: {MODEL_SIZE}")
         self.update_status("Loading model...")
-        self.run_on_main_thread(lambda: setattr(self, 'icon', ICON_PROCESSING))
-        self.run_on_main_thread(lambda: setattr(self, 'title', None))
+        self._set_menu_bar_state("processing")
         try:
             self.model = whisper.load_model(MODEL_SIZE)
             self.loading = False
             logger.info("Model loaded successfully")
-            self.update_status("Ready (⌥Space to record)")
-            self.run_on_main_thread(lambda: setattr(self, 'icon', ICON_PATH))
-            self.run_on_main_thread(lambda: setattr(self, 'title', None))
+            self.update_status(f"Ready ({format_hotkey_from_config(self.runtime_config())} to record)")
+            self._set_menu_bar_state("ready")
             # Model loaded silently - no notification needed
         except Exception as e:
             logger.error(f"Failed to load model: {e}", exc_info=True)
             self.update_status(f"Error: {str(e)[:30]}")
-            self.run_on_main_thread(lambda: setattr(self, 'icon', ICON_ERROR))
-            self.run_on_main_thread(lambda: setattr(self, 'title', None))
+            self._set_menu_bar_state("ready")
     
-    def setup_keyboard_listener(self):
-        """Setup global keyboard shortcut using CGEventTap (native macOS)"""
+    def enable_shortcut_permission(self, _):
+        """Prompt for and explain the macOS permissions required for the shortcut."""
+        diagnostics = hotkey_diagnostics()
+        if is_bundled_app() and diagnostics.get("signature") == "adhoc":
+            reset_accessibility_permission()
+            logger.warning("Reset Accessibility TCC for ad-hoc Murmur install")
+        request_hotkey_permissions(logger, prompt=True)
+        open_privacy_settings()
+        ui_alerts.show_alert(
+            APP_NAME,
+            permission_status_message(diagnostics=diagnostics),
+        )
+        self.reload_hotkey(prompt=False)
+
+    def _on_application_active(self):
+        """Pick up Accessibility grants as soon as the user returns to Murmur."""
+        if hotkey_permissions_ok() and self._hotkey_registration is None:
+            self.reload_hotkey(prompt=False)
+
+    def _schedule_hotkey_retry(self):
+        if self._hotkey_retry_timer is not None:
+            return
+        self._hotkey_retry_timer = rumps.Timer(self._retry_hotkey_if_needed, 1)
+        self._hotkey_retry_timer.start()
+
+    def _stop_hotkey_retry(self):
+        if self._hotkey_retry_timer is None:
+            return
+        self._hotkey_retry_timer.stop()
+        self._hotkey_retry_timer = None
+
+    def _retry_hotkey_if_needed(self, _sender=None):
+        if self._hotkey_registration is not None:
+            self._stop_hotkey_retry()
+            return
+        self.reload_hotkey(prompt=False)
+
+    def _register_hotkey(self, _sender=None):
+        """Register the configured global shortcut once the run loop is active."""
+        if getattr(self, "_hotkey_startup_timer", None) is not None:
+            self._hotkey_startup_timer.stop()
+            self._hotkey_startup_timer = None
+        self.reload_hotkey(prompt=True)
+
+    def reload_hotkey(self, *, prompt: bool = False):
+        """Apply the shortcut from settings, replacing any previous registration."""
+        binding = hotkey_from_config(self.runtime_config())
+        unregister_global_hotkey(self._hotkey_registration)
+        self._hotkey_registration = None
+
         def trigger_toggle():
-            threading.Timer(0.05, self._safe_toggle).start()
+            self.run_on_main_thread(self._safe_toggle)
 
         def handle_error(error):
             logger.error(f"Hotkey callback error: {error}")
 
+        # 1. Try to register the hotkey (Carbon will succeed without Accessibility)
         try:
-            self.event_tap = register_option_space_hotkey(
+            self._hotkey_registration = register_global_hotkey(
+                binding,
                 on_trigger=trigger_toggle,
                 on_error=handle_error,
                 logger=logger,
             )
+            self._stop_hotkey_retry()
+            self._hotkey_permission_notified = False
+            if is_bundled_app():
+                log_hotkey_diagnostics(
+                    logger,
+                    event=(
+                        "Shortcut active: "
+                        f"{format_hotkey_from_config(self.runtime_config())}"
+                    ),
+                )
+            else:
+                logger.info(
+                    "Shortcut active: %s",
+                    format_hotkey_from_config(self.runtime_config()),
+                )
+            return
+        except Exception as error:
+            # If registration failed (e.g., Carbon failed and NSEvent fallback failed),
+            # check Accessibility permissions
+            logger.warning("Direct hotkey registration failed: %s", error)
+
+        # 2. Handle Accessibility permissions if fallback is needed
+        request_hotkey_permissions(logger, prompt=prompt)
+        if not hotkey_permissions_ok():
+            logger.warning(
+                "Deferring hotkey registration for %s until Accessibility is granted",
+                format_hotkey(binding),
+            )
+            self._schedule_hotkey_retry()
+            if not self._hotkey_permission_notified:
+                self._hotkey_permission_notified = True
+                rumps.notification(
+                    APP_NAME,
+                    "Shortcut permission needed",
+                    "Enable Accessibility for Murmur.app, then return to Murmur.",
+                )
+            return
+
+        # Try registering again after prompting/checking Accessibility
+        try:
+            self._hotkey_registration = register_global_hotkey(
+                binding,
+                on_trigger=trigger_toggle,
+                on_error=handle_error,
+                logger=logger,
+            )
+            self._stop_hotkey_retry()
+            self._hotkey_permission_notified = False
         except Exception as error:
             logger.error(str(error))
+            if is_bundled_app():
+                log_hotkey_diagnostics(logger, event="Shortcut registration failed")
+            self._schedule_hotkey_retry()
+            if not self._hotkey_permission_notified:
+                self._hotkey_permission_notified = True
+                message = (
+                    "Enable Accessibility for the current Murmur.app, then quit and reopen."
+                )
+                if is_bundled_app():
+                    diagnostics = hotkey_diagnostics()
+                    if diagnostics.get("signature") == "adhoc":
+                        message = (
+                            "This DMG build needs a fresh Accessibility grant. "
+                            "Use Enable Shortcut Permission…, allow access, quit, and reopen."
+                        )
+                rumps.notification(
+                    APP_NAME,
+                    "Shortcut unavailable",
+                    message,
+                )
     
     def _safe_toggle(self):
         """Toggle recording safely"""
@@ -438,9 +763,8 @@ class MurmurApp(rumps.App):
         logger.info("start_recording called")
         self.is_recording = True
         self.recording_start_time = time.time()  # Track when recording started
-        self.icon = ICON_RECORDING
-        self.title = None
-        self.start_stop_item.title = "⏹ Stop Recording"
+        self._set_menu_bar_state("recording")
+        self.start_stop_item.title = "Stop Recording"
         self.upload_item.set_callback(None)  # Disable transcribe file
 
         try:
@@ -449,8 +773,7 @@ class MurmurApp(rumps.App):
             logger.info("Audio stream started successfully")
         except Exception as e:
             logger.error(f"Mic error: {e}")
-            self.icon = ICON_ERROR
-            self.title = None
+            self._set_menu_bar_state("ready")
             self.update_status(f"Mic error: {str(e)[:20]}")
             self.is_recording = False
     
@@ -465,9 +788,8 @@ class MurmurApp(rumps.App):
         logger.info(f"Recording duration: {recording_duration:.2f} seconds")
         
         self.is_recording = False
-        self.icon = ICON_PROCESSING
-        self.title = None  # Icon only during processing
-        self.start_stop_item.title = "⏳ Processing..."
+        self._set_menu_bar_state("processing")
+        self.start_stop_item.title = "Processing..."
         self.start_stop_item.set_callback(None)  # Disable while processing
 
         self.audio_capture.stop()
@@ -482,8 +804,6 @@ class MurmurApp(rumps.App):
         logger.info(f"transcribe called with {len(audio_chunks)} audio chunks")
         if not audio_chunks:
             logger.warning("No audio data to transcribe")
-            self.run_on_main_thread(lambda: setattr(self, 'icon', ICON_PATH))
-            self.run_on_main_thread(lambda: setattr(self, 'title', None))
             self.update_status("No audio recorded")
             self._reset_menu_state()
             return
@@ -505,30 +825,31 @@ class MurmurApp(rumps.App):
                     logger.warning(f"Audio too short ({duration_seconds:.2f}s), skipping transcription")
                 else:
                     logger.warning(f"Audio too quiet (max level: {max_level:.6f}), skipping transcription")
-                self.run_on_main_thread(lambda: setattr(self, 'icon', ICON_PATH))
-                self.run_on_main_thread(lambda: setattr(self, 'title', None))
                 self._reset_menu_state()
                 return
 
-            # Save audio file permanently
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            audio_filename = f"recording_{timestamp}.wav"
-            audio_path = os.path.join(AUDIO_DIR, audio_filename)
+            config = self.runtime_config()
+            save_audio = config.get("save_audio", DEFAULT_CONFIG["save_audio"])
+            cleanup_audio = not save_audio
+            if save_audio:
+                self.persistence.ensure_audio_dir(AUDIO_DIR)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                audio_filename = f"recording_{timestamp}.wav"
+                audio_path = os.path.join(AUDIO_DIR, audio_filename)
+            else:
+                fd, audio_path = tempfile.mkstemp(suffix=".wav")
+                os.close(fd)
+
             wav.write(audio_path, SAMPLE_RATE, (audio * 32767).astype(np.int16))
-            logger.info(f"Audio saved to {audio_path}")
+            if should_log_sensitive(config):
+                logger.info(f"Audio saved to {audio_path}")
             
             # Transcribe with better parameters
             logger.info("Starting transcription...")
-            result = self.model.transcribe(
-                audio_path,
-                fp16=False,
-                language=None,  # Auto-detect language
-                condition_on_previous_text=False,  # Don't use previous context (prevents hallucinations)
-                no_speech_threshold=0.6,  # Higher threshold to filter out no-speech segments
-            )
-            
-            text = result["text"].strip()
-            logger.info(f"Transcription result: {text[:100] if text else 'empty'}")
+            result = transcribe_audio(self.model, audio_path)
+            text = extract_text(result)
+            if should_log_sensitive(config):
+                logger.info("Transcription completed")
             
             # Filter out common hallucinations that occur with silence/noise
             is_hallucination = is_likely_hallucination(text)
@@ -542,34 +863,39 @@ class MurmurApp(rumps.App):
                 self.type_text(text)
                 
                 # Transcription complete - text is pasted, no notification needed
-                logger.info(f"Transcribed and pasted: {text[:50]}...")
+                logger.info("Transcribed and pasted")
                 
-                # Save to history with audio path
-                self.add_to_history(text, "live", audio_path=audio_path)
+                # Save to history with audio path when retention is enabled
+                history_audio_path = audio_path if save_audio else None
+                self.add_to_history(text, "live", audio_path=history_audio_path)
             else:
                 if is_hallucination:
-                    logger.info(f"Filtered hallucination: '{text}'")
+                    logger.info("Filtered hallucination")
+                    history_text = f"(Filtered) {text[:120]}"
                 else:
                     logger.info("No speech detected")
-                # Delete audio if no speech detected or hallucination
-                if os.path.exists(audio_path):
+                    history_text = "(No speech detected)"
+                history_audio_path = audio_path if save_audio else None
+                self.add_to_history(history_text, "live", audio_path=history_audio_path)
+                if os.path.exists(audio_path) and not save_audio:
                     os.unlink(audio_path)
+                    cleanup_audio = False
+            
+            if cleanup_audio and os.path.exists(audio_path):
+                os.unlink(audio_path)
             
             # Re-enable menu items
             self._reset_menu_state()
             
         except Exception as e:
             logger.error(f"Transcription error: {e}", exc_info=True)
-            self.run_on_main_thread(lambda: setattr(self, 'icon', ICON_ERROR))
-            self.run_on_main_thread(lambda: setattr(self, 'title', None))
             self._reset_menu_state()
             self.update_status(f"Error: {str(e)[:30]}")
     
     def _reset_menu_state(self):
         """Reset menu items to normal state - must be called on main thread"""
         def do_reset():
-            self.title = None
-            self.icon = ICON_PATH
+            self._apply_menu_bar_state("ready")
             self.start_stop_item.title = "Start/Stop Recording"
             self.start_stop_item.set_callback(self.toggle_recording)
             self.upload_item.set_callback(self.upload_audio_file)
@@ -590,54 +916,57 @@ class MurmurApp(rumps.App):
         if self.is_recording:
             return
         
-        # Use AppleScript to open native file picker (without activate to avoid app focus issues)
-        script = '''
-        set theFile to choose file with prompt "Select an audio file to transcribe:" of type {"public.audio", "mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac"}
-        return POSIX path of theFile
-        '''
-        
         try:
-            result = subprocess.run(
-                ['osascript', '-e', script],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-            
-            if result.returncode == 0 and result.stdout.strip():
-                file_path = result.stdout.strip()
-                self.icon = ICON_PROCESSING
-                self.title = None  # Icon only during processing
-                self.start_stop_item.title = "⏳ Processing..."
-                self.start_stop_item.set_callback(None)
-                self.upload_item.set_callback(None)
-                self.update_status(f"Transcribing file...")
-                logger.info(f"Processing file: {file_path}")
-                threading.Thread(target=self.transcribe_file, args=(file_path,), daemon=True).start()
-        except subprocess.TimeoutExpired:
-            pass  # User cancelled
-        except Exception as e:
-            self.update_status(f"File error: {str(e)[:20]}")
+            file_path = self._pick_audio_file_path()
+            if not file_path:
+                return
+
+            self._set_menu_bar_state("processing")
+            self.start_stop_item.title = "Processing..."
+            self.start_stop_item.set_callback(None)
+            self.upload_item.set_callback(None)
+            self.update_status("Transcribing file...")
+            logger.info(f"Processing file: {file_path}")
+            threading.Thread(target=self.transcribe_file, args=(file_path,), daemon=True).start()
+        except Exception:
+            logger.error("File picker failed", exc_info=True)
+            self.update_status("File error")
+
+    def _pick_audio_file_path(self):
+        """Show native NSOpenPanel file picker; return POSIX path or None if cancelled."""
+        panel = NSOpenPanel.openPanel()
+        panel.setTitle_("Select an audio file to transcribe")
+        panel.setPrompt_("Open")
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(False)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setAllowedFileTypes_([
+            "mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac",
+            "aac", "aiff", "caf", "m4b",
+        ])
+        if panel.runModal() != 1:
+            return None
+        urls = panel.URLs()
+        if not urls:
+            return None
+        return urls[0].path()
     
     def transcribe_file(self, file_path):
         """Transcribe an audio file - runs in background thread"""
         try:
-            # Copy audio file to our storage directory
-            import shutil
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            original_ext = os.path.splitext(file_path)[1] or '.wav'
-            audio_filename = f"file_{timestamp}{original_ext}"
-            audio_path = os.path.join(AUDIO_DIR, audio_filename)
-            shutil.copy2(file_path, audio_path)
+            config = self.runtime_config()
+            save_audio = config.get("save_audio", DEFAULT_CONFIG["save_audio"])
+            audio_path = None
+            if save_audio:
+                self.persistence.ensure_audio_dir(AUDIO_DIR)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                original_ext = os.path.splitext(file_path)[1] or '.wav'
+                audio_filename = f"file_{timestamp}{original_ext}"
+                audio_path = os.path.join(AUDIO_DIR, audio_filename)
+                shutil.copy2(file_path, audio_path)
             
-            # Transcribe directly with Whisper
-            result = self.model.transcribe(
-                file_path,
-                fp16=False,
-                language=None  # Auto-detect language
-            )
-            
-            text = result["text"].strip()
+            result = transcribe_audio_file(self.model, file_path)
+            text = extract_text(result)
             
             if text:
                 # Copy to clipboard
@@ -646,8 +975,13 @@ class MurmurApp(rumps.App):
                 # Show result length info
                 word_count = len(text.split())
                 
-                # Save to history with audio path
-                self.add_to_history(text, "file", os.path.basename(file_path), audio_path=audio_path)
+                # Save to history with audio path when retention is enabled
+                self.add_to_history(
+                    text,
+                    "file",
+                    os.path.basename(file_path),
+                    audio_path=audio_path if save_audio else None,
+                )
                 
                 # Update UI on main thread
                 self._reset_menu_state()
@@ -663,16 +997,7 @@ class MurmurApp(rumps.App):
         except Exception as e:
             error_msg = str(e)
             logger.error(f"File transcription error: {error_msg}")
-            self.run_on_main_thread(lambda: setattr(self, 'icon', ICON_ERROR))
-            self.run_on_main_thread(lambda: setattr(self, 'title', None))
             self._reset_menu_state()
-    
-    def open_history_window(self, _, selected_index=0):
-        """Open the SuperWhisper-style history window"""
-        try:
-            show_history_window_direct()
-        except Exception as e:
-            logger.error(f"Could not open history: {e}")
     
     def show_history_item(self, index):
         """Show a history item - opens the history window"""
@@ -685,13 +1010,12 @@ class MurmurApp(rumps.App):
     
     def clear_history(self, _):
         """Clear all history"""
-        response = rumps.alert(
-            title="Clear History",
-            message="Are you sure you want to clear all transcription history?",
+        if ui_alerts.show_confirm(
+            "Clear History",
+            "Are you sure you want to clear all transcription history?",
             ok="Clear",
-            cancel="Cancel"
-        )
-        if response == 1:  # OK clicked
+            cancel="Cancel",
+        ):
             self.history = []
             self.save_history()
             self.update_history_menu()
@@ -709,4 +1033,7 @@ class MurmurApp(rumps.App):
 
 
 if __name__ == "__main__":
+    ensure_single_instance()
+    ns_app = NSApplication.sharedApplication()
+    ns_app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     MurmurApp().run()
