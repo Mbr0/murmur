@@ -100,6 +100,7 @@ import tempfile
 from transcription_filters import is_likely_hallucination, should_skip_audio
 from services.audio_capture_service import AudioCaptureService
 from services.hotkey_service import (
+    format_hotkey,
     format_hotkey_from_config,
     hotkey_diagnostics,
     hotkey_from_config,
@@ -324,14 +325,34 @@ def show_settings_window_direct():
 ICON_PATH = resource_path("assets/icons/logo_menu_template.png")
 ICON_RECORDING = resource_path("assets/icons/icon_recording.png")
 ICON_PROCESSING = resource_path("assets/icons/icon_processing.png")
+ICON_ERROR = resource_path("assets/icons/icon_error.png")
 STATE_ICON_PATHS = {
     "ready": ICON_PATH,
     "recording": ICON_RECORDING,
     "processing": ICON_PROCESSING,
 }
+if os.path.exists(ICON_ERROR):
+    STATE_ICON_PATHS["error"] = ICON_ERROR
 _MENU_BAR_IMAGES = {}
 _INSTANCE_LOCK = None
 BUNDLE_ID = "com.canopystudio.murmur"
+
+
+def should_reject_toggle(*, loading: bool, is_processing: bool, model_ready: bool) -> bool:
+    """Whether hotkey/menu toggle must be ignored."""
+    return loading or is_processing or not model_ready
+
+
+def should_reject_upload(
+    *, loading: bool, is_recording: bool, is_processing: bool, model_ready: bool
+) -> bool:
+    """Whether file upload/transcribe must be ignored."""
+    return loading or is_recording or is_processing or not model_ready
+
+
+def should_apply_ready_on_reset(*, is_recording: bool) -> bool:
+    """Whether menu reset may force the ready/idle UI state."""
+    return not is_recording
 
 
 class _HotkeyActivationObserver(NSObject):
@@ -419,6 +440,8 @@ class MurmurApp(rumps.App):
         
         # State
         self.is_recording = False
+        self.is_processing = False
+        self._whisper_lock = threading.Lock()
         self.persistence = PERSISTENCE
         self.history = self.load_history()
         self.audio_capture = AudioCaptureService(sample_rate=SAMPLE_RATE, logger=logger)
@@ -590,9 +613,23 @@ class MurmurApp(rumps.App):
             # Model loaded silently - no notification needed
         except Exception as e:
             logger.error(f"Failed to load model: {e}", exc_info=True)
+            self.loading = False
             self.update_status(f"Error: {str(e)[:30]}")
-            self._set_menu_bar_state("ready")
+            error_state = "error" if "error" in STATE_ICON_PATHS else "ready"
+            self._set_menu_bar_state(error_state)
+            rumps.notification(
+                APP_NAME,
+                "Model failed to load",
+                "Recording is unavailable until the model loads successfully.",
+            )
+            self.run_on_main_thread(
+                lambda: ui_alerts.show_alert(
+                    APP_NAME,
+                    f"Could not load the speech model.\n\n{e}",
+                )
+            )
     
+
     def enable_shortcut_permission(self, _):
         """Prompt for and explain the macOS permissions required for the shortcut."""
         diagnostics = hotkey_diagnostics()
@@ -745,10 +782,30 @@ class MurmurApp(rumps.App):
     
     def toggle_recording(self, _):
         """Start or stop recording"""
-        logger.info(f"toggle_recording called. loading={self.loading}, is_recording={self.is_recording}")
-        if self.loading:
-            logger.warning("Model still loading, cannot record")
-            rumps.notification(APP_NAME, "Please wait", "Model is still loading...")
+        logger.info(
+            "toggle_recording called. loading=%s, is_recording=%s, is_processing=%s",
+            self.loading,
+            self.is_recording,
+            self.is_processing,
+        )
+        if should_reject_toggle(
+            loading=self.loading,
+            is_processing=self.is_processing,
+            model_ready=self.model is not None,
+        ):
+            if self.loading:
+                logger.warning("Model still loading, cannot record")
+                rumps.notification(APP_NAME, "Please wait", "Model is still loading...")
+            elif self.model is None:
+                logger.warning("Model unavailable, cannot record")
+                rumps.notification(
+                    APP_NAME,
+                    "Model unavailable",
+                    "Recording is unavailable until the model loads successfully.",
+                )
+            else:
+                logger.warning("Transcription in progress, cannot toggle recording")
+                rumps.notification(APP_NAME, "Please wait", "Transcription in progress...")
             return
         
         if self.is_recording:
@@ -773,9 +830,9 @@ class MurmurApp(rumps.App):
             logger.info("Audio stream started successfully")
         except Exception as e:
             logger.error(f"Mic error: {e}")
-            self._set_menu_bar_state("ready")
-            self.update_status(f"Mic error: {str(e)[:20]}")
             self.is_recording = False
+            self.update_status(f"Mic error: {str(e)[:20]}")
+            self._reset_menu_state()
     
     def stop_recording(self):
         """Stop recording and transcribe"""
@@ -788,6 +845,7 @@ class MurmurApp(rumps.App):
         logger.info(f"Recording duration: {recording_duration:.2f} seconds")
         
         self.is_recording = False
+        self.is_processing = True
         self._set_menu_bar_state("processing")
         self.start_stop_item.title = "Processing..."
         self.start_stop_item.set_callback(None)  # Disable while processing
@@ -807,7 +865,9 @@ class MurmurApp(rumps.App):
             self.update_status("No audio recorded")
             self._reset_menu_state()
             return
-        
+
+        audio_path = None
+        cleanup_audio = False
         try:
             # Combine audio chunks
             audio = np.concatenate(audio_chunks, axis=0).flatten()
@@ -846,7 +906,8 @@ class MurmurApp(rumps.App):
             
             # Transcribe with better parameters
             logger.info("Starting transcription...")
-            result = transcribe_audio(self.model, audio_path)
+            with self._whisper_lock:
+                result = transcribe_audio(self.model, audio_path)
             text = extract_text(result)
             if should_log_sensitive(config):
                 logger.info("Transcription completed")
@@ -877,12 +938,6 @@ class MurmurApp(rumps.App):
                     history_text = "(No speech detected)"
                 history_audio_path = audio_path if save_audio else None
                 self.add_to_history(history_text, "live", audio_path=history_audio_path)
-                if os.path.exists(audio_path) and not save_audio:
-                    os.unlink(audio_path)
-                    cleanup_audio = False
-            
-            if cleanup_audio and os.path.exists(audio_path):
-                os.unlink(audio_path)
             
             # Re-enable menu items
             self._reset_menu_state()
@@ -891,12 +946,20 @@ class MurmurApp(rumps.App):
             logger.error(f"Transcription error: {e}", exc_info=True)
             self._reset_menu_state()
             self.update_status(f"Error: {str(e)[:30]}")
+        finally:
+            if cleanup_audio and audio_path and os.path.exists(audio_path):
+                try:
+                    os.unlink(audio_path)
+                except OSError as cleanup_error:
+                    logger.error(f"Failed to delete temp audio {audio_path}: {cleanup_error}")
     
     def _reset_menu_state(self):
         """Reset menu items to normal state - must be called on main thread"""
         def do_reset():
-            self._apply_menu_bar_state("ready")
-            self.start_stop_item.title = "Start/Stop Recording"
+            self.is_processing = False
+            if should_apply_ready_on_reset(is_recording=self.is_recording):
+                self._apply_menu_bar_state("ready")
+                self.start_stop_item.title = "Start/Stop Recording"
             self.start_stop_item.set_callback(self.toggle_recording)
             self.upload_item.set_callback(self.upload_audio_file)
         self.run_on_main_thread(do_reset)
@@ -907,13 +970,28 @@ class MurmurApp(rumps.App):
             self.text_inserter.paste_text(text)
         except Exception as e:
             logger.error(f"Paste failed: {e}")
+            rumps.notification(
+                APP_NAME,
+                "Could not paste",
+                "Enable Accessibility for Murmur, then try again.",
+            )
     
     def upload_audio_file(self, _):
         """Open file dialog to select audio file for transcription"""
-        if self.loading:
-            return
-        
-        if self.is_recording:
+        if should_reject_upload(
+            loading=self.loading,
+            is_recording=self.is_recording,
+            is_processing=self.is_processing,
+            model_ready=self.model is not None,
+        ):
+            if self.loading:
+                rumps.notification(APP_NAME, "Please wait", "Model is still loading...")
+            elif self.model is None:
+                rumps.notification(
+                    APP_NAME,
+                    "Model unavailable",
+                    "Transcription is unavailable until the model loads successfully.",
+                )
             return
         
         try:
@@ -921,6 +999,7 @@ class MurmurApp(rumps.App):
             if not file_path:
                 return
 
+            self.is_processing = True
             self._set_menu_bar_state("processing")
             self.start_stop_item.title = "Processing..."
             self.start_stop_item.set_callback(None)
@@ -931,6 +1010,7 @@ class MurmurApp(rumps.App):
         except Exception:
             logger.error("File picker failed", exc_info=True)
             self.update_status("File error")
+            self._reset_menu_state()
 
     def _pick_audio_file_path(self):
         """Show native NSOpenPanel file picker; return POSIX path or None if cancelled."""
@@ -965,7 +1045,8 @@ class MurmurApp(rumps.App):
                 audio_path = os.path.join(AUDIO_DIR, audio_filename)
                 shutil.copy2(file_path, audio_path)
             
-            result = transcribe_audio_file(self.model, file_path)
+            with self._whisper_lock:
+                result = transcribe_audio_file(self.model, file_path)
             text = extract_text(result)
             
             if text:
@@ -989,7 +1070,7 @@ class MurmurApp(rumps.App):
                 logger.info(f"File transcribed: {word_count} words")
             else:
                 # Delete copied audio if no speech detected
-                if os.path.exists(audio_path):
+                if audio_path and os.path.exists(audio_path):
                     os.unlink(audio_path)
                 self._reset_menu_state()
                 logger.info("No speech detected in file")
@@ -998,7 +1079,7 @@ class MurmurApp(rumps.App):
             error_msg = str(e)
             logger.error(f"File transcription error: {error_msg}")
             self._reset_menu_state()
-    
+   
     def show_history_item(self, index):
         """Show a history item - opens the history window"""
         self.open_history_window(None, index)

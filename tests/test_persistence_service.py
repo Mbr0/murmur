@@ -62,6 +62,37 @@ class PersistenceServiceTests(unittest.TestCase):
             self.assertFalse(history.exists())
             self.assertFalse(any(audio_dir.iterdir()))
 
+    def test_clear_all_local_data_removes_legacy_mywhisper_paths(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Path(tmp_dir) / "config.json"
+            history = Path(tmp_dir) / "history.json"
+            audio_dir = Path(tmp_dir) / "audio"
+            audio_dir.mkdir()
+            legacy_config = Path(tmp_dir) / "legacy_config.json"
+            legacy_history = Path(tmp_dir) / "legacy_history.json"
+            legacy_audio = Path(tmp_dir) / "legacy_audio"
+            legacy_audio.mkdir()
+            legacy_config.write_text('{"model":"tiny"}', encoding="utf-8")
+            legacy_history.write_text('[{"text":"old"}]', encoding="utf-8")
+            (legacy_audio / "clip.wav").write_text("audio", encoding="utf-8")
+            service = PersistenceService(
+                PersistencePaths(str(config), str(history)),
+                logger=TestLogger(),
+            )
+
+            service.clear_all_local_data(
+                str(audio_dir),
+                legacy_paths=(
+                    str(legacy_config),
+                    str(legacy_history),
+                    str(legacy_audio),
+                ),
+            )
+
+            self.assertFalse(legacy_config.exists())
+            self.assertFalse(legacy_history.exists())
+            self.assertFalse(legacy_audio.exists())
+
     def test_save_config_sets_restrictive_file_permissions(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Path(tmp_dir) / "config.json"

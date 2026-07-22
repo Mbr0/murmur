@@ -1,0 +1,9 @@
+# Work folder skills registry
+# Used by @murmur-implementation to resolve folder → skill name → plan file.
+# Add a row when creating any new active work folder that may touch code.
+
+folders:
+  2026-07-22-audit-reliability-fixes:
+    skill: audit-reliability-fixes
+    plan: plan.md
+    path: docs/work/active/2026-07-22-audit-reliability-fixes

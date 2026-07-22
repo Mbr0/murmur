@@ -41,6 +41,8 @@ from PyObjCTools import AppHelper
 import ui_alerts
 import ui_theme
 
+APP_NAME = "Murmur"
+
 # Config file
 CONFIG_FILE = os.path.expanduser("~/.murmur_config.json")
 HISTORY_FILE = os.path.expanduser("~/.murmur_history.json")
