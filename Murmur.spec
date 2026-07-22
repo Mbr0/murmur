@@ -9,8 +9,32 @@ from PyInstaller.utils.hooks import collect_all
 import whisper
 
 whisper_assets_path = os.path.join(os.path.dirname(whisper.__file__), "assets")
-ffmpeg_path = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
-ffprobe_path = shutil.which("ffprobe") or "/opt/homebrew/bin/ffprobe"
+# PATH first; then Apple Silicon Homebrew, then Intel Homebrew.
+# If none exist, keep a conventional path — isfile checks below skip bundling.
+ffmpeg_path = next(
+    (
+        p
+        for p in (
+            shutil.which("ffmpeg"),
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+        )
+        if p and os.path.isfile(p)
+    ),
+    "/opt/homebrew/bin/ffmpeg",
+)
+ffprobe_path = next(
+    (
+        p
+        for p in (
+            shutil.which("ffprobe"),
+            "/opt/homebrew/bin/ffprobe",
+            "/usr/local/bin/ffprobe",
+        )
+        if p and os.path.isfile(p)
+    ),
+    "/opt/homebrew/bin/ffprobe",
+)
 
 datas = [
     ("assets/icons/logo_menu_template.png", "assets/icons"),

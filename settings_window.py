@@ -3,6 +3,7 @@
 Murmur Settings Window - Configuration panel
 """
 
+import logging
 import sys
 import os
 import subprocess
@@ -42,6 +43,7 @@ import ui_alerts
 import ui_theme
 
 APP_NAME = "Murmur"
+logger = logging.getLogger(__name__)
 
 # Config file
 CONFIG_FILE = os.path.expanduser("~/.murmur_config.json")
@@ -50,7 +52,7 @@ AUDIO_DIR = os.path.expanduser("~/.murmur_audio")
 LEGACY_CONFIG_FILE = os.path.expanduser("~/.mywhisper_config.json")
 PERSISTENCE = PersistenceService(
     PersistencePaths(config_file=CONFIG_FILE, history_file=HISTORY_FILE),
-    logger=print,
+    logger=logger,
 )
 
 # Model info

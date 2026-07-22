@@ -7,3 +7,8 @@ folders:
     skill: audit-reliability-fixes
     plan: plan.md
     path: docs/work/active/2026-07-22-audit-reliability-fixes
+  2026-07-22-audit-followup-waves:
+    skill: audit-followup-waves
+    plan: MASTER.md
+    path: docs/work/active/2026-07-22-audit-followup-waves
+

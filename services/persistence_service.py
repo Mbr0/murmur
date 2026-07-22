@@ -22,6 +22,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hotkey_control": False,
     "hotkey_shift": False,
     "hotkey_fn": False,
+    "mic_device_index": None,
+    "mic_device_name": None,
 }
 
 DEBUG_LOG_PATHS: tuple[str, ...] = (
@@ -155,8 +157,11 @@ class PersistenceService:
 
     def _save_json_file(self, path: str, data: Any) -> None:
         try:
-            with open(path, "w") as file:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(path, flags, 0o600)
+            # Create uses 0o600; fchmod covers rewrites of looser existing files.
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as file:
                 json.dump(data, file, indent=2)
-            os.chmod(path, 0o600)
         except OSError as error:
             self._logger.error(f"Failed to save JSON data to {path}: {error}")

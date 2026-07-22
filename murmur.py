@@ -29,9 +29,12 @@ if hasattr(sys, '_MEIPASS'):
     subprocess.run = _patched_run
 
 import fcntl
+import json
 import rumps
 import sounddevice as sd
 import numpy as np
+import urllib.error
+import urllib.request
 import whisper
 import logging
 
@@ -122,7 +125,13 @@ from services.persistence_service import (
     should_log_sensitive,
 )
 from services.text_insertion_service import TextInsertionService
-from services.transcription_service import extract_text, transcribe_audio, transcribe_audio_file
+from services.transcription_service import (
+    extract_text,
+    load_whisper_with_fallback,
+    resolve_whisper_device,
+    transcribe_audio,
+    transcribe_audio_file,
+)
 import ui_alerts
 
 import objc
@@ -144,6 +153,8 @@ from PyObjCTools import AppHelper
 SAMPLE_RATE = 16000
 APP_NAME = "Murmur"
 APP_VERSION = "1.0.0"
+GITHUB_RELEASES_LATEST_URL = "https://api.github.com/repos/Mbr0/murmur/releases/latest"
+UPDATE_CHECK_TIMEOUT_SECONDS = 5.0
 
 # Config file for settings
 CONFIG_FILE = os.path.expanduser("~/.murmur_config.json")
@@ -355,6 +366,154 @@ def should_apply_ready_on_reset(*, is_recording: bool) -> bool:
     return not is_recording
 
 
+def resolve_mic_device_index(
+    saved_index: object, input_device_indices: set[int] | frozenset[int]
+) -> int | None:
+    """Return persisted mic index, or None for system default. Fail fast if invalid."""
+    if saved_index is None:
+        return None
+    if isinstance(saved_index, bool) or not isinstance(saved_index, int):
+        raise ValueError(f"Invalid mic_device_index type: {type(saved_index).__name__}")
+    if saved_index not in input_device_indices:
+        raise ValueError(f"Microphone device index {saved_index} is not available")
+    return saved_index
+
+
+def resolve_mic_device(
+    saved_index: object,
+    saved_name: object,
+    input_devices: dict[int, str],
+) -> int | None:
+    """Resolve persisted mic by index+name. Prefer name when index drifted; never accept a mismatched device at the saved index."""
+    if saved_name is not None and not isinstance(saved_name, str):
+        raise ValueError(f"Invalid mic_device_name type: {type(saved_name).__name__}")
+    name = saved_name.strip() if isinstance(saved_name, str) and saved_name.strip() else None
+
+    if saved_index is None and name is None:
+        return None
+    if saved_index is not None and (
+        isinstance(saved_index, bool) or not isinstance(saved_index, int)
+    ):
+        raise ValueError(f"Invalid mic_device_index type: {type(saved_index).__name__}")
+
+    if saved_index is not None and saved_index in input_devices:
+        device_name = input_devices[saved_index]
+        if name is None or device_name == name:
+            return saved_index
+        # Name mismatch at this index — do not accept; try resolve by name below.
+
+    if name is not None:
+        matches = [idx for idx, device_name in input_devices.items() if device_name == name]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"Multiple microphones named {name!r}")
+        raise ValueError(f"Microphone {name!r} is not available")
+
+    raise ValueError(f"Microphone device index {saved_index} is not available")
+
+
+def clear_mic_device_selection(config: dict) -> dict:
+    """Return config with mic selection cleared (fail-fast; no stale device)."""
+    updated = dict(config)
+    updated["mic_device_index"] = None
+    updated["mic_device_name"] = None
+    return updated
+
+
+def skip_audio_user_message(duration_seconds: float, max_level: float) -> str:
+    """Calm user-facing reason when short/quiet audio is skipped (no transcription text)."""
+    if duration_seconds < 1.0:
+        return "Recording was too short to transcribe."
+    return "Recording was too quiet to transcribe."
+
+
+def normalize_release_tag(tag: str) -> str:
+    cleaned = tag.strip()
+    if len(cleaned) >= 2 and cleaned[0] in ("v", "V") and cleaned[1].isdigit():
+        return cleaned[1:]
+    return cleaned
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for segment in normalize_release_tag(version).split("."):
+        digits = []
+        for char in segment:
+            if char.isdigit():
+                digits.append(char)
+            else:
+                break
+        if not digits:
+            raise ValueError(f"Invalid version: {version}")
+        parts.append(int("".join(digits)))
+    if not parts:
+        raise ValueError(f"Invalid version: {version}")
+    return tuple(parts)
+
+
+def is_newer_version(latest: str, current: str) -> bool:
+    """True when latest release tag is strictly newer than the installed version."""
+    return _version_tuple(latest) > _version_tuple(current)
+
+
+def parse_latest_release_tag(payload: dict) -> str:
+    tag = payload.get("tag_name")
+    if not isinstance(tag, str) or not tag.strip():
+        raise ValueError("Missing tag_name in release payload")
+    return tag.strip()
+
+
+def check_for_update_message(
+    *, current_version: str, latest_tag: str | None, error: str | None
+) -> str:
+    """User-facing update status. Never includes audio or transcription content."""
+    offline = (
+        "Could not check for updates. Check your network connection and try again."
+    )
+    if error is not None or latest_tag is None:
+        return offline
+    current = normalize_release_tag(current_version)
+    latest = normalize_release_tag(latest_tag)
+    try:
+        if is_newer_version(latest_tag, current_version):
+            return (
+                f"Update available: {latest} (you have {current}).\n"
+                "Download from GitHub Releases: github.com/Mbr0/murmur/releases"
+            )
+        if is_newer_version(current_version, latest_tag):
+            return (
+                f"Your version ({current}) is ahead of the latest release ({latest})."
+            )
+    except ValueError:
+        return offline
+    return f"You're on the latest version ({current})."
+
+
+def fetch_latest_release_tag(
+    url: str = GITHUB_RELEASES_LATEST_URL,
+    *,
+    timeout: float = UPDATE_CHECK_TIMEOUT_SECONDS,
+) -> str:
+    """Fetch latest GitHub release tag only (version metadata; no audio/text upload)."""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"Murmur/{APP_VERSION}",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as error:
+        raise RuntimeError("offline") from error
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected release payload")
+    return parse_latest_release_tag(payload)
+
+
 class _HotkeyActivationObserver(NSObject):
     """Re-register the shortcut when Murmur becomes active after permission grants."""
 
@@ -446,6 +605,8 @@ class MurmurApp(rumps.App):
         self.history = self.load_history()
         self.audio_capture = AudioCaptureService(sample_rate=SAMPLE_RATE, logger=logger)
         self.model = None
+        self._whisper_device = "cpu"
+        self._whisper_fp16 = False
         self.text_inserter = TextInsertionService(logger=logger)
         
         # Menu items - SuperWhisper style
@@ -460,8 +621,9 @@ class MurmurApp(rumps.App):
         else:
             logger.info(f"Murmur running from source: {os.path.dirname(os.path.abspath(__file__))}")
         
-        # Microphone submenu
+        # Microphone submenu (restore persisted device before building menu)
         self.mic_menu = rumps.MenuItem("Microphone")
+        self._restore_microphone_from_config()
         self.update_microphone_menu()
         
         self.menu = [
@@ -509,6 +671,47 @@ class MurmurApp(rumps.App):
         """Update the lone menu bar status icon (ready/recording/processing)."""
         self.run_on_main_thread(lambda: self._apply_menu_bar_state(state))
 
+    def _input_device_indices(self) -> set[int]:
+        return set(self._input_devices_by_index())
+
+    def _input_devices_by_index(self) -> dict[int, str]:
+        devices = sd.query_devices()
+        return {
+            i: device["name"]
+            for i, device in enumerate(devices)
+            if device.get("max_input_channels", 0) > 0
+        }
+
+    def _restore_microphone_from_config(self) -> None:
+        """Apply persisted mic on startup; match name when present; clear stale config on failure."""
+        config = self.runtime_config()
+        saved_index = config.get("mic_device_index", DEFAULT_CONFIG["mic_device_index"])
+        saved_name = config.get("mic_device_name", DEFAULT_CONFIG["mic_device_name"])
+        try:
+            devices = self._input_devices_by_index()
+            device_idx = resolve_mic_device(saved_index, saved_name, devices)
+            if device_idx is None:
+                return
+            sd.default.device = (device_idx, sd.default.device[1])
+            device_name = devices[device_idx]
+            if device_idx != saved_index or device_name != saved_name:
+                self._persist_microphone_selection(device_idx, device_name)
+            logger.info("Restored microphone device index %s (%s)", device_idx, device_name)
+        except Exception as error:
+            logger.error("Could not restore microphone device: %s", error)
+            self.persistence.save_config(clear_mic_device_selection(config))
+            rumps.notification(
+                APP_NAME,
+                "Microphone unavailable",
+                "Saved microphone is no longer available. Choose one from the menu.",
+            )
+
+    def _persist_microphone_selection(self, device_idx: int, device_name: str) -> None:
+        config = self.runtime_config()
+        config["mic_device_index"] = device_idx
+        config["mic_device_name"] = device_name
+        self.persistence.save_config(config)
+
     def update_microphone_menu(self):
         """Update the microphone selection submenu"""
         # Clear existing items
@@ -532,14 +735,23 @@ class MurmurApp(rumps.App):
             self.mic_menu.add(rumps.MenuItem("Default Microphone", callback=None))
     
     def select_microphone(self, device_idx):
-        """Select a microphone device"""
+        """Select a microphone device and persist the choice."""
         try:
-            sd.default.device[0] = device_idx
+            device_idx = resolve_mic_device_index(device_idx, self._input_device_indices())
+            if device_idx is None:
+                raise ValueError("Microphone device index is required")
+            sd.default.device = (device_idx, sd.default.device[1])
+            device_name = sd.query_devices(device_idx)["name"]
+            self._persist_microphone_selection(device_idx, device_name)
             self.update_microphone_menu()
-            device_name = sd.query_devices(device_idx)['name']
             logger.info(f"Microphone changed to: {device_name}")
         except Exception as e:
             logger.error(f"Error changing microphone: {e}")
+            rumps.notification(
+                APP_NAME,
+                "Microphone unavailable",
+                "Could not switch to that microphone. Choose another device.",
+            )
     
     def open_settings(self, _):
         """Open settings window"""
@@ -558,11 +770,20 @@ class MurmurApp(rumps.App):
             ui_alerts.show_alert(APP_NAME, "Could not open History.")
 
     def check_updates(self, _):
-        """Check for updates (placeholder)"""
+        """Compare installed version to latest GitHub release tag (metadata only)."""
+        latest_tag = None
+        error = None
+        try:
+            latest_tag = fetch_latest_release_tag()
+        except Exception:
+            error = "offline"
         ui_alerts.show_alert(
             APP_NAME,
-            f"You're on Murmur {APP_VERSION}.\n"
-            "Release downloads will appear at canopystudio.eu/murmur when available.",
+            check_for_update_message(
+                current_version=APP_VERSION,
+                latest_tag=latest_tag,
+                error=error,
+            ),
         )
     
     def run_on_main_thread(self, func):
@@ -605,9 +826,18 @@ class MurmurApp(rumps.App):
         self.update_status("Loading model...")
         self._set_menu_bar_state("processing")
         try:
-            self.model = whisper.load_model(MODEL_SIZE)
+            device = resolve_whisper_device()
+            logger.info("Loading Whisper on device=%s", device)
+            self.model, self._whisper_device, self._whisper_fp16 = load_whisper_with_fallback(
+                lambda d: whisper.load_model(MODEL_SIZE, device=d),
+                device,
+            )
+            logger.info(
+                "Model loaded successfully on device=%s fp16=%s",
+                self._whisper_device,
+                self._whisper_fp16,
+            )
             self.loading = False
-            logger.info("Model loaded successfully")
             self.update_status(f"Ready ({format_hotkey_from_config(self.runtime_config())} to record)")
             self._set_menu_bar_state("ready")
             # Model loaded silently - no notification needed
@@ -769,12 +999,6 @@ class MurmurApp(rumps.App):
         """Toggle recording safely"""
         self.toggle_recording(None)
     
-    def load_model_menu(self, _):
-        """Reload model from menu"""
-        if not self.loading:
-            self.loading = True
-            threading.Thread(target=self.load_model, daemon=True).start()
-    
     def update_status(self, status):
         """Update status (for internal use)"""
         logger.debug(f"Status update: {status}")
@@ -833,6 +1057,11 @@ class MurmurApp(rumps.App):
             self.is_recording = False
             self.update_status(f"Mic error: {str(e)[:20]}")
             self._reset_menu_state()
+            rumps.notification(
+                APP_NAME,
+                "Microphone error",
+                "Could not start recording. Check microphone permissions and device.",
+            )
     
     def stop_recording(self):
         """Stop recording and transcribe"""
@@ -885,6 +1114,11 @@ class MurmurApp(rumps.App):
                     logger.warning(f"Audio too short ({duration_seconds:.2f}s), skipping transcription")
                 else:
                     logger.warning(f"Audio too quiet (max level: {max_level:.6f}), skipping transcription")
+                rumps.notification(
+                    APP_NAME,
+                    "Recording skipped",
+                    skip_audio_user_message(duration_seconds, max_level),
+                )
                 self._reset_menu_state()
                 return
 
@@ -907,7 +1141,12 @@ class MurmurApp(rumps.App):
             # Transcribe with better parameters
             logger.info("Starting transcription...")
             with self._whisper_lock:
-                result = transcribe_audio(self.model, audio_path)
+                result = transcribe_audio(
+                    self.model,
+                    audio_path,
+                    device=self._whisper_device,
+                    fp16=self._whisper_fp16,
+                )
             text = extract_text(result)
             if should_log_sensitive(config):
                 logger.info("Transcription completed")
@@ -916,10 +1155,7 @@ class MurmurApp(rumps.App):
             is_hallucination = is_likely_hallucination(text)
             
             if text and not is_hallucination:
-                # Copy to clipboard
-                pyperclip.copy(text)
-                
-                # Small delay then type the text
+                # Small delay then paste (paste_text copies, pastes, then restores clipboard)
                 time.sleep(0.15)
                 self.type_text(text)
                 
@@ -938,6 +1174,11 @@ class MurmurApp(rumps.App):
                     history_text = "(No speech detected)"
                 history_audio_path = audio_path if save_audio else None
                 self.add_to_history(history_text, "live", audio_path=history_audio_path)
+                rumps.notification(
+                    APP_NAME,
+                    "No speech detected",
+                    "Nothing clear enough to paste. Try again closer to the mic.",
+                )
             
             # Re-enable menu items
             self._reset_menu_state()
@@ -1046,7 +1287,12 @@ class MurmurApp(rumps.App):
                 shutil.copy2(file_path, audio_path)
             
             with self._whisper_lock:
-                result = transcribe_audio_file(self.model, file_path)
+                result = transcribe_audio_file(
+                    self.model,
+                    file_path,
+                    device=self._whisper_device,
+                    fp16=self._whisper_fp16,
+                )
             text = extract_text(result)
             
             if text:
@@ -1074,21 +1320,17 @@ class MurmurApp(rumps.App):
                     os.unlink(audio_path)
                 self._reset_menu_state()
                 logger.info("No speech detected in file")
+                rumps.notification(
+                    APP_NAME,
+                    "No speech detected",
+                    "Nothing clear enough to paste from that file.",
+                )
             
         except Exception as e:
             error_msg = str(e)
             logger.error(f"File transcription error: {error_msg}")
             self._reset_menu_state()
    
-    def show_history_item(self, index):
-        """Show a history item - opens the history window"""
-        self.open_history_window(None, index)
-    
-    def copy_history_item(self, text):
-        """Copy a history item to clipboard"""
-        pyperclip.copy(text)
-        logger.info("Copied to clipboard")
-    
     def clear_history(self, _):
         """Clear all history"""
         if ui_alerts.show_confirm(

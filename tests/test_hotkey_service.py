@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from AppKit import NSEventModifierFlagOption
 
@@ -119,6 +119,30 @@ class HotkeyServiceTests(unittest.TestCase):
         self.assertIsNotNone(registration.unregister_fn)
         self.assertTrue(hotkey_registration_active(registration))
         unregister_global_hotkey(registration)
+
+    def test_register_global_hotkey_with_fn_skips_carbon(self):
+        """Carbon cannot encode fn; fn bindings must use the NSEvent path."""
+        binding = HotkeyBinding(keycode=SPACE_KEYCODE, option=True, fn=True)
+        mock_monitor = object()
+        mock_ns = MagicMock()
+        mock_ns.addGlobalMonitorForEventsMatchingMask_handler_.return_value = mock_monitor
+        mock_ns.addLocalMonitorForEventsMatchingMask_handler_.return_value = mock_monitor
+        logger = MagicMock()
+
+        with patch("services.hotkey_service.hotkey_permissions_ok", return_value=True):
+            with patch("services.hotkey_service.NSEvent", mock_ns):
+                registration = register_global_hotkey(
+                    binding, lambda: None, lambda _e: None, logger
+                )
+                try:
+                    self.assertIsNone(registration.unregister_fn)
+                    self.assertIsNotNone(registration.global_monitor)
+                    self.assertTrue(
+                        mock_ns.addGlobalMonitorForEventsMatchingMask_handler_.called
+                    )
+                    self.assertTrue(hotkey_registration_active(registration))
+                finally:
+                    unregister_global_hotkey(registration)
 
     def test_permission_status_message_mentions_adhoc_bundle(self):
         diagnostics = {
