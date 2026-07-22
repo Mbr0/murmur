@@ -1,6 +1,7 @@
 # Audit reliability fixes
 
-**Status:** Ready for PR  
+**Status:** In PR — https://github.com/Mbr0/murmur/pull/1  
+
 
 
 **Plan:** [plan.md](./plan.md) · **Skill:** `@audit-reliability-fixes`
