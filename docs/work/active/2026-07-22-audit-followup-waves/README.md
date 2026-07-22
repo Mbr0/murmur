@@ -1,6 +1,7 @@
 # Audit follow-up waves
 
-**Status:** Ready for PR  
+**Status:** In PR — https://github.com/Mbr0/murmur/pull/2  
+
 
 **Plan:** [MASTER.md](./MASTER.md) · **Skill:** `@audit-followup-waves`
 
