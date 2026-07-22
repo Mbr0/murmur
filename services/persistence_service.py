@@ -22,11 +22,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hotkey_control": False,
     "hotkey_shift": False,
     "hotkey_fn": False,
+    "mic_device_index": None,
+    "mic_device_name": None,
 }
 
 DEBUG_LOG_PATHS: tuple[str, ...] = (
     os.path.expanduser("~/Library/Logs/Murmur/murmur.log"),
     "/tmp/murmur_debug.log",
+)
+
+LEGACY_DATA_PATHS: tuple[str, ...] = (
+    os.path.expanduser("~/.mywhisper_config.json"),
+    os.path.expanduser("~/.mywhisper_history.json"),
+    os.path.expanduser("~/.mywhisper_audio"),
 )
 
 
@@ -89,7 +97,12 @@ class PersistenceService:
             except OSError as error:
                 self._logger.error(f"Failed to delete debug log {path}: {error}")
 
-    def clear_all_local_data(self, audio_dir: str) -> None:
+    def clear_all_local_data(
+        self,
+        audio_dir: str,
+        *,
+        legacy_paths: tuple[str, ...] | None = None,
+    ) -> None:
         """Delete transcription history, stored audio files, and debug logs."""
         if os.path.exists(self._paths.history_file):
             try:
@@ -104,7 +117,23 @@ class PersistenceService:
             except OSError as error:
                 self._logger.error(f"Failed to clear audio directory: {error}")
 
+        paths = LEGACY_DATA_PATHS if legacy_paths is None else legacy_paths
+        for path in paths:
+            self._remove_path(path)
+
         self.clear_debug_log()
+
+    def _remove_path(self, path: str) -> None:
+        """Remove a file or directory if it exists."""
+        if not os.path.exists(path):
+            return
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except OSError as error:
+            self._logger.error(f"Failed to delete legacy path {path}: {error}")
 
     def ensure_audio_dir(self, audio_dir: str) -> None:
         """Create the audio directory with owner-only permissions."""
@@ -128,8 +157,11 @@ class PersistenceService:
 
     def _save_json_file(self, path: str, data: Any) -> None:
         try:
-            with open(path, "w") as file:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(path, flags, 0o600)
+            # Create uses 0o600; fchmod covers rewrites of looser existing files.
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as file:
                 json.dump(data, file, indent=2)
-            os.chmod(path, 0o600)
         except OSError as error:
             self._logger.error(f"Failed to save JSON data to {path}: {error}")

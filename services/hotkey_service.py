@@ -508,64 +508,67 @@ def register_global_hotkey(
 ) -> HotkeyRegistration:
     """Register a global hotkey using Carbon RegisterEventHotKey (via quickmachotkey).
 
-    Falls back to NSEvent monitors (which require Accessibility) if Carbon fails.
+    Falls back to NSEvent monitors (which require Accessibility) if Carbon fails
+    or when the binding requires fn (Carbon has no fn modifier bit).
     """
-    # 1. Try Carbon hotkey first (does NOT require Accessibility permissions)
-    try:
-        from quickmachotkey import quickHotKey
-        from quickmachotkey.constants import cmdKey, shiftKey, optionKey, controlKey
+    # 1. Try Carbon hotkey first (does NOT require Accessibility permissions).
+    # Carbon RegisterEventHotKey cannot express fn — skip so NSEvent can match it.
+    if not binding.fn:
+        try:
+            from quickmachotkey import quickHotKey
+            from quickmachotkey.constants import cmdKey, shiftKey, optionKey, controlKey
 
-        # Map modifiers
-        modifier_mask = 0
-        if binding.command:
-            modifier_mask |= cmdKey
-        if binding.shift:
-            modifier_mask |= shiftKey
-        if binding.option:
-            modifier_mask |= optionKey
-        if binding.control:
-            modifier_mask |= controlKey
+            # Map modifiers
+            modifier_mask = 0
+            if binding.command:
+                modifier_mask |= cmdKey
+            if binding.shift:
+                modifier_mask |= shiftKey
+            if binding.option:
+                modifier_mask |= optionKey
+            if binding.control:
+                modifier_mask |= controlKey
 
-        # Define the handler
-        def trigger_handler() -> None:
-            try:
-                on_trigger()
-            except Exception as error:
-                on_error(error)
+            # Define the handler
+            def trigger_handler() -> None:
+                try:
+                    on_trigger()
+                except Exception as error:
+                    on_error(error)
 
-        # Register the hotkey
-        registerable_handler = quickHotKey(
-            virtualKey=binding.keycode,
-            modifierMask=modifier_mask,
-            immediately=True,
-        )(trigger_handler)
+            # Register the hotkey
+            registerable_handler = quickHotKey(
+                virtualKey=binding.keycode,
+                modifierMask=modifier_mask,
+                immediately=True,
+            )(trigger_handler)
 
-        if logger is not None:
-            if is_bundled_app():
-                logger.warning(
-                    "Global Carbon hotkey registered successfully: %s (keycode=%d, mask=0x%x)",
-                    format_hotkey(binding),
-                    binding.keycode,
-                    modifier_mask,
-                )
-            else:
-                logger.info(
-                    "Global Carbon hotkey registered successfully: %s (keycode=%d, mask=0x%x)",
-                    format_hotkey(binding),
-                    binding.keycode,
-                    modifier_mask,
-                )
+            if logger is not None:
+                if is_bundled_app():
+                    logger.warning(
+                        "Global Carbon hotkey registered successfully: %s (keycode=%d, mask=0x%x)",
+                        format_hotkey(binding),
+                        binding.keycode,
+                        modifier_mask,
+                    )
+                else:
+                    logger.info(
+                        "Global Carbon hotkey registered successfully: %s (keycode=%d, mask=0x%x)",
+                        format_hotkey(binding),
+                        binding.keycode,
+                        modifier_mask,
+                    )
 
-        return HotkeyRegistration(
-            unregister_fn=registerable_handler.unregister,
-        )
-
-    except Exception as carbon_error:
-        if logger is not None:
-            logger.warning(
-                "Failed to register Carbon hotkey (%s). Falling back to NSEvent monitors.",
-                carbon_error,
+            return HotkeyRegistration(
+                unregister_fn=registerable_handler.unregister,
             )
+
+        except Exception as carbon_error:
+            if logger is not None:
+                logger.warning(
+                    "Failed to register Carbon hotkey (%s). Falling back to NSEvent monitors.",
+                    carbon_error,
+                )
 
     # 2. Fallback to NSEvent monitors (requires Accessibility permissions)
     if not hotkey_permissions_ok():

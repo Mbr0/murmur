@@ -1,7 +1,9 @@
+import os
 import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from services.persistence_service import (
     DEBUG_LOG_PATHS,
@@ -62,6 +64,37 @@ class PersistenceServiceTests(unittest.TestCase):
             self.assertFalse(history.exists())
             self.assertFalse(any(audio_dir.iterdir()))
 
+    def test_clear_all_local_data_removes_legacy_mywhisper_paths(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Path(tmp_dir) / "config.json"
+            history = Path(tmp_dir) / "history.json"
+            audio_dir = Path(tmp_dir) / "audio"
+            audio_dir.mkdir()
+            legacy_config = Path(tmp_dir) / "legacy_config.json"
+            legacy_history = Path(tmp_dir) / "legacy_history.json"
+            legacy_audio = Path(tmp_dir) / "legacy_audio"
+            legacy_audio.mkdir()
+            legacy_config.write_text('{"model":"tiny"}', encoding="utf-8")
+            legacy_history.write_text('[{"text":"old"}]', encoding="utf-8")
+            (legacy_audio / "clip.wav").write_text("audio", encoding="utf-8")
+            service = PersistenceService(
+                PersistencePaths(str(config), str(history)),
+                logger=TestLogger(),
+            )
+
+            service.clear_all_local_data(
+                str(audio_dir),
+                legacy_paths=(
+                    str(legacy_config),
+                    str(legacy_history),
+                    str(legacy_audio),
+                ),
+            )
+
+            self.assertFalse(legacy_config.exists())
+            self.assertFalse(legacy_history.exists())
+            self.assertFalse(legacy_audio.exists())
+
     def test_save_config_sets_restrictive_file_permissions(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Path(tmp_dir) / "config.json"
@@ -89,6 +122,27 @@ class PersistenceServiceTests(unittest.TestCase):
 
             mode = stat.S_IMODE(history.stat().st_mode)
             self.assertEqual(mode, 0o600)
+
+    def test_save_config_creates_file_with_owner_only_mode_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Path(tmp_dir) / "config.json"
+            history = Path(tmp_dir) / "history.json"
+            service = PersistenceService(
+                PersistencePaths(str(config), str(history)),
+                logger=TestLogger(),
+            )
+
+            with patch(
+                "services.persistence_service.os.open",
+                wraps=os.open,
+            ) as mock_open:
+                service.save_config({"model": "small", "save_audio": False})
+
+            mock_open.assert_called()
+            _path, flags, mode = mock_open.call_args.args[:3]
+            self.assertEqual(mode, 0o600)
+            self.assertTrue(flags & os.O_CREAT)
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
 
     def test_ensure_audio_dir_sets_restrictive_permissions(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -171,6 +225,8 @@ class PersistenceServiceTests(unittest.TestCase):
         self.assertFalse(DEFAULT_CONFIG["save_audio"])
         self.assertFalse(DEFAULT_CONFIG["save_history"])
         self.assertTrue(DEFAULT_CONFIG["privacy_mode"])
+        self.assertIsNone(DEFAULT_CONFIG["mic_device_index"])
+        self.assertIsNone(DEFAULT_CONFIG["mic_device_name"])
 
     def test_add_history_entry_keeps_latest_100(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -22,7 +22,7 @@ from Cocoa import (
     NSTableColumn, NSObject, NSApp, NSApplicationActivationPolicyAccessory,
     NSTextFieldCell, NSRightTextAlignment,
     NSAlert, NSWarningAlertStyle, NSAlertFirstButtonReturn, NSFocusRingTypeNone,
-    NSAppearance,
+    NSAppearance, NSAccessibilityButtonRole,
 )
 from Quartz import CGColorCreateGenericRGB
 from PyObjCTools import AppHelper
@@ -201,6 +201,8 @@ class HistoryWindowController(NSObject):
         copy_btn = NSButton.alloc().initWithFrame_(NSMakeRect(12, 12, 88, 28))
         copy_btn.setTitle_("Copy")
         ui_theme.style_dark_button(copy_btn)
+        copy_btn.setAccessibilityLabel_("Copy transcription")
+        copy_btn.setAccessibilityRole_(NSAccessibilityButtonRole)
         copy_btn.setTarget_(self)
         copy_btn.setAction_(objc.selector(self.copyClicked_, signature=b'v@:@'))
         footer.addSubview_(copy_btn)
@@ -208,6 +210,8 @@ class HistoryWindowController(NSObject):
         clear_btn = NSButton.alloc().initWithFrame_(NSMakeRect(108, 12, 130, 28))
         clear_btn.setTitle_("Clear History")
         ui_theme.style_dark_button(clear_btn)
+        clear_btn.setAccessibilityLabel_("Clear History")
+        clear_btn.setAccessibilityRole_(NSAccessibilityButtonRole)
         clear_btn.setTarget_(self)
         clear_btn.setAction_(objc.selector(self.clearHistoryClicked_, signature=b'v@:@'))
         footer.addSubview_(clear_btn)
@@ -313,6 +317,9 @@ class HistoryWindowController(NSObject):
         btn.setTransparent_(True)
         btn.setFocusRingType_(NSFocusRingTypeNone)
         btn.setTag_(index)
+        a11y_parts = [part for part in (meta_line, text_preview) if part]
+        btn.setAccessibilityLabel_("History item: " + ", ".join(a11y_parts))
+        btn.setAccessibilityRole_(NSAccessibilityButtonRole)
         btn.setTarget_(self)
         btn.setAction_(objc.selector(self.itemClicked_, signature=b'v@:@'))
         item.addSubview_(btn)
@@ -426,6 +433,8 @@ class HistoryWindowController(NSObject):
         self.stop_btn = NSButton.alloc().initWithFrame_(NSMakeRect(player_center_x - 92, 10, 84, 28))
         self.stop_btn.setTitle_("Stop")
         ui_theme.style_dark_button(self.stop_btn)
+        self.stop_btn.setAccessibilityLabel_("Stop playback")
+        self.stop_btn.setAccessibilityRole_(NSAccessibilityButtonRole)
         self.stop_btn.setTarget_(self)
         self.stop_btn.setAction_(objc.selector(self.stopClicked_, signature=b'v@:@'))
         content_view.addSubview_(self.stop_btn)
@@ -433,6 +442,8 @@ class HistoryWindowController(NSObject):
         self.play_btn = NSButton.alloc().initWithFrame_(NSMakeRect(player_center_x + 8, 10, 84, 28))
         self.play_btn.setTitle_("Play")
         ui_theme.style_primary_button(self.play_btn)
+        self.play_btn.setAccessibilityLabel_("Play audio")
+        self.play_btn.setAccessibilityRole_(NSAccessibilityButtonRole)
         self.play_btn.setTarget_(self)
         self.play_btn.setAction_(objc.selector(self.playClicked_, signature=b'v@:@'))
         content_view.addSubview_(self.play_btn)
@@ -496,6 +507,7 @@ class HistoryWindowController(NSObject):
         self.play_btn.setEnabled_(has_audio)
         self.stop_btn.setEnabled_(has_audio)
         self.play_btn.setTitle_("Play")
+        self.play_btn.setAccessibilityLabel_("Play audio")
         ui_theme.style_primary_button(self.play_btn)
         self.is_playing = False
     
@@ -522,6 +534,7 @@ class HistoryWindowController(NSObject):
         self.is_playing = False
         if hasattr(self, 'play_btn') and self.play_btn:
             self.play_btn.setTitle_("Play")
+            self.play_btn.setAccessibilityLabel_("Play audio")
             ui_theme.style_primary_button(self.play_btn)
     
     def itemClicked_(self, sender):
@@ -544,6 +557,7 @@ class HistoryWindowController(NSObject):
             # Pause - stop current playback
             self._stop_audio()
             self.play_btn.setTitle_("Play")
+            self.play_btn.setAccessibilityLabel_("Play audio")
             ui_theme.style_primary_button(self.play_btn)
         else:
             # Play
@@ -551,6 +565,7 @@ class HistoryWindowController(NSObject):
             self.audio_process = subprocess.Popen(["afplay", audio_path])
             self.is_playing = True
             self.play_btn.setTitle_("Pause")
+            self.play_btn.setAccessibilityLabel_("Pause audio")
             ui_theme.style_primary_button(self.play_btn)
             
             # Monitor playback completion in background
@@ -564,6 +579,7 @@ class HistoryWindowController(NSObject):
                     def reset_play_label():
                         if self.play_btn:
                             self.play_btn.setTitle_("Play")
+                            self.play_btn.setAccessibilityLabel_("Play audio")
                             ui_theme.style_primary_button(self.play_btn)
                     AppHelper.callAfter(reset_play_label)
             threading.Thread(target=monitor, daemon=True).start()

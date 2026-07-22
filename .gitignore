@@ -18,3 +18,16 @@ SHIPPING.md
 LAUNCH_READINESS.md
 MANIFEST.md
 RELEASE_SIGNING.md
+
+# Cursor — track agent config, ignore everything else under .cursor/
+.cursor/*
+!.cursor/skills/
+!.cursor/skills/**
+!.cursor/agents/
+!.cursor/agents/**
+!.cursor/README.md
+
+# Cross-tool mirror
+!.agents/
+!.agents/skills/
+!.agents/skills/**
