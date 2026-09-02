@@ -66,6 +66,8 @@ Wave 3 (cloud and the settings tabs) adds:
   ``False`` until the user turns it on (``ui/settings/general_tab.py``).
 - ``settings_last_tab``: the identifier of the Settings tab last shown, so the
   window reopens where the user left it (``ui/settings/window.py``).
+- ``snippets``: list of ``{"trigger", "text"}`` — spoken phrases that expand
+  into stored text (``cleanup/snippets.py``, edited on the Smart tab).
 
 Writers that own only a few keys must go through :meth:`PersistenceService.update_config`
 rather than saving a whole config they loaded earlier: a snapshot save silently
@@ -143,6 +145,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "update_channel": "stable",
     "launch_at_login": False,
     "settings_last_tab": "general",
+    "snippets": [],
 }
 
 #: Config keys the privacy surface reads and writes.

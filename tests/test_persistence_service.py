@@ -371,6 +371,7 @@ class PersistenceServiceTests(unittest.TestCase):
                 "update_channel": "beta",
                 "launch_at_login": True,
                 "settings_last_tab": "account",
+                "snippets": [{"trigger": "my address", "text": "12 Rue Oberkampf"}],
             }
             # Fails loudly if DEFAULT_CONFIG gains a key this fixture forgot.
             self.assertEqual(set(full_config.keys()), set(DEFAULT_CONFIG.keys()))
