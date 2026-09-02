@@ -166,10 +166,20 @@ if [ -n "${CODE_SIGN_IDENTITY}" ]; then
     codesign --verify --verbose=2 "${DMG_PATH}"
 fi
 
+# Size budget (MASTER.md risk table): two runtimes plus MLX wheels have to stay
+# under 400 MB. Models are downloaded on demand and never in the image.
+DMG_MAX_MB="${DMG_MAX_MB:-400}"
+DMG_SIZE_MB=$(( $(stat -f%z "${DMG_PATH}") / 1000000 ))
+if [ "${DMG_SIZE_MB}" -gt "${DMG_MAX_MB}" ]; then
+    echo "ERROR: ${DMG_PATH} is ${DMG_SIZE_MB} MB, over the ${DMG_MAX_MB} MB budget."
+    echo "       See the risk table in docs/work/active/2026-09-02-murmur-v2/MASTER.md."
+    exit 1
+fi
+
 echo ""
 echo "======================================"
 echo "DMG ready: ${DMG_PATH}"
-echo "Size: $(du -h "${DMG_PATH}" | awk '{print $1}')"
+echo "Size: ${DMG_SIZE_MB} MB (budget ${DMG_MAX_MB} MB)"
 echo ""
 echo "Open the DMG to see the drag-to-Applications layout."
 echo "======================================"

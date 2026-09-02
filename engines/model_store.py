@@ -137,7 +137,7 @@ CATALOG: tuple[ModelSpec, ...] = (
     ModelSpec(
         id="whispercpp-large-v3-turbo-q5_0",
         engine="whispercpp",
-        display_name="Whisper large-v3-turbo (quantised, 574 MB)",
+        display_name="Whisper large-v3-turbo (quantised)",
         files=(
             _hf_file(
                 _WHISPER_REPO,
@@ -152,7 +152,7 @@ CATALOG: tuple[ModelSpec, ...] = (
     ModelSpec(
         id="whispercpp-large-v3-turbo",
         engine="whispercpp",
-        display_name="Whisper large-v3-turbo (1.6 GB)",
+        display_name="Whisper large-v3-turbo",
         files=(
             _hf_file(
                 _WHISPER_REPO,
@@ -167,7 +167,7 @@ CATALOG: tuple[ModelSpec, ...] = (
     ModelSpec(
         id="voxtral-mini-4b-realtime-4bit",
         engine="voxtral_mlx",
-        display_name="Voxtral Mini 4B Realtime (4-bit MLX, 3.1 GB)",
+        display_name="Voxtral Mini 4B Realtime (4-bit MLX)",
         files=(
             _hf_file(
                 _VOXTRAL_REPO,
@@ -198,6 +198,29 @@ CATALOG: tuple[ModelSpec, ...] = (
         license="Apache-2.0",
     ),
 )
+
+
+def models_for_engine(
+    engine_id: str, catalog: Iterable[ModelSpec] = CATALOG
+) -> tuple[ModelSpec, ...]:
+    """Every catalog entry belonging to ``engine_id``, in catalog order.
+
+    An engine with no models yields an empty tuple rather than raising: the
+    caller is a picker deciding what to offer, not code asking for a model.
+    """
+    return tuple(spec for spec in catalog if spec.engine == engine_id)
+
+
+def human_size(num_bytes: int) -> str:
+    """Format a byte count the way model sources publish it (decimal units)."""
+    assert num_bytes >= 0, f"size cannot be negative: {num_bytes}"
+    if num_bytes >= 1_000_000_000:
+        return f"{num_bytes / 1_000_000_000:.1f} GB"
+    if num_bytes >= 1_000_000:
+        return f"{num_bytes / 1_000_000:.0f} MB"
+    if num_bytes >= 1_000:
+        return f"{num_bytes / 1_000:.0f} KB"
+    return f"{num_bytes} bytes"
 
 
 class ModelStore:
@@ -487,4 +510,6 @@ __all__ = [
     "ModelStore",
     "ModelStoreError",
     "UnknownModelError",
+    "human_size",
+    "models_for_engine",
 ]

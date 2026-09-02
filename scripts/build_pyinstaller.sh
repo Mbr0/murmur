@@ -18,6 +18,17 @@ APPLE_TEAM_ID="${APPLE_TEAM_ID:-}"
 APPLE_APP_SPECIFIC_PASSWORD="${APPLE_APP_SPECIFIC_PASSWORD:-}"
 ENTITLEMENTS="${ENTITLEMENTS:-entitlements.plist}"
 ZIP_PATH="dist/${APP_NAME}.zip"
+WHISPER_SERVER="vendor/whispercpp/whisper-server"
+# "release" once a Developer ID identity signs the build, "internal" otherwise.
+# The About text reads Contents/Resources/build_info.json to say which it is.
+BUILD_CHANNEL="${BUILD_CHANNEL:-}"
+
+if [ ! -f "${WHISPER_SERVER}" ]; then
+    echo "ERROR: ${WHISPER_SERVER} is missing."
+    echo "       Build it first: bash scripts/tools/fetch_whispercpp.sh"
+    echo "       (decision D2 — the bundled whisper.cpp server is the default engine.)"
+    exit 1
+fi
 
 if ! python -c "import PyInstaller" 2>/dev/null; then
     pip install pyinstaller
@@ -34,6 +45,44 @@ if [ ! -d "${APP_BUNDLE}" ]; then
     echo "ERROR: Expected ${APP_BUNDLE} was not created."
     exit 1
 fi
+
+# engines/whispercpp.py resolves <sys._MEIPASS>/bin/whisper-server at runtime.
+if ! find "${APP_BUNDLE}/Contents" -type f -name whisper-server -path '*/bin/*' | grep -q .; then
+    echo "ERROR: bin/whisper-server is not in ${APP_BUNDLE}; the default engine would not start."
+    exit 1
+fi
+
+if find "${APP_BUNDLE}/Contents" \( -name torch -o -name 'libtorch*' \) -print -quit | grep -q .; then
+    echo "ERROR: the bundle still contains torch. Check the excludes list in Murmur.spec."
+    exit 1
+fi
+
+# Build marker read by the About text: ad-hoc builds label themselves internal.
+RESOURCES_DIR="${APP_BUNDLE}/Contents/Resources"
+mkdir -p "${RESOURCES_DIR}"
+if [ -n "${CODE_SIGN_IDENTITY}" ]; then
+    BUILD_SIGNED=true
+    BUILD_CHANNEL="${BUILD_CHANNEL:-release}"
+else
+    BUILD_SIGNED=false
+    BUILD_CHANNEL="${BUILD_CHANNEL:-internal}"
+fi
+if [ "${NOTARIZE}" = "true" ]; then
+    BUILD_NOTARIZED=true
+else
+    BUILD_NOTARIZED=false
+fi
+cat > "${RESOURCES_DIR}/build_info.json" <<EOF
+{
+  "signed": ${BUILD_SIGNED},
+  "channel": "${BUILD_CHANNEL}",
+  "version": "${APP_VERSION}",
+  "notarized": ${BUILD_NOTARIZED},
+  "team_id": "${APPLE_TEAM_ID}",
+  "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+echo "Build marker: channel=${BUILD_CHANNEL} signed=${BUILD_SIGNED}"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION}" "${APP_BUNDLE}/Contents/Info.plist" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string ${APP_VERSION}" "${APP_BUNDLE}/Contents/Info.plist"
@@ -89,16 +138,30 @@ sign_macho "${APP_BUNDLE}"
 codesign --verify --strict --verbose=2 "${APP_BUNDLE}"
 
 if [ "${NOTARIZE}" = "true" ]; then
-    if [ -z "${CODE_SIGN_IDENTITY}" ] || [ -z "${APPLE_ID}" ] || [ -z "${APPLE_TEAM_ID}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD}" ]; then
-        echo "NOTARIZE=true requires CODE_SIGN_IDENTITY, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_SPECIFIC_PASSWORD."
-        exit 1
+    # A stored keychain profile keeps the password out of the environment as
+    # well as out of argv; without one, "@env:" at least keeps it out of argv,
+    # where `ps` shows every argument to every user on the machine.
+    if [ -n "${NOTARY_KEYCHAIN_PROFILE:-}" ]; then
+        NOTARY_ARGS=(--keychain-profile "${NOTARY_KEYCHAIN_PROFILE}")
+        if [ -z "${CODE_SIGN_IDENTITY}" ]; then
+            echo "NOTARIZE=true requires CODE_SIGN_IDENTITY."
+            exit 1
+        fi
+    else
+        if [ -z "${CODE_SIGN_IDENTITY}" ] || [ -z "${APPLE_ID}" ] || [ -z "${APPLE_TEAM_ID}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD}" ]; then
+            echo "NOTARIZE=true requires CODE_SIGN_IDENTITY, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_SPECIFIC_PASSWORD"
+            echo "(or NOTARY_KEYCHAIN_PROFILE — see RELEASE_SIGNING.md)."
+            exit 1
+        fi
+        NOTARY_ARGS=(
+            --apple-id "${APPLE_ID}"
+            --team-id "${APPLE_TEAM_ID}"
+            --password "@env:APPLE_APP_SPECIFIC_PASSWORD"
+        )
+        export APPLE_APP_SPECIFIC_PASSWORD
     fi
     ditto -c -k --sequesterRsrc --keepParent "${APP_BUNDLE}" "${ZIP_PATH}"
-    xcrun notarytool submit "${ZIP_PATH}" \
-        --apple-id "${APPLE_ID}" \
-        --team-id "${APPLE_TEAM_ID}" \
-        --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
-        --wait
+    xcrun notarytool submit "${ZIP_PATH}" "${NOTARY_ARGS[@]}" --wait
     xcrun stapler staple "${APP_BUNDLE}"
     echo "Notarization complete."
 fi

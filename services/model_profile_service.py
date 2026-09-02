@@ -31,11 +31,16 @@ def detect_ram_gb() -> int | None:
     return ram_bytes // (1024**3)
 
 
+def voxtral_eligible(chip: str, ram_gb: int | None) -> bool:
+    """Return whether this machine is eligible to opt into Voxtral Mini 4B Realtime."""
+    return chip == CHIP_APPLE_SILICON and ram_gb is not None and ram_gb >= VOXTRAL_MIN_RAM_GB
+
+
 def select_engine_id(chip: str, ram_gb: int | None) -> str:
-    """Decision D1: Voxtral on capable Apple Silicon, whisper.cpp everywhere else."""
+    """Decision D1 (provisional, 2026-09-02): whisper.cpp large-v3-turbo q5_0 is the
+    default engine on all Macs. Voxtral Mini 4B Realtime is opt-in on eligible Apple
+    Silicon machines; see ``voxtral_eligible``."""
     assert chip in (CHIP_APPLE_SILICON, CHIP_INTEL), f"unknown chip: {chip!r}"
-    if chip == CHIP_APPLE_SILICON and ram_gb is not None and ram_gb >= VOXTRAL_MIN_RAM_GB:
-        return ENGINE_VOXTRAL_MLX
     return ENGINE_WHISPERCPP
 
 

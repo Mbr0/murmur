@@ -25,7 +25,9 @@ from engines.base import (
 )
 
 #: Engine ids that resolve to a module ``engines.<id>`` exposing ``ENGINE_CLASS``.
-ENGINE_IDS = ("whispercpp", "voxtral_mlx", "whisper_openai")
+#: ``whisper_openai`` was the Wave 0 adapter around openai-whisper; decision D1
+#: retired it and it now lives in ``_archive/engines/``.
+ENGINE_IDS = ("whispercpp", "voxtral_mlx")
 
 _REGISTERED: dict[str, Callable[..., Engine]] = {}
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Bake-off harness for Murmur v2 decision D1 (primary local engine).
 
-Runs one or more engines (whisper.cpp, Voxtral MLX, current openai-whisper)
-over the same fixture clips and writes the markdown table consumed by
+Runs one or more engines (whisper.cpp, Voxtral MLX) over the same fixture
+clips and writes the markdown table consumed by
 ``docs/work/active/2026-09-02-murmur-v2/decisions.md`` plus a JSON sidecar
 of per-clip results.
 
@@ -37,7 +37,6 @@ Usage (MODELS is where the model store keeps downloads):
     venv/bin/python scripts/tools/bakeoff.py \\
         --engine whispercpp=/path/to/ggml-large-v3-turbo.bin \\
         --engine "voxtral_mlx=$MODELS/voxtral-mini-4b-realtime-4bit" \\
-        --engine whisper_openai=turbo \\
         --fixtures tests/fixtures/audio \\
         --out docs/work/active/2026-09-02-murmur-v2/bakeoff-table.md \\
         --runs 3
@@ -71,10 +70,6 @@ from engines.base import EngineUnavailableError  # noqa: E402
 
 #: Languages the bake-off covers, matching the decisions.md table columns.
 SUPPORTED_LANGUAGES = ("en", "fr", "nl", "de")
-
-#: kwarg name ``create_engine`` expects for a given engine id's model spec.
-#: Unlisted ids (including test doubles) default to "model_path".
-_ENGINE_KWARG_NAMES = {"whisper_openai": "model_name"}
 
 #: Clip duration range (seconds) counted toward the median-latency column.
 _LATENCY_DURATION_MIN_S = 8.0
@@ -320,11 +315,6 @@ def render_table(results: "OrderedDict[str, dict]") -> str:
 # ---------------------------------------------------------------------------
 
 
-def _kwarg_name_for(engine_id: str) -> str:
-    """kwarg ``create_engine`` expects for this engine id's model spec."""
-    return _ENGINE_KWARG_NAMES.get(engine_id, "model_path")
-
-
 def parse_engine_arg(raw: str) -> tuple[str, str]:
     """Parse one repeatable ``--engine id=spec`` value."""
     engine_id, separator, spec = raw.partition("=")
@@ -351,8 +341,7 @@ def run_engine_bakeoff(
     """
     baseline_self_bytes = _ru_maxrss_self()
     try:
-        kwargs = {_kwarg_name_for(engine_id): spec}
-        engine = create_engine(engine_id, **kwargs)
+        engine = create_engine(engine_id, model_path=spec)
         engine.load()
     except EngineUnavailableError as exc:
         return {"unavailable": str(exc)}
@@ -518,10 +507,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="ID=SPEC",
         help=(
             "Repeatable. ID is an engines.ENGINE_IDS value "
-            "(whispercpp, voxtral_mlx, whisper_openai); SPEC is a local model "
+            "(whispercpp, voxtral_mlx); SPEC is a local model "
             "path (whispercpp: the .bin file; voxtral_mlx: the model "
-            "directory, not a Hugging Face repo id) or, for whisper_openai, a "
-            "model name. e.g. --engine whispercpp=/path/to/ggml-large-v3-turbo.bin. "
+            "directory, not a Hugging Face repo id). "
+            "e.g. --engine whispercpp=/path/to/ggml-large-v3-turbo.bin. "
             "Passing several runs each engine in its own process so peak RAM "
             "is attributed correctly."
         ),

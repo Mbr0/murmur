@@ -12,6 +12,41 @@ from pathlib import Path
 #: when the engine should detect the language itself.
 LANGUAGE_AUTO = "auto"
 
+#: Languages a multilingual Whisper model transcribes well enough to offer in the
+#: picker, ``auto`` first. Whisper itself claims ninety-nine, but a picker that
+#: long is unusable and most of its tail is unusable too; this is the subset
+#: Murmur stands behind. Shared so :mod:`engines.whispercpp` and anything else
+#: describing a Whisper model report the same list.
+WHISPER_LANGUAGES: tuple[str, ...] = (
+    LANGUAGE_AUTO,
+    "en",
+    "fr",
+    "nl",
+    "de",
+    "es",
+    "it",
+    "pt",
+    "pl",
+    "ru",
+    "uk",
+    "tr",
+    "sv",
+    "da",
+    "no",
+    "fi",
+    "cs",
+    "ro",
+    "hu",
+    "el",
+    "ja",
+    "zh",
+    "ko",
+    "ar",
+    "hi",
+    "id",
+    "vi",
+)
+
 
 class EngineError(Exception):
     """Base class for every engine failure."""

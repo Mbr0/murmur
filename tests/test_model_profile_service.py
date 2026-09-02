@@ -13,6 +13,7 @@ from services.model_profile_service import (
     detect_chip,
     detect_ram_gb,
     select_engine_id,
+    voxtral_eligible,
 )
 
 
@@ -71,9 +72,9 @@ class DetectRamTests(unittest.TestCase):
 class SelectEngineIdTests(unittest.TestCase):
     def test_decision_table(self):
         cases = [
-            (CHIP_APPLE_SILICON, 64, ENGINE_VOXTRAL_MLX),
-            (CHIP_APPLE_SILICON, 32, ENGINE_VOXTRAL_MLX),
-            (CHIP_APPLE_SILICON, 16, ENGINE_VOXTRAL_MLX),
+            (CHIP_APPLE_SILICON, 64, ENGINE_WHISPERCPP),
+            (CHIP_APPLE_SILICON, 32, ENGINE_WHISPERCPP),
+            (CHIP_APPLE_SILICON, 16, ENGINE_WHISPERCPP),
             (CHIP_APPLE_SILICON, 15, ENGINE_WHISPERCPP),
             (CHIP_APPLE_SILICON, 8, ENGINE_WHISPERCPP),
             (CHIP_APPLE_SILICON, None, ENGINE_WHISPERCPP),
@@ -94,11 +95,29 @@ class SelectEngineIdTests(unittest.TestCase):
         self.assertIn(ENGINE_WHISPERCPP, ENGINE_IDS)
 
 
+class VoxtralEligibleTests(unittest.TestCase):
+    def test_decision_table(self):
+        cases = [
+            (CHIP_APPLE_SILICON, 64, True),
+            (CHIP_APPLE_SILICON, 32, True),
+            (CHIP_APPLE_SILICON, 16, True),
+            (CHIP_APPLE_SILICON, 15, False),
+            (CHIP_APPLE_SILICON, 8, False),
+            (CHIP_APPLE_SILICON, None, False),
+            (CHIP_INTEL, 64, False),
+            (CHIP_INTEL, 16, False),
+            (CHIP_INTEL, None, False),
+        ]
+        for chip, ram_gb, expected in cases:
+            with self.subTest(chip=chip, ram_gb=ram_gb):
+                self.assertEqual(voxtral_eligible(chip, ram_gb), expected)
+
+
 class DefaultEngineForCurrentMachineTests(unittest.TestCase):
     @patch("services.model_profile_service.detect_ram_gb", return_value=32)
     @patch("services.model_profile_service.detect_chip", return_value=CHIP_APPLE_SILICON)
     def test_composes_detection_and_selection(self, _mock_chip, _mock_ram):
-        self.assertEqual(default_engine_for_current_machine(), ENGINE_VOXTRAL_MLX)
+        self.assertEqual(default_engine_for_current_machine(), ENGINE_WHISPERCPP)
 
     @patch("services.model_profile_service.detect_ram_gb", return_value=None)
     @patch("services.model_profile_service.detect_chip", return_value=CHIP_INTEL)

@@ -321,7 +321,7 @@ class FanOutTests(unittest.TestCase):
         with mock.patch.object(bakeoff.subprocess, "run", fake_run):
             with self.assertRaises(bakeoff.ChildRunError):
                 bakeoff.run_bakeoff_isolated(
-                    ["whispercpp=/a.bin", "voxtral_mlx=/b", "whisper_openai=turbo"],
+                    ["whispercpp=/a.bin", "voxtral_mlx=/b", "whispercpp=/c.bin"],
                     Path("tests/fixtures/audio"),
                 )
         self.assertEqual(len(calls), 1)

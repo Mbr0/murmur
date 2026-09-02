@@ -4,10 +4,10 @@ Record each decision from MASTER.md with the data that settled it.
 
 | # | Decision | Status | Data |
 |---|----------|--------|------|
-| D1 | Primary local engine | Open — harness ready, awaiting real recordings | Candidates: Voxtral Mini 4B Realtime 4-bit (MLX), whisper.cpp large-v3-turbo, current openai-whisper. Clips: EN/FR/NL/DE dictation, 10 each, recorded by us (`tests/fixtures/audio/README.md`). Run `scripts/tools/bakeoff.py`. Caveat found in Wave 0: Voxtral Realtime through mlx-audio 0.5.1 accepts no language and no vocabulary/prompt parameter, so hints cannot bias it; whisper.cpp accepts both. |
+| D1 | Primary local engine | Provisional 2026-09-02 (synthetic clips) — whisper.cpp large-v3-turbo q5_0 default on all Macs; Voxtral Mini 4B Realtime opt-in on Apple Silicon ≥16 GB | Bake-off below on 40 `say`-generated clips (10 per language, 8–12 s). whisper.cpp: 0.70 s median per 10 s clip, 0.66 GB, WER on par (better FR, slightly worse EN/NL). Voxtral: 4.79 s batch latency, 1.81 GB, no language or vocabulary hints in mlx-audio 0.5.1; its value is streaming partials for the live pill. openai-whisper medium (the retired baseline): 1.54 s, 1.77 GB. Re-run `scripts/tools/bakeoff.py` on real EN/FR/NL/DE recordings before Wave 5 ships; FR WER is inflated for every engine by the synthetic voice. |
 | D2 | whisper.cpp via bundled `whisper-server` over HTTP | Amended 2026-09-02 | whisper-server v1.7.5 (pinned) exposes no `/v1/audio/transcriptions`; the client uses native `POST /inference` (multipart `file`, `language`, `prompt`, `response_format=verbose_json`) and `GET /health`. Same child-process-over-HTTP pattern as Boske, not the same route. Server is started with `-l auto` because its default is English. |
-| D3 | Cleanup via bundled `llama-server` and a ~3B GGUF | Proposed | Apache 2.0 model required. |
-| D4 | Updater | Open, Wave 1d | Sparkle 2 via PyObjC vs signed-DMG updater. |
+| D3 | Cleanup via bundled `llama-server` and a ~3B GGUF | Confirmed 2026-09-02 | Model `mistralai/Ministral-3-3B-Instruct-2512-GGUF` Q4_K_M (2.1 GB, Apache 2.0, licence verified via the HF API); llama.cpp pinned `v0.3.0`, Metal. Smoke test on this M-series 24 GB Mac: server ready in 16.4 s cold; cleanup of 41/93/113-word dictations in 0.84/1.45/1.68 s against a 3.0 s budget (policy: 2 s per 100 words, min 3 s, cap 20 s); message, mail and notes modes produced usable text with fillers removed and vocabulary terms preserved. |
+| D4 | Updater | Decided 2026-09-02 — signed-build updater | No Sparkle framework is vendored and Sparkle-through-PyObjC inside a PyInstaller bundle could not be verified, so `services/update_service.py` ships the fallback: GitHub releases feed, SemVer compare, DMG download, then `codesign --verify --deep --strict` + `spctl --assess --type open --context context:primary-signature` + Team ID match against `MURMUR_EXPECTED_TEAM_ID`/`build_info.json` before `hdiutil` mount, rename-swap and relaunch. Ad-hoc or unknown-team builds are refused. |
 | D5 | Pro gated by license, repo stays MIT | Proposed | |
 | D6 | Cloud auth through Boske lease tokens and device linking | Proposed | Requires Boske to expose the linking flow to Murmur. |
 | D7 | Intel Macs on whisper.cpp only | Confirmed by code | `select_engine_id()` returns whisper.cpp for Intel or under 16 GB; Voxtral engine refuses to load off arm64. |
@@ -16,9 +16,13 @@ Record each decision from MASTER.md with the data that settled it.
 
 _To be filled by `scripts/tools/bakeoff.py` once real EN/FR/NL/DE clips exist (harness landed in Wave 0; `scripts/tools/make_synthetic_fixtures.sh` produces `say`-based clips for smoke-testing the harness only, never for deciding D1)._
 
+**Run 2026-09-02, M-series 24 GB, macOS 27, synthetic `say` fixtures (40 clips), `--runs 1`, one engine per process.** whisper.cpp v1.7.5 Metal; mlx-audio 0.5.1; openai-whisper 20250625 on MPS.
+
 | Engine | Model | EN WER | FR WER | NL WER | DE WER | Median latency (10 s clip) | Peak RAM |
 |--------|-------|--------|--------|--------|--------|----------------------------|----------|
-| | | | | | | | |
+| whispercpp | whispercpp-large-v3-turbo-q5_0/ggml-large-v3-turbo-q5_0.bin | 10.0% | 42.6% | 14.7% | 13.8% | 0.70s | 0.66 GB |
+| voxtral_mlx | voxtral-mini-4b-realtime-4bit | 8.6% | 53.4% | 9.1% | 13.0% | 4.79s | 1.81 GB |
+| whisper_openai | medium | 9.0% | 53.7% | 9.5% | 13.0% | 1.54s | 1.77 GB |
 
 ## Wave 0 findings (2026-09-02)
 

@@ -7,34 +7,17 @@ Shortcut: Option+Space to start/stop recording
 import sys
 import os
 
-# Add bundled ffmpeg to PATH FIRST if running in PyInstaller bundle
-# This must happen before any imports that might use ffmpeg
+# Put the bundled resources directory on PATH before anything that shells out.
+# The bundled `whisper-server` lives there, so a plain command name resolves to
+# the bundled copy without any monkey-patching of subprocess.
 if hasattr(sys, '_MEIPASS'):
-    # Add the bundled directory to PATH
     os.environ['PATH'] = sys._MEIPASS + os.pathsep + os.environ.get('PATH', '')
-    
-    # Also patch whisper's audio module to use the bundled ffmpeg directly
-    import subprocess
-    _original_run = subprocess.run
-    _ffmpeg_path = os.path.join(sys._MEIPASS, 'ffmpeg')
-    
-    def _patched_run(cmd, *args, **kwargs):
-        # If the command starts with 'ffmpeg', replace it with the full path
-        if cmd and isinstance(cmd, list) and cmd[0] == 'ffmpeg':
-            cmd = [_ffmpeg_path] + cmd[1:]
-        elif cmd and isinstance(cmd, str) and cmd.startswith('ffmpeg'):
-            cmd = cmd.replace('ffmpeg', _ffmpeg_path, 1)
-        return _original_run(cmd, *args, **kwargs)
-    
-    subprocess.run = _patched_run
 
 import fcntl
 import json
 import rumps
 import sounddevice as sd
 import numpy as np
-import urllib.error
-import urllib.request
 import logging
 
 
@@ -90,7 +73,6 @@ logger = _configure_logging()
 
 if hasattr(sys, '_MEIPASS'):
     logger.info(f"Added bundled resources to PATH: {sys._MEIPASS}")
-    logger.info(f"Patched subprocess.run to use bundled ffmpeg")
 
 import pyperclip
 import threading
@@ -99,15 +81,29 @@ import scipy.io.wavfile as wav
 import time
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from cleanup.vocabulary import (
+    apply_replacements,
+    hints_from_vocabulary,
+    vocabulary_from_config,
+)
 from engines import create_engine
+from engines.model_store import ModelIntegrityError, ModelStore, models_for_engine
 from transcription_filters import is_likely_hallucination, should_skip_audio
+from ui.onboarding_window import OnboardingCallbacks, should_show, show_onboarding
 from services.audio_capture_service import AudioCaptureService
+from services.language_service import resolve_language
 from services.hotkey_service import (
+    ACTION_START,
+    ACTION_STOP,
+    KEY_UP_MODES,
+    PressController,
     format_hotkey,
     format_hotkey_from_config,
     hotkey_diagnostics,
     hotkey_from_config,
+    hotkey_mode_from_config,
     hotkey_permissions_ok,
     is_bundled_app,
     log_hotkey_diagnostics,
@@ -118,7 +114,7 @@ from services.hotkey_service import (
     reset_accessibility_permission,
     unregister_global_hotkey,
 )
-from services.model_profile_service import default_model_for_current_machine
+from services.model_profile_service import default_engine_for_current_machine
 from services.persistence_service import (
     DEFAULT_CONFIG,
     PersistencePaths,
@@ -126,6 +122,7 @@ from services.persistence_service import (
     should_log_sensitive,
 )
 from services.text_insertion_service import TextInsertionService
+from services.update_service import UpdateService, cleanup_previous_bundles, read_build_info
 import ui_alerts
 
 import objc
@@ -147,8 +144,9 @@ from PyObjCTools import AppHelper
 SAMPLE_RATE = 16000
 APP_NAME = "Murmur"
 APP_VERSION = "1.0.0"
-GITHUB_RELEASES_LATEST_URL = "https://api.github.com/repos/Mbr0/murmur/releases/latest"
-UPDATE_CHECK_TIMEOUT_SECONDS = 5.0
+
+#: Length of the wizard's "Try it" recording, in seconds.
+ONBOARDING_TEST_SECONDS = 4.0
 
 # Config file for settings
 CONFIG_FILE = os.path.expanduser("~/.murmur_config.json")
@@ -188,10 +186,8 @@ def migrate_legacy_data():
 
 migrate_legacy_data()
 
-# Load model from config
-default_model = default_model_for_current_machine()
-_config = PERSISTENCE.load_config(default={"model": default_model, **DEFAULT_CONFIG})
-MODEL_SIZE = _config.get("model", default_model)
+# The engine and model come from config at load time (see MurmurApp.load_model);
+# nothing about the speech engine is decided at import.
 PERSISTENCE.ensure_audio_dir(AUDIO_DIR)
 
 # Get resource path (works for both dev and PyInstaller bundle)
@@ -263,7 +259,7 @@ def _reload_ui_theme():
     if "ui_theme" in sys.modules:
         importlib.reload(sys.modules["ui_theme"])
     import ui_theme
-    config = PERSISTENCE.load_config(default={"model": default_model, **DEFAULT_CONFIG})
+    config = PERSISTENCE.load_config(default=dict(DEFAULT_CONFIG))
     ui_theme.set_appearance_mode(config.get("appearance_mode", "system"))
     logger.info(
         f"UI theme {ui_theme.THEME_VERSION} ({ui_theme.appearance_mode()}) "
@@ -357,6 +353,21 @@ def should_reject_toggle(*, loading: bool, is_processing: bool, model_ready: boo
     return loading or is_processing or not model_ready
 
 
+def should_toggle_for_press_action(action: str | None, *, is_recording: bool) -> bool:
+    """Whether a PressController action needs the recorder toggled.
+
+    The controller decides what the press means; this decides whether the app is
+    already in that state. Unknown actions raise instead of being ignored.
+    """
+    if action is None:
+        return False
+    if action == ACTION_START:
+        return not is_recording
+    if action == ACTION_STOP:
+        return is_recording
+    raise ValueError(f"Unknown press action: {action!r}")
+
+
 def should_reject_upload(
     *, loading: bool, is_recording: bool, is_processing: bool, model_ready: bool
 ) -> bool:
@@ -431,90 +442,330 @@ def skip_audio_user_message(duration_seconds: float, max_level: float) -> str:
     return "Recording was too quiet to transcribe."
 
 
-def normalize_release_tag(tag: str) -> str:
-    cleaned = tag.strip()
-    if len(cleaned) >= 2 and cleaned[0] in ("v", "V") and cleaned[1].isdigit():
-        return cleaned[1:]
-    return cleaned
+#: Config key naming the engine's model; ``None`` until the user or the
+#: defaults below fill it in.
+CONFIG_ENGINE_ID = "engine_id"
+CONFIG_MODEL_ID = "model_id"
+
+#: The pre-Wave-1 config key, a bare openai-whisper size such as ``"medium"``.
+#: Its presence is what marks a config as needing the one-off migration.
+LEGACY_MODEL_KEY = "model"
+
+#: Menu status while no speech model is on disk.
+NO_MODEL_STATUS = "No speech model installed"
+
+#: Menu status while the engine is being swapped.
+SWITCHING_STATUS = "Switching engine…"
+
+#: Where :func:`missing_model_action` sends a user with no model.
+MISSING_MODEL_ONBOARDING = "onboarding"
+MISSING_MODEL_SETTINGS = "settings"
+
+#: Outcomes of :func:`reload_engine_decision`.
+RELOAD_START = "start"
+RELOAD_UNCHANGED = "unchanged"
+RELOAD_BUSY = "busy"
+RELOAD_RECORDING = "recording"
+
+#: Why a reload was refused, in the user's words. A refusal is never silent.
+RELOAD_REFUSAL_MESSAGES = {
+    RELOAD_BUSY: "Murmur is still busy. Choose the model again in a moment.",
+    RELOAD_RECORDING: "Stop recording before switching the speech engine.",
+}
+
+#: Config key remembering which engines already showed the "hints ignored"
+#: notice: ``{engine_id: True}``. Shown once per engine, never per recording.
+HINTS_NOTICE_KEY = "hints_notice_shown"
 
 
-def _version_tuple(version: str) -> tuple[int, ...]:
-    parts: list[int] = []
-    for segment in normalize_release_tag(version).split("."):
-        digits = []
-        for char in segment:
-            if char.isdigit():
-                digits.append(char)
-            else:
-                break
-        if not digits:
-            raise ValueError(f"Invalid version: {version}")
-        parts.append(int("".join(digits)))
-    if not parts:
-        raise ValueError(f"Invalid version: {version}")
-    return tuple(parts)
+@dataclass(frozen=True)
+class EngineSelection:
+    """Which engine and model to load, and whether config has to catch up."""
+
+    engine_id: str
+    model_id: str
+    #: True when config did not name both keys and must be written back.
+    needs_persist: bool
+    #: True when that write is the one-off migration off ``LEGACY_MODEL_KEY``.
+    from_legacy_model_key: bool
 
 
-def is_newer_version(latest: str, current: str) -> bool:
-    """True when latest release tag is strictly newer than the installed version."""
-    return _version_tuple(latest) > _version_tuple(current)
-
-
-def parse_latest_release_tag(payload: dict) -> str:
-    tag = payload.get("tag_name")
-    if not isinstance(tag, str) or not tag.strip():
-        raise ValueError("Missing tag_name in release payload")
-    return tag.strip()
-
-
-def check_for_update_message(
-    *, current_version: str, latest_tag: str | None, error: str | None
-) -> str:
-    """User-facing update status. Never includes audio or transcription content."""
-    offline = (
-        "Could not check for updates. Check your network connection and try again."
-    )
-    if error is not None or latest_tag is None:
-        return offline
-    current = normalize_release_tag(current_version)
-    latest = normalize_release_tag(latest_tag)
-    try:
-        if is_newer_version(latest_tag, current_version):
-            return (
-                f"Update available: {latest} (you have {current}).\n"
-                "Download from GitHub Releases: github.com/Mbr0/murmur/releases"
-            )
-        if is_newer_version(current_version, latest_tag):
-            return (
-                f"Your version ({current}) is ahead of the latest release ({latest})."
-            )
-    except ValueError:
-        return offline
-    return f"You're on the latest version ({current})."
-
-
-def fetch_latest_release_tag(
-    url: str = GITHUB_RELEASES_LATEST_URL,
+def resolve_engine_selection(
+    config: dict,
     *,
-    timeout: float = UPDATE_CHECK_TIMEOUT_SECONDS,
-) -> str:
-    """Fetch latest GitHub release tag only (version metadata; no audio/text upload)."""
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": f"Murmur/{APP_VERSION}",
-        },
-        method="GET",
+    default_engine_id: str,
+    model_ids_for_engine,
+) -> EngineSelection:
+    """Resolve the engine and model to load from config, filling in defaults.
+
+    A config that names both keys is honoured as-is. A missing engine falls
+    back to this machine's default (chip and RAM, decision D1); a missing model
+    falls back to the first catalog model of whichever engine won. Either gap
+    means the resolved pair is written back, so the choice is made exactly once
+    — including for a legacy config that only carried ``model``.
+
+    An engine with no catalog model at all is a packaging error, not a user
+    state, so it raises rather than silently picking another engine.
+    """
+    assert config is not None, "config is required"
+    assert default_engine_id, "default_engine_id is required"
+
+    engine_id = config.get(CONFIG_ENGINE_ID)
+    if not isinstance(engine_id, str) or not engine_id:
+        engine_id = default_engine_id
+
+    model_id = config.get(CONFIG_MODEL_ID)
+    if not isinstance(model_id, str) or not model_id:
+        candidates = tuple(model_ids_for_engine(engine_id))
+        if not candidates:
+            raise ValueError(f"No catalog model for engine {engine_id!r}")
+        model_id = candidates[0]
+
+    needs_persist = (
+        config.get(CONFIG_ENGINE_ID) != engine_id or config.get(CONFIG_MODEL_ID) != model_id
     )
+    return EngineSelection(
+        engine_id=engine_id,
+        model_id=model_id,
+        needs_persist=needs_persist,
+        from_legacy_model_key=needs_persist and LEGACY_MODEL_KEY in config,
+    )
+
+
+def missing_model_action(config: dict) -> str:
+    """Where to send a user whose chosen model is not downloaded.
+
+    A Mac that never finished the wizard gets the wizard, which can download
+    the model in place; anyone else gets Settings, where the same download
+    lives. Neither path falls back to another engine behind the user's back.
+    """
+    assert config is not None, "config is required"
+    return MISSING_MODEL_ONBOARDING if should_show(config) else MISSING_MODEL_SETTINGS
+
+
+def model_unavailable_message(reason: str | None) -> str:
+    """Body of the "cannot record/transcribe" notification.
+
+    ``reason`` is the menu status when one explains the block (no model
+    installed), and None when the engine simply failed to load.
+    """
+    if not reason:
+        return "Recording is unavailable until the model loads successfully."
+    return f"{reason}. Download one from Settings → Speech engine."
+
+
+def model_status_title(display_name: str | None) -> str:
+    """Title of the menu's engine status line."""
+    return f"Model: {display_name}" if display_name else NO_MODEL_STATUS
+
+
+def reload_engine_decision(
+    *,
+    requested: tuple[str, str],
+    active: tuple[str | None, str | None],
+    is_reloading: bool,
+    is_recording: bool,
+    is_processing: bool,
+    engine_ready: bool,
+) -> str:
+    """Whether a requested engine swap may start now.
+
+    Policy: refuse rather than queue. A queued swap would fire minutes later,
+    long after the user stopped thinking about it, and a refusal that says so
+    is easier to act on than a delayed surprise. Recording and transcription
+    both hold the engine, so both block; a second request while one is already
+    in flight is refused too.
+    """
+    assert requested and len(requested) == 2, "requested is (engine_id, model_id)"
+    if is_reloading:
+        return RELOAD_BUSY
+    if is_recording:
+        return RELOAD_RECORDING
+    if is_processing:
+        return RELOAD_BUSY
+    if engine_ready and tuple(active) == tuple(requested):
+        return RELOAD_UNCHANGED
+    return RELOAD_START
+
+
+def should_show_hints_notice(
+    config: dict, engine_id: str, *, hints_applied: bool | None, has_terms: bool
+) -> bool:
+    """Whether to tell the user this engine ignored their vocabulary terms.
+
+    Only when there were terms to ignore, only when the engine said outright
+    that it did not use them (``False``, not the ``None`` that means "nothing
+    to apply"), and only the first time for that engine.
+    """
+    assert config is not None, "config is required"
+    assert engine_id, "engine_id is required"
+    if not has_terms or hints_applied is not False:
+        return False
+    shown = config.get(HINTS_NOTICE_KEY) or {}
+    return not bool(shown.get(engine_id))
+
+
+def remember_hints_notice(config: dict, engine_id: str) -> dict:
+    """Return a copy of ``config`` marking the notice as shown for ``engine_id``."""
+    assert config is not None, "config is required"
+    assert engine_id, "engine_id is required"
+    shown = dict(config.get(HINTS_NOTICE_KEY) or {})
+    shown[engine_id] = True
+    return {**config, HINTS_NOTICE_KEY: shown}
+
+
+def hints_notice_message(engine_name: str) -> str:
+    """The one-time notice itself. Names the engine, never the transcript."""
+    assert engine_name, "engine_name is required"
+    return f"Vocabulary hints are not supported by {engine_name}"
+
+
+def push_to_talk_degraded_message(mode: str) -> str | None:
+    """What to tell the user when the chosen press mode cannot run as chosen.
+
+    ``hold`` and ``auto`` both need to see the key release, which macOS only
+    delivers through an NSEvent monitor, which needs Accessibility. Without it
+    Murmur runs the shortcut as ``toggle``. Saying so beats leaving the user
+    holding a key that will never stop the recording. None when there is
+    nothing to explain.
+    """
+    if mode not in KEY_UP_MODES:
+        return None
+    return (
+        f"Push-to-talk “{mode}” needs Accessibility to see the key release. "
+        "Until it is granted, the shortcut toggles recording on and off instead."
+    )
+
+
+def finalize_transcript(
+    raw_text: str,
+    vocabulary,
+    *,
+    detect_hallucination=is_likely_hallucination,
+    replace=apply_replacements,
+) -> tuple[str, bool]:
+    """Return ``(text to paste, was a hallucination)`` for one raw transcript.
+
+    The filter reads the engine's own words, before the user's replacements
+    rewrite them. Running it afterwards let a replacement hide a classic
+    silence hallucination from the filter — and let one whose output happened
+    to look like a hallucination suppress a real transcript.
+    """
+    assert raw_text is not None, "raw_text is required"
+    hallucination = bool(detect_hallucination(raw_text))
+    return replace(raw_text, vocabulary), hallucination
+
+
+def model_integrity_message(display_name: str) -> str:
+    """What to say when a model's files no longer match their checksums."""
+    assert display_name, "display_name is required"
+    return (
+        f"{display_name} failed verification: its files do not match the "
+        "checksums on record. Delete and re-download the model from "
+        "Settings → Speech engine."
+    )
+
+
+def verify_model_before_load(store, model_id: str, verified: set) -> None:
+    """Re-hash ``model_id`` before an engine is pointed at it, once per process.
+
+    ``ModelStore.is_installed`` compares file sizes only, so a truncated,
+    swapped or tampered model passes it and the engine happily loads whatever
+    is on disk. Verification reads every byte, which costs a few seconds per
+    gigabyte, so ``verified`` remembers the ids already checked in this process;
+    the caller drops an id again after a download or an engine switch.
+
+    A mismatch is re-raised as a plain :class:`RuntimeError` so it reaches the
+    user through the same alert as any other failed load.
+    """
+    assert store is not None, "store is required"
+    assert model_id, "model_id is required"
+    assert verified is not None, "verified is required"
+    if model_id in verified:
+        return
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as error:
-        raise RuntimeError("offline") from error
-    if not isinstance(payload, dict):
-        raise ValueError("Unexpected release payload")
-    return parse_latest_release_tag(payload)
+        store.verify(model_id)
+    except ModelIntegrityError as error:
+        raise RuntimeError(model_integrity_message(model_id)) from error
+    verified.add(model_id)
+
+
+def about_menu_title(version: str, build_info: dict) -> str:
+    """The About line: version, plus a warning when the build is not signed.
+
+    ``build_info`` is ``{}`` outside a bundle, so a source run says nothing
+    about signing; only a real bundle that reports ``signed: false`` is
+    labelled, matching what CI writes into ``build_info.json``.
+    """
+    assert version, "version is required"
+    title = f"{APP_NAME} {version}"
+    if build_info.get("signed") is False:
+        return f"{title} · internal build"
+    return title
+
+
+def update_available_message(latest_version: str, current_version: str) -> str:
+    """Alert body offering an update. Version metadata only."""
+    assert latest_version, "latest_version is required"
+    assert current_version, "current_version is required"
+    return (
+        f"Murmur {latest_version} is available (you have {current_version}).\n\n"
+        "Murmur will download it, check its signature, replace this copy, and "
+        "restart itself."
+    )
+
+
+def should_relaunch_after_install(result) -> bool:
+    """Whether this process must start the new bundle before it quits.
+
+    ``install_update`` puts the new app in place but does not run it, because
+    only the running app knows how to shut itself down cleanly. So Murmur
+    launches the new bundle itself and then quits, and the user never has to
+    reopen anything. Skipped only when the installer already relaunched.
+    """
+    assert result is not None, "result is required"
+    return not bool(getattr(result, "relaunched", False))
+
+
+def update_installed_message(version: str) -> str:
+    """Said as the app hands over to the version it just installed."""
+    assert version, "version is required"
+    return f"Murmur {version} is installed. Restarting now."
+
+
+def update_relaunch_failed_message(version: str) -> str:
+    """Said when the new bundle is in place but would not start."""
+    assert version, "version is required"
+    return (
+        f"Murmur {version} is installed, but it could not be started. "
+        "Quit Murmur and open it again."
+    )
+
+
+def download_progress_status(bytes_done: int, bytes_total: int | None) -> str:
+    """Menu status while an update downloads. Percent when the size is known."""
+    assert bytes_done >= 0, f"bytes_done cannot be negative: {bytes_done}"
+    if not bytes_total or bytes_total <= 0:
+        return f"Downloading update… {bytes_done // 1_000_000} MB"
+    percent = min(100, int(bytes_done * 100 / bytes_total))
+    return f"Downloading update… {percent}%"
+
+
+def front_app_bundle_id() -> str | None:
+    """Bundle id of the frontmost app, or None when macOS will not say.
+
+    Used to pick a per-app language. Wave 2 moves this into ``cleanup/context.py``
+    alongside the window title and selection probes.
+    """
+    try:
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+    except Exception as error:
+        logger.debug("Could not read the frontmost application: %s", error)
+        return None
+    if app is None:
+        return None
+    bundle_id = app.bundleIdentifier()
+    return str(bundle_id) if bundle_id else None
 
 
 class _HotkeyActivationObserver(NSObject):
@@ -603,7 +854,9 @@ class MurmurApp(rumps.App):
         # State
         self.is_recording = False
         self.is_processing = False
-        self._whisper_lock = threading.Lock()
+        # Held for the whole of a transcription and for an engine swap, so a
+        # model can never be unloaded from under a decode in flight.
+        self._engine_lock = threading.Lock()
         self.persistence = PERSISTENCE
         self.history = self.load_history()
         self.audio_capture = AudioCaptureService(sample_rate=SAMPLE_RATE, logger=logger)
@@ -611,6 +864,19 @@ class MurmurApp(rumps.App):
         # becomes the same status/notification/alert as a failed load instead of
         # killing the app before the menu bar exists.
         self.engine = None
+        self.engine_id = None
+        self.model_id = None
+        # Set when the block has a better explanation than "it failed to load"
+        # (today: nothing is downloaded yet). Read by the two rejection paths.
+        self.engine_unavailable_reason = None
+        self._engine_reloading = False
+        self._update_status_line = None
+        #: Model ids whose checksums this process has already read. See
+        #: :func:`verify_model_before_load`.
+        self._verified_models = set()
+        #: Last non-transient engine status line, so a temporary title (an
+        #: update download) can be undone without restoring a stale one.
+        self._model_status_title = "Loading model…"
         self.text_inserter = TextInsertionService(logger=logger)
         
         # Menu items - SuperWhisper style
@@ -630,6 +896,9 @@ class MurmurApp(rumps.App):
         self._restore_microphone_from_config()
         self.update_microphone_menu()
         
+        # Engine status line: the model in use, the swap in progress, or the
+        # reason dictation is unavailable. Updated by load_model/reload_engine.
+        self.model_item = rumps.MenuItem("Loading model…", callback=None)
         self.menu = [
             self.start_stop_item,
             self.upload_item,
@@ -637,22 +906,34 @@ class MurmurApp(rumps.App):
             self.settings_item,
             self.mic_menu,
             None,  # Separator
-            rumps.MenuItem(f"Model: {MODEL_SIZE.capitalize()}", callback=None),
-            rumps.MenuItem(f"Murmur {APP_VERSION}", callback=None),
+            self.model_item,
+            rumps.MenuItem(about_menu_title(APP_VERSION, read_build_info()), callback=None),
             rumps.MenuItem("Check for Updates...", callback=self.check_updates),
+            rumps.MenuItem("Welcome Tour…", callback=self.open_welcome_tour),
             rumps.MenuItem("Enable Shortcut Permission...", callback=self.enable_shortcut_permission),
             None,
             rumps.MenuItem("Quit", callback=self.quit_app, key="q"),
         ]
-        
+
         # Load model in background
         self.loading = True
         threading.Thread(target=self.load_model, daemon=True).start()
-        
+
+        # An update leaves the bundle it replaced beside the new one. This is
+        # the launch that can safely delete it: nothing is loading out of it.
+        threading.Thread(target=self._clean_previous_bundles, daemon=True).start()
+
+        # First run: the wizard opens once the menu bar and run loop exist.
+        self._onboarding_timer = rumps.Timer(self._maybe_show_onboarding, 0.6)
+        self._onboarding_timer.start()
+
         # Register global shortcut after the run loop is active.
         self._hotkey_registration = None
         self._hotkey_retry_timer = None
         self._hotkey_permission_notified = False
+        self._push_to_talk_degraded_notified = False
+        # Replaced by reload_hotkey with the configured mode once the run loop starts.
+        self._press_controller = PressController()
         self._hotkey_activation_observer = _HotkeyActivationObserver.alloc().initWithCallback_(
             self._on_application_active
         )
@@ -758,13 +1039,10 @@ class MurmurApp(rumps.App):
             )
     
     def open_settings(self, _):
-        """Open settings window"""
-        try:
-            show_settings_window_direct()
-        except Exception:
-            logger.error("Could not open settings", exc_info=True)
-            ui_alerts.show_alert(APP_NAME, "Could not open Settings.")
-    
+        """Menu item: open the settings window."""
+        self.open_settings_window_safely()
+
+
     def open_history_window(self, _, selected_index=0):
         """Open the SuperWhisper-style history window"""
         try:
@@ -774,22 +1052,106 @@ class MurmurApp(rumps.App):
             ui_alerts.show_alert(APP_NAME, "Could not open History.")
 
     def check_updates(self, _):
-        """Compare installed version to latest GitHub release tag (metadata only)."""
-        latest_tag = None
-        error = None
+        """Ask the update feed off the main thread; the answer comes back as an alert."""
+        threading.Thread(target=self._check_updates_worker, daemon=True).start()
+
+    def _check_updates_worker(self):
+        """Fetch release metadata only. No audio, no text, nothing uploaded."""
         try:
-            latest_tag = fetch_latest_release_tag()
-        except Exception:
-            error = "offline"
-        ui_alerts.show_alert(
+            info = UpdateService(APP_VERSION).check()
+        except Exception as error:
+            logger.error("Update check failed: %s", error)
+            self._alert_on_main(
+                "Could not check for updates. Check your network connection and try again."
+            )
+            return
+        if info is None:
+            self._alert_on_main(f"You're on the latest version ({APP_VERSION}).")
+            return
+        self.run_on_main_thread(lambda: self._offer_update(info))
+
+    def _offer_update(self, info):
+        """Ask before downloading; installing replaces the running app."""
+        if not ui_alerts.show_confirm(
             APP_NAME,
-            check_for_update_message(
-                current_version=APP_VERSION,
-                latest_tag=latest_tag,
-                error=error,
-            ),
-        )
-    
+            update_available_message(info.version, APP_VERSION),
+            ok="Download & Install",
+            cancel="Later",
+        ):
+            return
+        threading.Thread(target=self._install_update_worker, args=(info,), daemon=True).start()
+
+    def _install_update_worker(self, info):
+        """Download, verify the signature, install. Progress goes to the menu.
+
+        The line is only borrowed: it is restored to whatever the engine status
+        is when the download ends, not to the string it held when it started. A
+        download runs for minutes, and the engine can be swapped or fail in that
+        time — putting the old title back would then lie about the engine.
+        """
+
+        def progress(bytes_done, bytes_total):
+            line = download_progress_status(bytes_done, bytes_total)
+            if line == self._update_status_line:
+                return  # every chunk ticks; only redraw when the text changes
+            self._update_status_line = line
+            self._set_model_menu_title(line, transient=True)
+
+        try:
+            result = UpdateService(APP_VERSION).download_and_install(info, progress)
+        except Exception as error:
+            logger.error("Update install failed: %s", error)
+            self._set_model_menu_title(self._model_status_title)
+            self._alert_on_main(f"Could not install Murmur {info.version}.\n\n{error}")
+            return
+        finally:
+            self._update_status_line = None
+        self._set_model_menu_title(self._model_status_title)
+        self._relaunch_into_update(info.version, result)
+
+    def _relaunch_into_update(self, version, result):
+        """Start the newly installed bundle, then quit this one.
+
+        The installer deliberately does not launch it: only the running app can
+        close its engine, its audio stream and its hotkey registration in that
+        order. So the handover is here — start the new copy, say so, quit. A
+        launch that fails leaves the installed app in place and tells the user
+        to reopen it by hand rather than quitting into nothing.
+        """
+        if should_relaunch_after_install(result):
+            try:
+                subprocess.Popen(list(result.relaunch_cmd))
+            except OSError as error:
+                logger.error("Could not start the updated Murmur: %s", error)
+                self._alert_on_main(update_relaunch_failed_message(version))
+                return
+        logger.info("Handing over to Murmur %s", version)
+        self.run_on_main_thread(lambda: self._quit_into_update(version))
+
+    def _quit_into_update(self, version):
+        """Notify (never a modal, which the quit would race) and shut down."""
+        rumps.notification(APP_NAME, "Update installed", update_installed_message(version))
+        self.quit_app(None)
+
+    def _clean_previous_bundles(self):
+        """Remove the bundles a past update set aside. Logged, never surfaced.
+
+        Leftover clutter is not the user's problem and must not delay or break a
+        launch, so a failure here goes to the log and nowhere else.
+        """
+        try:
+            removed = cleanup_previous_bundles()
+        except Exception as error:
+            logger.warning("Could not remove bundles left by a previous update: %s", error)
+            return
+        if removed:
+            logger.info("Removed %d bundle(s) left by a previous update", len(removed))
+
+    def _alert_on_main(self, message, *, title=APP_NAME):
+        """Show an alert from any thread."""
+        self.run_on_main_thread(lambda: ui_alerts.show_alert(title, message))
+
+
     def run_on_main_thread(self, func):
         """Run a function on the main thread - required for UI updates from background threads"""
         if threading.current_thread() is threading.main_thread():
@@ -804,8 +1166,7 @@ class MurmurApp(rumps.App):
 
     def runtime_config(self):
         """Load current config from disk (includes privacy retention settings)."""
-        default = {"model": default_model_for_current_machine(), **DEFAULT_CONFIG}
-        return self.persistence.load_config(default)
+        return self.persistence.load_config(dict(DEFAULT_CONFIG))
     
     def save_history(self):
         """Save transcription history to file"""
@@ -824,37 +1185,368 @@ class MurmurApp(rumps.App):
         )
         self.save_history()
     
+    # -- speech engine ---------------------------------------------------
+
+    def _model_ids_for_engine(self, engine_id):
+        """Catalog model ids belonging to ``engine_id``, in catalog order."""
+        return tuple(spec.id for spec in models_for_engine(engine_id))
+
+    def _resolve_selection(self, config):
+        """Resolve engine and model from config, writing back defaults once."""
+        selection = resolve_engine_selection(
+            config,
+            default_engine_id=default_engine_for_current_machine(),
+            model_ids_for_engine=self._model_ids_for_engine,
+        )
+        if selection.needs_persist:
+            updated = {
+                **config,
+                CONFIG_ENGINE_ID: selection.engine_id,
+                CONFIG_MODEL_ID: selection.model_id,
+            }
+            self.persistence.save_config(updated)
+            if selection.from_legacy_model_key:
+                logger.info(
+                    "Migrated legacy model setting to engine %s with model %s",
+                    selection.engine_id,
+                    selection.model_id,
+                )
+        return selection
+
+    def _notify_settings_engine_reloaded(self):
+        """Let an open Settings window re-offer the new engine's languages.
+
+        Its Language popup is built when the window opens; after a live swap it
+        would otherwise keep listing the languages of an engine that is no
+        longer running. Best effort: no Settings window is the normal case.
+        """
+        engine = self.engine
+        if engine is None:
+            return
+        try:
+            info = engine.info()
+        except Exception as error:
+            logger.warning("Could not read the new engine's info: %s", error)
+            return
+
+        def notify():
+            for controller in list(_window_controllers):
+                hook = getattr(controller, "engine_reloaded", None)
+                if hook is None:
+                    continue
+                try:
+                    hook(info)
+                except Exception as error:
+                    logger.warning("Settings could not follow the engine swap: %s", error)
+
+        self.run_on_main_thread(notify)
+
+    def _model_display_name(self, model_id):
+        """Catalog display name for a model id, falling back to the id itself."""
+        try:
+            return ModelStore().spec(model_id).display_name
+        except Exception:
+            return model_id
+
+    def _set_model_menu_title(self, title, *, transient=False):
+        """Write the engine status line in the menu, from any thread.
+
+        ``transient=True`` marks a title that borrows the line for something
+        else (an update download), so it is not remembered as the engine's
+        status and cannot be restored later.
+        """
+        if not transient:
+            self._model_status_title = title
+        self.run_on_main_thread(lambda: setattr(self.model_item, "title", title))
+
+    def _engine_display_name(self):
+        """What to call the running engine in user-facing copy."""
+        engine = self.engine
+        if engine is not None:
+            try:
+                return engine.info().name
+            except Exception:
+                pass
+        return self.engine_id or "this engine"
+
+    def _note_hints_support(self, config, transcript, vocabulary):
+        """Say once, per engine, when the user's terms could not bias the decode.
+
+        Voxtral Realtime takes no biasing argument at all, so a user who typed
+        a vocabulary would otherwise wonder why it changed nothing. The notice
+        names the engine and never the transcript.
+        """
+        engine_id = self.engine_id or transcript.engine_id
+        if not should_show_hints_notice(
+            config,
+            engine_id,
+            hints_applied=transcript.hints_applied,
+            has_terms=bool(vocabulary.terms),
+        ):
+            return
+        self.persistence.save_config(remember_hints_notice(self.runtime_config(), engine_id))
+        rumps.notification(
+            APP_NAME, "Vocabulary", hints_notice_message(self._engine_display_name())
+        )
+
     def load_model(self):
-        """Load the transcription engine"""
-        logger.info(f"Loading model: {MODEL_SIZE}")
+        """Load the configured speech engine. Runs on a background thread."""
         self.update_status("Loading model...")
         self._set_menu_bar_state("processing")
         try:
-            self.engine = create_engine("whisper_openai", model_name=MODEL_SIZE)
-            self.engine.load()
-            logger.info("Model loaded successfully %s", self.engine.runtime_summary())
-            self.loading = False
-            self.update_status(f"Ready ({format_hotkey_from_config(self.runtime_config())} to record)")
-            self._set_menu_bar_state("ready")
-            # Model loaded silently - no notification needed
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}", exc_info=True)
-            self.loading = False
-            self.update_status(f"Error: {str(e)[:30]}")
-            error_state = "error" if "error" in STATE_ICON_PATHS else "ready"
-            self._set_menu_bar_state(error_state)
-            rumps.notification(
-                APP_NAME,
-                "Model failed to load",
-                "Recording is unavailable until the model loads successfully.",
+            config = self.runtime_config()
+            selection = self._resolve_selection(config)
+            store = ModelStore()
+            if not store.is_installed(selection.model_id):
+                self._report_missing_model(config, selection)
+                return
+            self._activate_engine(selection.engine_id, selection.model_id, store)
+        except Exception as error:
+            self._report_engine_failure(error)
+
+    def _activate_engine(self, engine_id, model_id, store):
+        """Unload whatever is loaded, then build and publish the new engine.
+
+        The old engine goes first: two speech models resident at once run to
+        several gigabytes, and the Macs most likely to switch models are the
+        ones that can least afford holding both. The caller reports failures.
+
+        The files are checksummed before any of that: ``is_installed`` only
+        compares sizes, so it cannot tell a good model from a swapped one.
+        """
+        logger.info("Loading engine %s with model %s", engine_id, model_id)
+        verify_model_before_load(store, model_id, self._verified_models)
+        with self._engine_lock:
+            previous = self.engine
+            self.engine = None
+            self.engine_id = None
+            self.model_id = None
+            if previous is not None:
+                previous.unload()
+            engine = create_engine(engine_id, model_path=store.engine_model_path(model_id))
+            engine.load()
+            self.engine = engine
+            self.engine_id = engine_id
+            self.model_id = model_id
+        logger.info("Model loaded successfully %s", engine.runtime_summary())
+        self.loading = False
+        self.engine_unavailable_reason = None
+        self._set_model_menu_title(model_status_title(self._model_display_name(model_id)))
+        self.update_status(
+            f"Ready ({format_hotkey_from_config(self.runtime_config())} to record)"
+        )
+        self._set_menu_bar_state("ready")
+
+    def _report_missing_model(self, config, selection):
+        """No model on disk: say so plainly, then offer the way to get one.
+
+        Deliberately not a fallback to some other engine — the user chose this
+        one, and a silent substitution would misreport what is transcribing.
+        """
+        logger.info(
+            "Speech model %s for engine %s is not installed",
+            selection.model_id,
+            selection.engine_id,
+        )
+        self.loading = False
+        self.engine = None
+        self.engine_id = None
+        self.model_id = None
+        self.engine_unavailable_reason = NO_MODEL_STATUS
+        self.update_status(NO_MODEL_STATUS)
+        self._set_model_menu_title(NO_MODEL_STATUS)
+        error_state = "error" if "error" in STATE_ICON_PATHS else "ready"
+        self._set_menu_bar_state(error_state)
+        if missing_model_action(config) == MISSING_MODEL_ONBOARDING:
+            self.run_on_main_thread(self.show_onboarding_window)
+        else:
+            self.run_on_main_thread(self.open_settings_window_safely)
+
+    def _report_engine_failure(self, error):
+        """One status/notification/alert path for a failed load or a failed swap."""
+        logger.error("Failed to load the speech engine: %s", error, exc_info=True)
+        self.loading = False
+        self.engine_unavailable_reason = None
+        self.update_status(f"Error: {str(error)[:30]}")
+        self._set_model_menu_title("Speech engine unavailable")
+        error_state = "error" if "error" in STATE_ICON_PATHS else "ready"
+        self._set_menu_bar_state(error_state)
+        rumps.notification(
+            APP_NAME,
+            "Model failed to load",
+            "Recording is unavailable until the model loads successfully.",
+        )
+        self._alert_on_main(f"Could not load the speech model.\n\n{error}")
+
+    def reload_engine(self, engine_id: str, model_id: str) -> str | None:
+        """Swap the speech engine without a restart. Called by Settings.
+
+        Settings calls this on the main thread; the work itself runs on a
+        background thread so the popup does not freeze behind a model load.
+
+        Returns None when the swap started (or the pair is already loaded), and
+        the refusal message when it cannot happen now. The caller needs that
+        answer before it writes anything: config must never name an engine the
+        app declined to load.
+        """
+        assert engine_id, "engine_id is required"
+        assert model_id, "model_id is required"
+        decision = reload_engine_decision(
+            requested=(engine_id, model_id),
+            active=(self.engine_id, self.model_id),
+            is_reloading=self._engine_reloading,
+            is_recording=self.is_recording,
+            is_processing=self.is_processing,
+            engine_ready=engine_is_ready(self.engine),
+        )
+        if decision == RELOAD_UNCHANGED:
+            return None
+        if decision != RELOAD_START:
+            message = RELOAD_REFUSAL_MESSAGES[decision]
+            logger.info("Engine switch refused (%s)", decision)
+            self.update_status(message)
+            rumps.notification(APP_NAME, "Engine unchanged", message)
+            return message
+        # A switch is also how a freshly downloaded model arrives, so its
+        # checksums are read again rather than trusted from an earlier run.
+        self._verified_models.discard(model_id)
+        self._engine_reloading = True
+        threading.Thread(
+            target=self._reload_engine_worker,
+            args=(engine_id, model_id),
+            daemon=True,
+        ).start()
+        return None
+
+    def _reload_engine_worker(self, engine_id, model_id):
+        """Unload the old engine, load the new one, then persist the choice."""
+        self.update_status(SWITCHING_STATUS)
+        self._set_model_menu_title(SWITCHING_STATUS)
+        self._set_menu_bar_state("processing")
+        try:
+            store = ModelStore()
+            if not store.is_installed(model_id):
+                raise RuntimeError(
+                    f"{self._model_display_name(model_id)} is not downloaded yet."
+                )
+            self._activate_engine(engine_id, model_id, store)
+            # Written only once the engine really came up, and only these two
+            # keys: config must never claim an engine the app is not running.
+            self.persistence.update_config(
+                {CONFIG_ENGINE_ID: engine_id, CONFIG_MODEL_ID: model_id}
             )
-            self.run_on_main_thread(
-                lambda: ui_alerts.show_alert(
-                    APP_NAME,
-                    f"Could not load the speech model.\n\n{e}",
+            self._notify_settings_engine_reloaded()
+            logger.info("Switched to engine %s with model %s", engine_id, model_id)
+        except Exception as error:
+            self._report_engine_failure(error)
+        finally:
+            self._engine_reloading = False
+
+    # -- onboarding ------------------------------------------------------
+
+    def open_settings_window_safely(self):
+        """Open Settings from any code path without letting AppKit errors escape."""
+        try:
+            show_settings_window_direct()
+        except Exception:
+            logger.error("Could not open settings", exc_info=True)
+            ui_alerts.show_alert(APP_NAME, "Could not open Settings.")
+
+    def _maybe_show_onboarding(self, _sender=None):
+        """Open the wizard on a first run, once the menu bar exists."""
+        if self._onboarding_timer is not None:
+            self._onboarding_timer.stop()
+            self._onboarding_timer = None
+        if not should_show(self.runtime_config()):
+            return
+        self.show_onboarding_window()
+
+    def open_welcome_tour(self, _):
+        """Menu item: reopen the wizard whenever the user wants it."""
+        self.show_onboarding_window()
+
+    def show_onboarding_window(self):
+        """Show the wizard, wired to this app's recorder, engine and settings."""
+        try:
+            show_onboarding(
+                OnboardingCallbacks(
+                    download=ModelStore().download,
+                    record_and_transcribe=self._record_test_sentence,
+                    open_settings=lambda: self.run_on_main_thread(
+                        self.open_settings_window_safely
+                    ),
+                    on_finished=self._onboarding_finished,
                 )
             )
-    
+        except Exception:
+            logger.error("Could not open the welcome tour", exc_info=True)
+            ui_alerts.show_alert(APP_NAME, "Could not open the welcome tour.")
+
+    def _onboarding_finished(self, updates):
+        """Persist what the wizard decided, and pick up a model it downloaded.
+
+        Only the wizard's own keys are written. The wizard is open for minutes
+        and the app keeps writing config behind it, so saving a merged snapshot
+        would revert whatever landed in between.
+        """
+        self.persistence.update_config(updates)
+        if engine_is_ready(self.engine) or self._engine_reloading:
+            return
+        self.loading = True
+        threading.Thread(target=self.load_model, daemon=True).start()
+
+    def _record_test_sentence(self):
+        """Record a few seconds and transcribe them for the wizard's own field.
+
+        The result goes back to the wizard and nowhere else: it is not pasted,
+        not saved to history, and never logged.
+
+        It marks the app busy for its whole duration, exactly as a normal
+        recording does. Otherwise a hotkey press during the wizard's five
+        seconds would open a second input stream, and an engine switch would
+        see an idle app and unload the engine mid-transcription.
+        """
+        if self.is_recording or self.is_processing:
+            raise RuntimeError("Murmur is busy with another recording. Try again in a moment.")
+        # One read under the lock: the engine checked and the engine used must
+        # be the same object, or a swap in between transcribes on an unloaded one.
+        with self._engine_lock:
+            engine = self.engine
+            if not engine_is_ready(engine):
+                raise RuntimeError(
+                    "The speech model is not loaded yet. Download it on the previous "
+                    "step, then try this again."
+                )
+
+        self.is_processing = True
+        try:
+            capture = AudioCaptureService(sample_rate=SAMPLE_RATE, logger=logger)
+            capture.start()
+            try:
+                time.sleep(ONBOARDING_TEST_SECONDS)
+            finally:
+                capture.stop()
+            chunks = capture.chunks
+            if not chunks:
+                raise RuntimeError(
+                    "No audio was captured. Check the microphone permission and try again."
+                )
+
+            audio = np.concatenate(chunks, axis=0).flatten()
+            handle, audio_path = tempfile.mkstemp(suffix=".wav")
+            os.close(handle)
+            try:
+                wav.write(audio_path, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+                with self._engine_lock:
+                    transcript = engine.transcribe(Path(audio_path), language=None)
+            finally:
+                try:
+                    os.unlink(audio_path)
+                except OSError as error:
+                    logger.error("Failed to delete the wizard's temp audio: %s", error)
+            return transcript.text
+        finally:
+            self.is_processing = False
 
     def enable_shortcut_permission(self, _):
         """Prompt for and explain the macOS permissions required for the shortcut."""
@@ -902,12 +1594,18 @@ class MurmurApp(rumps.App):
 
     def reload_hotkey(self, *, prompt: bool = False):
         """Apply the shortcut from settings, replacing any previous registration."""
-        binding = hotkey_from_config(self.runtime_config())
+        config = self.runtime_config()
+        binding = hotkey_from_config(config)
+        mode = hotkey_mode_from_config(config)
         unregister_global_hotkey(self._hotkey_registration)
         self._hotkey_registration = None
+        self._press_controller = PressController(mode)
 
-        def trigger_toggle():
-            self.run_on_main_thread(self._safe_toggle)
+        def trigger_key_down():
+            self.run_on_main_thread(self._on_hotkey_key_down)
+
+        def trigger_key_up():
+            self.run_on_main_thread(self._on_hotkey_key_up)
 
         def handle_error(error):
             logger.error(f"Hotkey callback error: {error}")
@@ -916,10 +1614,13 @@ class MurmurApp(rumps.App):
         try:
             self._hotkey_registration = register_global_hotkey(
                 binding,
-                on_trigger=trigger_toggle,
+                on_trigger=trigger_key_down,
                 on_error=handle_error,
                 logger=logger,
+                on_key_up=trigger_key_up,
+                mode=mode,
             )
+            self._apply_key_up_availability(mode)
             self._stop_hotkey_retry()
             self._hotkey_permission_notified = False
             if is_bundled_app():
@@ -962,10 +1663,13 @@ class MurmurApp(rumps.App):
         try:
             self._hotkey_registration = register_global_hotkey(
                 binding,
-                on_trigger=trigger_toggle,
+                on_trigger=trigger_key_down,
                 on_error=handle_error,
                 logger=logger,
+                on_key_up=trigger_key_up,
+                mode=mode,
             )
+            self._apply_key_up_availability(mode)
             self._stop_hotkey_retry()
             self._hotkey_permission_notified = False
         except Exception as error:
@@ -991,10 +1695,49 @@ class MurmurApp(rumps.App):
                     message,
                 )
     
+    def _apply_key_up_availability(self, mode):
+        """Tell the press controller whether key-up will really be delivered.
+
+        Without a key-up source, ``hold`` and ``auto`` would start a recording
+        that no later press can stop, so the controller runs them as ``toggle``.
+        The degradation is logged every time and shown to the user once: it is
+        the difference between the shortcut they configured and the one they
+        have, and it comes back the moment Accessibility is granted.
+        """
+        registration = self._hotkey_registration
+        available = bool(registration is not None and registration.key_up_available)
+        self._press_controller.set_key_up_available(available)
+        if available or mode not in KEY_UP_MODES:
+            self._push_to_talk_degraded_notified = False
+            return
+        message = push_to_talk_degraded_message(mode)
+        logger.warning("Push-to-talk degraded to toggle: %s", message)
+        if self._push_to_talk_degraded_notified:
+            return
+        self._push_to_talk_degraded_notified = True
+        rumps.notification(APP_NAME, "Shortcut runs as toggle", message)
+
     def _safe_toggle(self):
         """Toggle recording safely"""
         self.toggle_recording(None)
-    
+
+    def _on_hotkey_key_down(self, _sender=None):
+        """Shortcut pressed. The mode decides what that means."""
+        self._press_controller.sync(self.is_recording)
+        self._apply_press_action(self._press_controller.on_key_down(time.time()))
+
+    def _on_hotkey_key_up(self, _sender=None):
+        """Shortcut released. Only hold and auto act on this."""
+        self._apply_press_action(self._press_controller.on_key_up(time.time()))
+
+    def _apply_press_action(self, action):
+        if should_toggle_for_press_action(action, is_recording=self.is_recording):
+            self._safe_toggle()
+        # The app may have refused the toggle (loading, processing, mic error), so
+        # let the controller see what actually happened.
+        self._press_controller.sync(self.is_recording)
+
+
     def update_status(self, status):
         """Update status (for internal use)"""
         logger.debug(f"Status update: {status}")
@@ -1021,7 +1764,7 @@ class MurmurApp(rumps.App):
                 rumps.notification(
                     APP_NAME,
                     "Model unavailable",
-                    "Recording is unavailable until the model loads successfully.",
+                    model_unavailable_message(self.engine_unavailable_reason),
                 )
             else:
                 logger.warning("Transcription in progress, cannot toggle recording")
@@ -1134,17 +1877,24 @@ class MurmurApp(rumps.App):
             if should_log_sensitive(config):
                 logger.info(f"Audio saved to {audio_path}")
             
-            # Transcribe with better parameters
-            logger.info("Starting transcription...")
-            with self._whisper_lock:
-                transcript = self.engine.transcribe(Path(audio_path), language=None)
-            text = transcript.text
+            # Language follows the front app when it has an override; the
+            # vocabulary biases the decode and then fixes what it got wrong.
+            language = resolve_language(config, front_app_bundle_id())
+            vocabulary = vocabulary_from_config(config)
+            hints = hints_from_vocabulary(vocabulary)
+
+            logger.info("Starting transcription in language %s", language)
+            with self._engine_lock:
+                transcript = self.engine.transcribe(
+                    Path(audio_path), language=language, hints=hints
+                )
+            # The hallucination filter reads the engine's raw words; the user's
+            # replacements are applied to what survives.
+            text, is_hallucination = finalize_transcript(transcript.text, vocabulary)
+            self._note_hints_support(config, transcript, vocabulary)
             if should_log_sensitive(config):
                 logger.info("Transcription completed")
-            
-            # Filter out common hallucinations that occur with silence/noise
-            is_hallucination = is_likely_hallucination(text)
-            
+
             if text and not is_hallucination:
                 # Small delay then paste (paste_text copies, pastes, then restores clipboard)
                 time.sleep(0.15)
@@ -1222,7 +1972,7 @@ class MurmurApp(rumps.App):
                 rumps.notification(
                     APP_NAME,
                     "Model unavailable",
-                    "Transcription is unavailable until the model loads successfully.",
+                    model_unavailable_message(self.engine_unavailable_reason),
                 )
             return
         
@@ -1277,13 +2027,17 @@ class MurmurApp(rumps.App):
                 audio_path = os.path.join(AUDIO_DIR, audio_filename)
                 shutil.copy2(file_path, audio_path)
             
-            with self._whisper_lock:
+            language = resolve_language(config, front_app_bundle_id())
+            vocabulary = vocabulary_from_config(config)
+            hints = hints_from_vocabulary(vocabulary)
+            with self._engine_lock:
                 # A whole-file import, not dictation: the decoder may condition on
                 # the text it already produced for earlier windows.
                 transcript = self.engine.transcribe(
-                    Path(file_path), language=None, long_form=True
+                    Path(file_path), language=language, hints=hints, long_form=True
                 )
-            text = transcript.text
+            text = apply_replacements(transcript.text, vocabulary)
+            self._note_hints_support(config, transcript, vocabulary)
 
             if text:
                 # Copy to clipboard

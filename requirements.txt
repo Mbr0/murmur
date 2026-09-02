@@ -1,11 +1,26 @@
 # Murmur - Local Speech-to-Text
 # Pinned for reproducible builds (see venv: pip freeze)
 
-rumps==0.4.0
-openai-whisper==20250625
+# rumps and quickmachotkey wrap AppKit and Carbon through PyObjC, so they only
+# install on macOS. The marker lets the Linux CI job install everything else and
+# run the platform-independent tests; it is always true on a Mac.
+rumps==0.4.0 ; sys_platform == "darwin"
+quickmachotkey==2025.7.28 ; sys_platform == "darwin"
+
 sounddevice==0.5.5
 numpy==2.4.6
 scipy==1.17.1
 pyperclip==1.11.0
-torch==2.12.0
-quickmachotkey==2025.7.28
+
+# Speech engines (Wave 1d). torch and openai-whisper are gone: every candidate
+# for decision D1 drops them. whisper.cpp ships as the bundled `whisper-server`
+# binary (decision D2, built by scripts/tools/fetch_whispercpp.sh), not a wheel.
+#
+# MLX wheels exist for Apple Silicon only, so the marker keeps `pip install -r`
+# working on Intel Macs (decision D7: whisper.cpp only) and on the Linux CI
+# runner. Transitively this pulls mlx-metal (the Metal backend, ~64 MB) plus
+# transformers, tokenizers, safetensors, huggingface_hub, httpx and miniaudio.
+# None of them pulls torch back in - verified with mlx-audio 0.5.1 on
+# 2026-09-02.
+mlx==0.32.2 ; platform_machine == "arm64"
+mlx-audio==0.5.1 ; platform_machine == "arm64"
