@@ -34,15 +34,26 @@ from murmur import (
     CLEANUP_UNSTABLE_REASON,
     MODE_MENU_AUTOMATIC,
     ACCOUNT_STATUS_FREE,
+    ACCOUNT_STATUS_NOT_SAVED,
     ACCOUNT_STATUS_PRO,
     ACCOUNT_STATUS_PRO_GRACE,
     ENTITLEMENT_REFRESH_INTERVAL_S,
+    ENTITLEMENT_RETRY_BASE_S,
+    ENTITLEMENT_RETRY_MAX_S,
+    FREE_MODE_ID,
+    NOTICE_KEY_FAILED,
+    NOTICE_KEY_RATE_LIMITED,
+    NOTICE_KEY_REJECTED,
     SIGN_IN_MENU_TITLE,
     CleanupPlan,
     CleanupRuntime,
     RemoteEngineKey,
     UsageConfigStore,
     account_menu_title,
+    after_byok_failure,
+    byok_provider_name,
+    next_refresh_delay,
+    pinned_cloud_config,
     configured_mode_id,
     expand_gated_snippets,
     gated_vocabulary,
@@ -111,8 +122,13 @@ from cleanup.llama_server import CLEANUP_MODEL_SPEC, CleanupResult, LlamaServerE
 from cleanup.modes import MODE_IDS, TONE_IDS
 from cleanup.vocabulary import FREE_TERM_LIMIT, Vocabulary, vocabulary_from_config
 from engines.base import EngineError
+from engines.byok import ByokAuthError, ByokRateLimited
 from engines.cloud import ALLOWANCE_MESSAGE, CloudAllowanceExhausted, CloudAuthError
-from engines.factory import DEFAULT_CLOUD_BASE_URL
+from engines.factory import (
+    CONFIG_CLOUD_BASE_URL,
+    DEFAULT_CLOUD_BASE_URL,
+    cloud_base_url,
+)
 from engines.model_store import CATALOG, ModelIntegrityError
 from services.engine_router import (
     ENGINE_BYOK,
@@ -844,6 +860,36 @@ class ProGateCallSiteTests(GateTestCase):
             pro=lambda _feature: True,
         )
         self.assertEqual(seen, ["en"])
+
+
+class UserDataInLogsTests(GateTestCase):
+    """The two config readers that used to log the exception's message.
+
+    ``%s`` on the exception prints what it quotes, and both of these quote the
+    user's own text — a cleanup mode id, a snippet trigger or its body. The log
+    is not the place for either, so only the type name goes in.
+    """
+
+    SECRET = "my-private-snippet-body"
+
+    def test_an_unreadable_cleanup_mode_logs_the_type_only(self):
+        with patch("murmur.mode_from_config", side_effect=ValueError(self.SECRET)):
+            with self.assertLogs("murmur", level="WARNING") as caught:
+                self.assertEqual(configured_mode_id(_config()), FREE_MODE_ID)
+
+        self.assertIn("ValueError", caught.output[0])
+        self.assertNotIn(self.SECRET, caught.output[0])
+
+    def test_unreadable_snippets_log_the_type_only(self):
+        def load(_config_dict):
+            raise ValueError(self.SECRET)
+
+        with self.assertLogs("murmur", level="WARNING") as caught:
+            text = expand_gated_snippets("hello", _config(), load=load)
+
+        self.assertEqual(text, "hello")
+        self.assertIn("ValueError", caught.output[0])
+        self.assertNotIn(self.SECRET, caught.output[0])
 
 
 class LanguageNormalisationTests(unittest.TestCase):
@@ -1770,6 +1816,7 @@ class SettingsServicesTests(GateTestCase):
         "license",
         "pro_gate",
         "keychain",
+        "secret_store_volatile",
         "scheduler",
         "version",
         "build_info",
@@ -2304,6 +2351,16 @@ def _usage(config=None, clock=None):
     return UsageService(config_store=store, **kwargs), store
 
 
+def _bind_hosted_config(app):
+    """Bind the one door every hosted client goes through. Returns ``app``.
+
+    ``_hosted_config`` pins the proxy origin, so a fixture that skips it is
+    testing a path the app does not have.
+    """
+    app._hosted_config = lambda cfg: MurmurApp._hosted_config(app, cfg)
+    return app
+
+
 class RoutingDecisionTests(GateTestCase):
     """The whole routing table, through the app's own decision method."""
 
@@ -2464,12 +2521,16 @@ class CloudFallbackTests(GateTestCase):
     def _app(self, remote):
         local = _FakeEngine("whispercpp", text="from this Mac")
         notices = []
+
+        def announce(notice, *, once_key=None):
+            notices.append(notice)
+
         app = SimpleNamespace(
             engine=local,
             engine_id="whispercpp",
             _engine_lock=threading.Lock(),
             _remote_engine_for=lambda engine_id, config: remote,
-            _announce_route=notices.append,
+            _announce_route=announce,
         )
         app._engine_for_route = lambda engine_id, config: MurmurApp._engine_for_route(
             app, engine_id, config
@@ -2477,10 +2538,10 @@ class CloudFallbackTests(GateTestCase):
         app._run_engine = lambda *a, **k: MurmurApp._run_engine(app, *a, **k)
         return app, local, notices
 
-    def _run(self, route, remote):
+    def _run(self, route, remote, config=None):
         app, local, notices = self._app(remote)
         transcript, engine_id = MurmurApp._transcribe_routed(
-            app, route, _config(), "/tmp/clip.wav", language="en", hints=None
+            app, route, config or _config(), "/tmp/clip.wav", language="en", hints=None
         )
         return transcript, engine_id, local, notices
 
@@ -2533,7 +2594,7 @@ class CloudFallbackTests(GateTestCase):
             engine_id="whispercpp",
             _engine_lock=threading.Lock(),
             _remote_engine_for=lambda engine_id, config: None,
-            _announce_route=lambda notice: None,
+            _announce_route=lambda notice, **kwargs: None,
         )
         app._engine_for_route = lambda engine_id, config: MurmurApp._engine_for_route(
             app, engine_id, config
@@ -2556,6 +2617,188 @@ class CloudFallbackTests(GateTestCase):
         self.assertEqual(transcript.text, "from the cloud")
         self.assertEqual(engine_id, ENGINE_CLOUD)
         self.assertEqual(local.calls, [])
+
+    def test_a_build_failure_that_is_not_an_engine_error_still_falls_back(self):
+        # ``build_engine`` raises ValueError for a missing own-key provider and
+        # the engines raise it for a non-HTTPS endpoint. That used to escape as
+        # "Transcription failed" and cost the user the words they just spoke.
+        app, local, notices = self._app(remote=None)
+        builder = _bind_hosted_config(
+            SimpleNamespace(
+                cloud_base_url=DEFAULT_CLOUD_BASE_URL,
+                _base_url_drift_logged=True,
+                _remote_engine=None,
+                _remote_engine_key=None,
+                _remote_engine_lock=threading.Lock(),
+                license_service=None,
+                _keychain=lambda: None,
+            )
+        )
+        app._remote_engine_for = lambda engine_id, config: MurmurApp._remote_engine_for(
+            builder, engine_id, config
+        )
+        route = SimpleNamespace(engine_id=ENGINE_CLOUD, notice=None, reason="cloud")
+
+        transcript, engine_id = MurmurApp._transcribe_routed(
+            app, route, _config(), "/tmp/clip.wav", language="en", hints=None
+        )
+
+        # ``build_engine`` refuses "cloud" without a licence service.
+        self.assertEqual(transcript.text, "from this Mac")
+        self.assertEqual(engine_id, "whispercpp")
+
+
+class OwnKeyFallbackTests(GateTestCase):
+    """An own-key failure is the user's to fix, so it is worded as theirs.
+
+    Routing these through ``after_cloud_failure`` matched neither proxy
+    exception, so a revoked key fell back with no notice at all and a log line
+    blaming Murmur Cloud — a silent, permanent downgrade.
+    """
+
+    def _run(self, error, config=None):
+        remote = _FakeEngine("byok", raises=error)
+        local = _FakeEngine("whispercpp", text="from this Mac")
+        notices = []
+        app = SimpleNamespace(
+            engine=local,
+            engine_id="whispercpp",
+            _engine_lock=threading.Lock(),
+            _remote_engine_for=lambda engine_id, cfg: remote,
+            _announce_route=lambda notice, **kwargs: notices.append(notice),
+        )
+        app._engine_for_route = lambda engine_id, cfg: MurmurApp._engine_for_route(
+            app, engine_id, cfg
+        )
+        app._run_engine = lambda *a, **k: MurmurApp._run_engine(app, *a, **k)
+        route = SimpleNamespace(engine_id=ENGINE_BYOK, notice=None, reason="own key")
+        transcript, engine_id = MurmurApp._transcribe_routed(
+            app,
+            route,
+            config or _config(cloud_mode="own_key", byok_provider="mistral"),
+            "/tmp/clip.wav",
+            language="en",
+            hints=None,
+        )
+        return transcript, engine_id, notices
+
+    def test_a_rejected_key_says_where_to_fix_it(self):
+        _t, engine_id, notices = self._run(ByokAuthError("401"))
+
+        self.assertEqual(engine_id, "whispercpp")
+        self.assertIn(NOTICE_KEY_REJECTED.format(provider="Mistral"), notices)
+
+    def test_a_rate_limited_provider_says_so_without_blaming_the_key(self):
+        _t, engine_id, notices = self._run(ByokRateLimited("429", retry_after_s=30.0))
+
+        self.assertEqual(engine_id, "whispercpp")
+        self.assertIn(NOTICE_KEY_RATE_LIMITED.format(provider="Mistral"), notices)
+
+    def test_any_other_own_key_failure_still_tells_the_user_something(self):
+        _t, engine_id, notices = self._run(EngineError("gateway timeout"))
+
+        self.assertEqual(engine_id, "whispercpp")
+        self.assertIn(NOTICE_KEY_FAILED.format(provider="Mistral"), notices)
+
+    def test_the_notice_names_the_provider_the_user_configured(self):
+        _t, _e, notices = self._run(
+            ByokAuthError("401"),
+            config=_config(cloud_mode="own_key", byok_provider="openai"),
+        )
+
+        self.assertIn(NOTICE_KEY_REJECTED.format(provider="OpenAI"), notices)
+
+    def test_the_cloud_wording_never_reaches_an_own_key_failure(self):
+        _t, _e, notices = self._run(ByokAuthError("401"))
+
+        self.assertNotIn(NOTICE_SIGN_IN, notices)
+
+    def test_the_log_names_the_engine_that_actually_failed(self):
+        with self.assertLogs("murmur", level="INFO") as caught:
+            self._run(ByokAuthError("401"))
+
+        line = "\n".join(caught.output)
+        self.assertIn(ENGINE_BYOK, line)
+        self.assertNotIn("Murmur Cloud", line)
+
+
+class OwnKeyNoticeTable(unittest.TestCase):
+    """:func:`after_byok_failure` as a table, and the name it puts in it."""
+
+    def _route(self, error, provider="Mistral"):
+        return after_byok_failure(error, local_engine_id="whispercpp", provider=provider)
+
+    def test_a_rejected_key_points_at_settings(self):
+        route = self._route(ByokAuthError("401"))
+
+        self.assertEqual(route.engine_id, "whispercpp")
+        self.assertEqual(route.reason, "byok key rejected")
+        self.assertIn("Settings", route.notice)
+
+    def test_a_rate_limit_is_not_a_bad_key(self):
+        route = self._route(ByokRateLimited("429"))
+
+        self.assertEqual(route.reason, "byok rate limited")
+        self.assertNotIn("rejected", route.notice)
+
+    def test_everything_else_is_generic_but_never_silent(self):
+        route = self._route(EngineError("boom"))
+
+        self.assertEqual(route.reason, "byok failed")
+        self.assertTrue(route.notice)
+
+    def test_it_always_falls_back_to_the_engine_the_user_chose(self):
+        for error in (ByokAuthError("x"), ByokRateLimited("x"), EngineError("x")):
+            route = after_byok_failure(
+                error, local_engine_id="voxtral_mlx", provider="OpenAI"
+            )
+            self.assertEqual(route.engine_id, "voxtral_mlx")
+
+    def test_the_provider_name_comes_from_config(self):
+        self.assertEqual(byok_provider_name(_config(byok_provider="mistral")), "Mistral")
+        self.assertEqual(byok_provider_name(_config(byok_provider="openai")), "OpenAI")
+
+    def test_an_unknown_or_missing_provider_still_reads_as_a_sentence(self):
+        self.assertEqual(byok_provider_name(_config(byok_provider="acme")), "Acme")
+        self.assertEqual(byok_provider_name({}), "Your provider")
+
+
+class SessionNoticeTests(GateTestCase):
+    """The own-key notices are said once a session, not once an utterance."""
+
+    def _app(self):
+        usage, _store = _usage({"usage_month": datetime.now().strftime("%Y-%m")})
+        return SimpleNamespace(usage=usage, _session_notices=set())
+
+    def test_a_kind_of_notice_is_shown_once_and_then_kept_quiet(self):
+        app = self._app()
+        shown = []
+
+        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+            MurmurApp._announce_route(app, "Your Mistral key was rejected", once_key="k")
+            MurmurApp._announce_route(app, "Your Mistral key was rejected", once_key="k")
+
+        self.assertEqual(shown, ["Your Mistral key was rejected"])
+
+    def test_a_different_kind_is_still_worth_saying(self):
+        app = self._app()
+        shown = []
+
+        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+            MurmurApp._announce_route(app, "rejected", once_key="byok key rejected")
+            MurmurApp._announce_route(app, "rate limited", once_key="byok rate limited")
+
+        self.assertEqual(shown, ["rejected", "rate limited"])
+
+    def test_notices_without_a_key_are_unaffected(self):
+        app = self._app()
+        shown = []
+
+        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+            MurmurApp._announce_route(app, NOTICE_SIGN_IN)
+            MurmurApp._announce_route(app, NOTICE_SIGN_IN)
+
+        self.assertEqual(shown, [NOTICE_SIGN_IN, NOTICE_SIGN_IN])
 
 
 class RouteNoticeTests(GateTestCase):
@@ -2692,18 +2935,22 @@ class CloudCleanupSelectionTests(GateTestCase):
             license_service=SimpleNamespace(current_lease_token=lambda: "token"),
             engine_id="whispercpp",
             usage=None,
+            cloud_base_url=DEFAULT_CLOUD_BASE_URL,
+            _base_url_drift_logged=False,
             _cloud_cleanup_client=client,
             _cloud_cleanup_base_url=DEFAULT_CLOUD_BASE_URL if client else None,
-            _announce_route=lambda notice: None,
+            _announce_route=lambda notice, **kwargs: None,
             _record_usage=lambda *a: None,
         )
+        app._hosted_config = lambda cfg: MurmurApp._hosted_config(app, cfg)
         app._cleanup_client = lambda cfg: MurmurApp._cleanup_client(app, cfg)
         app._cloud_cleanup_with_fallback = (
             lambda c: MurmurApp._cloud_cleanup_with_fallback(app, c)
         )
-        chosen = MurmurApp._cleanup_callable(
+        chosen, is_local = MurmurApp._cleanup_callable(
             app, config, cloud_engine_active=cloud_engine_active
         )
+        app.chose_local = is_local
         return app, chosen
 
     def test_cloud_cleanup_needs_the_switch_the_route_and_the_gate(self):
@@ -2771,6 +3018,47 @@ class CloudCleanupSelectionTests(GateTestCase):
 
         self.assertEqual(metered, [(ORIGIN_CLOUD, 0, 3)])
 
+    def test_the_caller_is_told_which_backend_it_got(self):
+        # It cannot work it out afterwards: ``self.cleanup_runtime.cleanup``
+        # builds a fresh bound method on every access, so comparing the chosen
+        # callable against it is always False and the local branch never ran.
+        client = SimpleNamespace(cleanup=lambda text, prompt: "cloud")
+        cloud, _ = self._app(
+            config=_config(cleanup_cloud=True, cloud_base_url=DEFAULT_CLOUD_BASE_URL),
+            cloud_engine_active=True,
+            client=client,
+        )
+        local, _ = self._app(config=_config(cleanup_cloud=False), cloud_engine_active=True)
+
+        self.assertFalse(cloud.chose_local)
+        self.assertTrue(local.chose_local)
+
+    def test_the_preparing_label_reaches_the_pill_on_a_cold_local_server(self):
+        # The bound-method comparison meant this label was never shown, so the
+        # pill sat on "working" through a 2 GB model load and read as a hang.
+        labels = []
+        runtime = SimpleNamespace(
+            cleanup=lambda text, prompt: CleanupResult(text=text, elapsed_s=0.0),
+            is_started=False,
+        )
+        app = SimpleNamespace(
+            cleanup_runtime=runtime,
+            _cleanup_callable=lambda cfg, cloud_engine_active: (runtime.cleanup, True),
+            _set_model_menu_title=lambda *a, **k: None,
+            _model_status_title="Loading model…",
+            _record_usage=lambda *a: None,
+            usage=None,
+        )
+        pill = SimpleNamespace(working=lambda label=None: labels.append(label))
+        config = _config(cleanup_mode="message")
+
+        with patch("murmur.capture_context", lambda include_selection=False: _context()):
+            MurmurApp._clean_up_transcript(
+                app, "hello", config, "en", vocabulary_from_config(config), pill
+            )
+
+        self.assertEqual(labels[0], CLEANUP_PREPARING_STATUS)
+
     def test_a_skipped_cloud_cleanup_is_not_metered(self):
         metered = []
         client = SimpleNamespace(
@@ -2815,6 +3103,19 @@ class RemoteEngineCacheTests(unittest.TestCase):
         # sign-in need no rebuild.
         self.assertNotIn("lease", str(remote_engine_key(ENGINE_CLOUD, _config())))
 
+    def _app(self, base_url=DEFAULT_CLOUD_BASE_URL):
+        return _bind_hosted_config(
+            SimpleNamespace(
+                cloud_base_url=base_url,
+                _base_url_drift_logged=False,
+                _remote_engine=None,
+                _remote_engine_key=None,
+                _remote_engine_lock=threading.Lock(),
+                license_service=None,
+                _keychain=lambda: None,
+            )
+        )
+
     def test_the_engine_is_built_once_and_then_reused(self):
         built = []
 
@@ -2822,13 +3123,7 @@ class RemoteEngineCacheTests(unittest.TestCase):
             built.append(engine_id)
             return _FakeEngine(engine_id)
 
-        app = SimpleNamespace(
-            _remote_engine=None,
-            _remote_engine_key=None,
-            _remote_engine_lock=threading.Lock(),
-            license_service=None,
-            _keychain=lambda: None,
-        )
+        app = self._app()
         config = _config()
         with patch("murmur.build_engine", build):
             first = MurmurApp._remote_engine_for(app, ENGINE_CLOUD, config)
@@ -2841,23 +3136,181 @@ class RemoteEngineCacheTests(unittest.TestCase):
         built = []
 
         def build(engine_id, **kwargs):
-            built.append(kwargs["config"].get("cloud_base_url"))
+            built.append(kwargs["config"].get("byok_provider"))
             return _FakeEngine(engine_id)
 
-        app = SimpleNamespace(
-            _remote_engine=None,
-            _remote_engine_key=None,
-            _remote_engine_lock=threading.Lock(),
-            license_service=None,
-            _keychain=lambda: None,
-        )
+        app = self._app()
         with patch("murmur.build_engine", build):
-            MurmurApp._remote_engine_for(app, ENGINE_CLOUD, _config())
+            MurmurApp._remote_engine_for(app, ENGINE_BYOK, _config(byok_provider="mistral"))
+            MurmurApp._remote_engine_for(app, ENGINE_BYOK, _config(byok_provider="openai"))
+
+        self.assertEqual(built, ["mistral", "openai"])
+
+
+class PinnedProxyOriginTests(unittest.TestCase):
+    """The proxy origin is read once, at launch, and every client uses that one.
+
+    The licence service is built against the origin read at startup, but the
+    engine key and the cleanup client used to re-read ``cloud_base_url`` from
+    the live config on each request. Editing that key mid-session therefore
+    sent the audio, the transcript and the cleanup text to another host while
+    the lease still belonged to the first — and handed that host the lease.
+    """
+
+    PINNED = DEFAULT_CLOUD_BASE_URL
+    ELSEWHERE = "https://elsewhere.test"
+
+    def _app(self):
+        return _bind_hosted_config(
+            SimpleNamespace(
+                cloud_base_url=self.PINNED,
+                _base_url_drift_logged=False,
+                _remote_engine=None,
+                _remote_engine_key=None,
+                _remote_engine_lock=threading.Lock(),
+                license_service=SimpleNamespace(current_lease_token=lambda: "token"),
+                _cloud_cleanup_client=None,
+                _cloud_cleanup_base_url=None,
+                _keychain=lambda: None,
+            )
+        )
+
+    def test_an_unchanged_origin_is_the_same_dict(self):
+        config = _config()
+
+        self.assertIs(pinned_cloud_config(config, self.PINNED), config)
+
+    def test_a_changed_origin_is_replaced_not_followed(self):
+        config = _config(cloud_base_url=self.ELSEWHERE)
+
+        pinned = pinned_cloud_config(config, self.PINNED)
+
+        self.assertEqual(pinned[CONFIG_CLOUD_BASE_URL], self.PINNED)
+        # And the caller's dict is untouched.
+        self.assertEqual(config[CONFIG_CLOUD_BASE_URL], self.ELSEWHERE)
+
+    def test_a_blank_origin_still_reads_as_the_pinned_one(self):
+        pinned = pinned_cloud_config(_config(cloud_base_url="  "), self.PINNED)
+
+        self.assertEqual(cloud_base_url(pinned), self.PINNED)
+
+    def test_the_engine_key_never_carries_the_live_origin(self):
+        app = self._app()
+        seen = []
+
+        def build(engine_id, **kwargs):
+            seen.append(kwargs["config"].get(CONFIG_CLOUD_BASE_URL))
+            return _FakeEngine(engine_id)
+
+        with patch("murmur.build_engine", build):
             MurmurApp._remote_engine_for(
-                app, ENGINE_CLOUD, _config(cloud_base_url="https://other.test")
+                app, ENGINE_CLOUD, _config(cloud_base_url=self.ELSEWHERE)
             )
 
-        self.assertEqual(len(built), 2)
+        self.assertEqual(seen, [self.PINNED])
+        self.assertEqual(app._remote_engine_key.base_url, self.PINNED)
+
+    def test_the_cleanup_client_never_reaches_the_live_origin(self):
+        app = self._app()
+        seen = []
+
+        class Client:
+            def __init__(self, base_url, lease_provider):
+                seen.append(base_url)
+
+        with patch("murmur.CloudCleanupClient", Client):
+            MurmurApp._cleanup_client(app, _config(cloud_base_url=self.ELSEWHERE))
+
+        self.assertEqual(seen, [self.PINNED])
+
+    def test_the_drift_is_said_once_a_session_not_once_a_dictation(self):
+        app = self._app()
+        config = _config(cloud_base_url=self.ELSEWHERE)
+
+        with self.assertLogs("murmur", level="WARNING") as caught:
+            MurmurApp._hosted_config(app, config)
+            MurmurApp._hosted_config(app, config)
+
+        self.assertEqual(len(caught.output), 1)
+        self.assertIn("Restart", caught.output[0])
+
+    def test_an_unchanged_origin_says_nothing_at_all(self):
+        app = self._app()
+
+        with patch("murmur.logger") as log:
+            MurmurApp._hosted_config(app, _config())
+
+        log.warning.assert_not_called()
+
+
+class RemoteEngineBuildFailureTests(unittest.TestCase):
+    """Building a hosted engine can fail; it must fail as an ``EngineError``.
+
+    ``_transcribe_routed`` falls back on ``EngineError`` and nothing else, so a
+    ``ValueError`` out of ``build_engine`` (a missing own-key provider) or out
+    of an engine's HTTPS check took the transcript with it.
+    """
+
+    def _app(self):
+        return _bind_hosted_config(
+            SimpleNamespace(
+                cloud_base_url=DEFAULT_CLOUD_BASE_URL,
+                _base_url_drift_logged=True,
+                _remote_engine=None,
+                _remote_engine_key=None,
+                _remote_engine_lock=threading.Lock(),
+                license_service=None,
+                _keychain=lambda: None,
+            )
+        )
+
+    def test_a_value_error_from_the_factory_becomes_an_engine_error(self):
+        def build(engine_id, **kwargs):
+            raise ValueError("engine 'byok' needs config['byok_provider']")
+
+        with patch("murmur.build_engine", build):
+            with self.assertRaises(EngineError) as caught:
+                MurmurApp._remote_engine_for(self._app(), ENGINE_BYOK, _config())
+
+        self.assertIn("ValueError", str(caught.exception))
+
+    def test_a_failure_in_load_becomes_an_engine_error_too(self):
+        class Failing(_FakeEngine):
+            def load(self):
+                raise ValueError("base_url must be https")
+
+        with patch("murmur.build_engine", lambda engine_id, **kw: Failing(engine_id)):
+            with self.assertRaises(EngineError):
+                MurmurApp._remote_engine_for(self._app(), ENGINE_CLOUD, _config())
+
+    def test_the_wrapped_message_names_the_type_and_nothing_else(self):
+        def build(engine_id, **kwargs):
+            raise ValueError("cloud_base_url=https://user:sekrit@host is not https")
+
+        with patch("murmur.build_engine", build):
+            with self.assertRaises(EngineError) as caught:
+                MurmurApp._remote_engine_for(self._app(), ENGINE_CLOUD, _config())
+
+        self.assertNotIn("sekrit", str(caught.exception))
+
+    def test_an_engine_error_keeps_its_own_subclass(self):
+        # ``after_byok_failure`` branches on it: re-wrapping a rejected key
+        # would turn "check your key" into "something failed".
+        class Failing(_FakeEngine):
+            def load(self):
+                raise ByokAuthError("401")
+
+        with patch("murmur.build_engine", lambda engine_id, **kw: Failing(engine_id)):
+            with self.assertRaises(ByokAuthError):
+                MurmurApp._remote_engine_for(self._app(), ENGINE_BYOK, _config())
+
+    def test_a_failed_build_is_not_cached_as_the_engine(self):
+        app = self._app()
+        with patch("murmur.build_engine", lambda *a, **k: (_ for _ in ()).throw(ValueError())):
+            with self.assertRaises(EngineError):
+                MurmurApp._remote_engine_for(app, ENGINE_CLOUD, _config())
+
+        self.assertIsNone(app._remote_engine)
 
 
 class EntitlementRefreshTests(GateTestCase):
@@ -2902,6 +3355,190 @@ class EntitlementRefreshTests(GateTestCase):
 
         self.assertIsNone(publish_entitlements(Broken()))
         self.assertTrue(is_pro_feature_enabled("cleanup"))  # the class default
+
+
+class EntitlementBackoffTests(GateTestCase):
+    """A renewal that failed is retried soon, not in six hours.
+
+    The clock used to be stamped *before* the call, so a launch with no network
+    counted as refreshed and the next attempt was a full interval away — an
+    afternoon on the free tier for a paying Mac.
+    """
+
+    def _app(self, service):
+        if service is not None:
+            service.current_entitlements = lambda: _entitlements()
+        return SimpleNamespace(
+            license_service=service,
+            _entitlements_refreshed_at=None,
+            _entitlement_failures=0,
+            _entitlements_retry_at=None,
+            _refresh_account_menu=lambda entitlements=None: None,
+        )
+
+    def _once(self, app):
+        app._entitlement_refresh_due = lambda: MurmurApp._entitlement_refresh_due(app)
+        app._entitlement_refresh_succeeded = (
+            lambda: MurmurApp._entitlement_refresh_succeeded(app)
+        )
+        app._entitlement_refresh_failed = (
+            lambda error: MurmurApp._entitlement_refresh_failed(app, error)
+        )
+        MurmurApp._refresh_entitlements_once(app)
+
+    def test_the_first_failure_waits_five_minutes(self):
+        self.assertEqual(next_refresh_delay(1), ENTITLEMENT_RETRY_BASE_S)
+
+    def test_the_wait_doubles_and_then_stops_at_an_hour(self):
+        self.assertEqual(next_refresh_delay(2), 2 * ENTITLEMENT_RETRY_BASE_S)
+        self.assertEqual(next_refresh_delay(3), 4 * ENTITLEMENT_RETRY_BASE_S)
+        self.assertEqual(next_refresh_delay(9), ENTITLEMENT_RETRY_MAX_S)
+
+    def test_the_backoff_never_exceeds_the_interval_it_replaces(self):
+        self.assertLess(next_refresh_delay(99), ENTITLEMENT_REFRESH_INTERVAL_S)
+
+    def test_a_failed_renewal_does_not_stamp_the_clock(self):
+        calls = []
+
+        def refresh():
+            calls.append(1)
+            raise RuntimeError("no network")
+
+        app = self._app(SimpleNamespace(refresh_if_needed=refresh))
+        with self.assertLogs("murmur", level="WARNING"):
+            self._once(app)
+
+        self.assertIsNone(app._entitlements_refreshed_at)
+        self.assertEqual(app._entitlement_failures, 1)
+        self.assertIsNotNone(app._entitlements_retry_at)
+        self.assertEqual(len(calls), 1)
+
+    def test_the_retry_is_not_attempted_before_its_time(self):
+        app = self._app(
+            SimpleNamespace(refresh_if_needed=lambda: (_ for _ in ()).throw(OSError()))
+        )
+        with self.assertLogs("murmur", level="WARNING"):
+            self._once(app)
+        self._once(app)  # a minute later, well inside the backoff
+
+        self.assertEqual(app._entitlement_failures, 1)
+
+    def test_the_retry_runs_once_its_time_has_come(self):
+        attempts = []
+
+        def refresh():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("no network")
+
+        app = self._app(SimpleNamespace(refresh_if_needed=refresh))
+        with self.assertLogs("murmur", level="WARNING"):
+            self._once(app)
+        app._entitlements_retry_at = time.time() - 1
+        self._once(app)
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(app._entitlement_failures, 0)
+        self.assertIsNone(app._entitlements_retry_at)
+        self.assertIsNotNone(app._entitlements_refreshed_at)
+
+    def test_a_success_stamps_the_clock_and_waits_the_full_interval(self):
+        app = self._app(SimpleNamespace(refresh_if_needed=lambda: None))
+
+        self._once(app)
+        stamped = app._entitlements_refreshed_at
+
+        self.assertIsNotNone(stamped)
+        self.assertFalse(app._entitlement_refresh_due())
+
+    def test_a_build_with_no_licence_service_does_not_spin(self):
+        app = self._app(None)
+
+        self._once(app)
+
+        self.assertIsNotNone(app._entitlements_refreshed_at)
+        self.assertFalse(app._entitlement_refresh_due())
+
+    def test_the_failure_log_names_the_type_and_not_the_message(self):
+        app = self._app(
+            SimpleNamespace(
+                refresh_if_needed=lambda: (_ for _ in ()).throw(
+                    RuntimeError("token sk-live-do-not-log-me")
+                )
+            )
+        )
+
+        with self.assertLogs("murmur", level="WARNING") as caught:
+            self._once(app)
+
+        self.assertIn("RuntimeError", caught.output[0])
+        self.assertNotIn("sk-live-do-not-log-me", caught.output[0])
+
+
+class VolatileSecretStoreTests(GateTestCase):
+    """A Mac with no Keychain keeps the lease in memory, and has to say so.
+
+    Signing in, seeing "Pro", quitting and being Free again is reported as a
+    billing failure. The two places the account is shown say it up front.
+    """
+
+    def test_the_menu_line_marks_a_lease_that_will_not_survive_a_quit(self):
+        self.assertEqual(
+            account_menu_title(_entitlements(pro=True), store_is_volatile=True),
+            ACCOUNT_STATUS_PRO + ACCOUNT_STATUS_NOT_SAVED,
+        )
+        self.assertEqual(
+            account_menu_title(None, store_is_volatile=True),
+            ACCOUNT_STATUS_FREE + ACCOUNT_STATUS_NOT_SAVED,
+        )
+
+    def test_a_working_keychain_leaves_the_line_alone(self):
+        self.assertEqual(
+            account_menu_title(_entitlements(pro=True), store_is_volatile=False),
+            ACCOUNT_STATUS_PRO,
+        )
+
+    def test_the_flag_is_set_when_the_keychain_is_unreachable(self):
+        app = SimpleNamespace(_keychain=lambda: None, secret_store_is_volatile=False)
+
+        with self.assertLogs("murmur", level="WARNING"):
+            MurmurApp._build_license_service(app, DEFAULT_CLOUD_BASE_URL)
+
+        self.assertTrue(app.secret_store_is_volatile)
+
+    def test_a_reachable_keychain_is_not_volatile(self):
+        app = SimpleNamespace(
+            _keychain=lambda: SimpleNamespace(get=lambda name: None), secret_store_is_volatile=True
+        )
+
+        MurmurApp._build_license_service(app, DEFAULT_CLOUD_BASE_URL)
+
+        self.assertFalse(app.secret_store_is_volatile)
+
+    def test_the_menu_redraw_carries_the_flag(self):
+        titles = []
+        app = SimpleNamespace(
+            secret_store_is_volatile=True,
+            run_on_main_thread=lambda apply: apply(),
+            account_item=SimpleNamespace(title=""),
+        )
+
+        MurmurApp._refresh_account_menu(app, _entitlements(pro=True))
+        titles.append(app.account_item.title)
+
+        self.assertEqual(titles, [ACCOUNT_STATUS_PRO + ACCOUNT_STATUS_NOT_SAVED])
+
+    def test_the_account_tab_is_told_too(self):
+        app = SimpleNamespace(
+            persistence=object(),
+            _keychain=lambda: None,
+            runtime_config=dict,
+            usage=None,
+            license_service=None,
+            secret_store_is_volatile=True,
+        )
+
+        self.assertTrue(MurmurApp._settings_services(app)["secret_store_volatile"])
 
 
 class AccountMenuTests(unittest.TestCase):

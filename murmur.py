@@ -118,6 +118,7 @@ from cleanup.vocabulary import (
 from engines import create_engine
 from engines._http import open_no_cross_host_redirect
 from engines.base import EngineError
+from engines.byok import ByokAuthError, ByokRateLimited
 from engines.cloud import (
     ALLOWANCE_MESSAGE,
     CloudAllowanceExhausted,
@@ -128,6 +129,7 @@ from engines.cloud import (
 from engines.factory import (
     CONFIG_BYOK_MODEL,
     CONFIG_BYOK_PROVIDER,
+    CONFIG_CLOUD_BASE_URL,
     build_engine,
     byok_item_name,
     cloud_base_url,
@@ -147,6 +149,7 @@ from services.engine_router import (
     CLOUD_MODE_MURMUR,
     ENGINE_BYOK,
     ENGINE_CLOUD,
+    Route,
     after_cloud_failure,
     effective_vocabulary_terms,
     route_engine,
@@ -870,7 +873,8 @@ def configured_mode_id(config: dict) -> str:
     try:
         return mode_from_config(config).id
     except Exception as error:  # noqa: BLE001 - an unknown id is user data
-        logger.warning("Ignoring an unreadable cleanup_mode: %s", error)
+        # The type only: the message quotes the mode id, which is user data.
+        logger.warning("Ignoring an unreadable cleanup_mode: %s", type(error).__name__)
         return FREE_MODE_ID
 
 
@@ -933,7 +937,10 @@ def expand_gated_snippets(
     try:
         snippets = load(config)
     except Exception as error:  # noqa: BLE001 - snippets are user data
-        logger.warning("Ignoring unreadable snippets in the config: %s", error)
+        # The type only: the message can carry the snippet trigger or its body.
+        logger.warning(
+            "Ignoring unreadable snippets in the config: %s", type(error).__name__
+        )
         return text
     if not snippets:
         return text
@@ -986,10 +993,20 @@ ENTITLEMENT_REFRESH_INTERVAL_S = 6 * 3600
 #: Settings is reflected in the menu without waiting six hours for it.
 ENTITLEMENT_POLL_INTERVAL_S = 60.0
 
+#: How long to wait after a renewal that *failed*, and the ceiling that backoff
+#: climbs to. Five minutes covers a dropped Wi-Fi or a proxy restart; an hour is
+#: short enough that a lease which lapses is renewed well inside its grace week.
+ENTITLEMENT_RETRY_BASE_S = 300.0
+ENTITLEMENT_RETRY_MAX_S = 3600.0
+
 #: Menu line naming the plan. One of three, and never a number.
 ACCOUNT_STATUS_FREE = "Account: Free"
 ACCOUNT_STATUS_PRO = "Account: Pro"
 ACCOUNT_STATUS_PRO_GRACE = "Account: Pro (grace)"
+
+#: Appended to the account line when the lease lives in memory only. See
+#: :meth:`MurmurApp._build_license_service`.
+ACCOUNT_STATUS_NOT_SAVED = " (not saved)"
 
 #: Menu item that opens Settings on the Account tab.
 SIGN_IN_MENU_TITLE = "Sign in with Boske ID…"
@@ -1025,6 +1042,78 @@ def remote_engine_key(engine_id: str, config: dict) -> RemoteEngineKey:
         provider=provider if isinstance(provider, str) and provider.strip() else None,
         model=model if isinstance(model, str) and model.strip() else None,
     )
+
+
+def pinned_cloud_config(config: dict, base_url: str) -> dict:
+    """``config`` as the hosted clients must read it: the proxy origin pinned.
+
+    The proxy origin is read **once**, at launch, and the licence service is
+    built against it for the session. Everything else that speaks to the proxy
+    used to re-read ``cloud_base_url`` from the live config at request time, so
+    an edit to that key mid-session pointed the audio, the transcript and the
+    cleanup text at another host while the lease still belonged to the first —
+    a redirect, and a lease handed to whoever the config now names.
+
+    So the pinned value wins, and a changed key takes effect at the next
+    launch. Returns ``config`` itself when the two already agree, which is the
+    ordinary case and lets the caller detect the drift by identity.
+    """
+    assert config is not None, "config is required"
+    assert base_url, "base_url is required"
+    if cloud_base_url(config) == base_url:
+        return config
+    return {**config, CONFIG_CLOUD_BASE_URL: base_url}
+
+
+#: Display names for the own-key providers, for the one notice that names one.
+#: Deliberately not imported from the Settings tab: wording a notification must
+#: not make the app depend on a UI module.
+BYOK_PROVIDER_NAMES: dict[str, str] = {"mistral": "Mistral", "openai": "OpenAI"}
+
+#: What the user is told when their **own** provider refuses a clip. The cloud
+#: has its own wording in :mod:`services.engine_router`; these three are the
+#: own-key half, and they name the provider because the key is the user's to fix.
+NOTICE_KEY_REJECTED = "Your {provider} key was rejected; check Settings › Account"
+NOTICE_KEY_RATE_LIMITED = "{provider} rate limited this request; using the local engine"
+NOTICE_KEY_FAILED = "{provider} could not transcribe this; using the local engine"
+
+
+def byok_provider_name(config: dict) -> str:
+    """The own-key provider's display name, for a notice that names it."""
+    assert config is not None, "config is required"
+    provider = str(config.get(CONFIG_BYOK_PROVIDER) or "").strip().lower()
+    if not provider:
+        return "Your provider"
+    return BYOK_PROVIDER_NAMES.get(provider, provider.title())
+
+
+def after_byok_failure(exc: BaseException, *, local_engine_id: str, provider: str) -> Route:
+    """Where to re-run a clip the user's **own** provider refused.
+
+    Own-key failures used to be sent through
+    :func:`~services.engine_router.after_cloud_failure`, which knows only the
+    two proxy exceptions: a rejected key matched neither, so it fell back with
+    no notice at all and a log line blaming Murmur Cloud. A revoked key then
+    downgraded every dictation to the local engine, silently, forever.
+
+    A rejected key is the one failure here the user can act on, so it says
+    where to fix it. A rate limit is theirs to wait out, and anything else is
+    told plainly rather than blamed on them. The caller shows each of these at
+    most once a session — see :meth:`MurmurApp._announce_route`.
+    """
+    assert local_engine_id, "local_engine_id is required"
+    assert provider, "provider is required"
+    if isinstance(exc, ByokAuthError):
+        return Route(
+            local_engine_id, NOTICE_KEY_REJECTED.format(provider=provider), "byok key rejected"
+        )
+    if isinstance(exc, ByokRateLimited):
+        return Route(
+            local_engine_id,
+            NOTICE_KEY_RATE_LIMITED.format(provider=provider),
+            "byok rate limited",
+        )
+    return Route(local_engine_id, NOTICE_KEY_FAILED.format(provider=provider), "byok failed")
 
 
 def own_key_present(keychain, config: dict) -> bool:
@@ -1125,13 +1214,41 @@ def should_refresh_entitlements(
     return elapsed < 0 or elapsed >= interval_s
 
 
-def account_menu_title(entitlements) -> str:
-    """The menu's one-line account status: Free, Pro, or Pro in its grace week."""
+def next_refresh_delay(
+    attempt: int,
+    *,
+    base_s: float = ENTITLEMENT_RETRY_BASE_S,
+    max_s: float = ENTITLEMENT_RETRY_MAX_S,
+) -> float:
+    """How long to wait before retrying a lease renewal that just failed.
+
+    ``attempt`` is 1 for the first failure in a row. The wait doubles from
+    :data:`ENTITLEMENT_RETRY_BASE_S` and stops at :data:`ENTITLEMENT_RETRY_MAX_S`:
+    a renewal that failed used to stamp the clock anyway and then wait the full
+    six hours, which turned a dropped connection at launch into an afternoon on
+    the free tier. Backing off rather than retrying every minute is what keeps
+    a proxy that is down from being hammered by every running copy of Murmur.
+    """
+    assert attempt >= 1, "attempt counts from 1"
+    assert base_s > 0, "base_s must be positive"
+    assert max_s >= base_s, "max_s must not be below base_s"
+    return min(base_s * (2 ** (attempt - 1)), max_s)
+
+
+def account_menu_title(entitlements, *, store_is_volatile: bool = False) -> str:
+    """The menu's one-line account status: Free, Pro, or Pro in its grace week.
+
+    ``store_is_volatile`` is the Keychain being unreachable, which means the
+    lease behind that line lives in memory and dies with the process. The line
+    says so rather than showing a plan the next launch will not have.
+    """
     if entitlements is None or not getattr(entitlements, "pro", False):
-        return ACCOUNT_STATUS_FREE
-    if getattr(entitlements, "in_grace", False):
-        return ACCOUNT_STATUS_PRO_GRACE
-    return ACCOUNT_STATUS_PRO
+        title = ACCOUNT_STATUS_FREE
+    elif getattr(entitlements, "in_grace", False):
+        title = ACCOUNT_STATUS_PRO_GRACE
+    else:
+        title = ACCOUNT_STATUS_PRO
+    return f"{title}{ACCOUNT_STATUS_NOT_SAVED}" if store_is_volatile else title
 
 
 def publish_entitlements(license_service) -> Any:
@@ -2135,7 +2252,11 @@ class MurmurApp(rumps.App):
         # status because "which plan" and "which engine" answer the same
         # question — where is this dictation going to be transcribed.
         self.account_item = rumps.MenuItem(
-            account_menu_title(get_current_entitlements()), callback=None
+            account_menu_title(
+                get_current_entitlements(),
+                store_is_volatile=self.secret_store_is_volatile,
+            ),
+            callback=None,
         )
         self.sign_in_item = rumps.MenuItem(
             SIGN_IN_MENU_TITLE, callback=self.open_account_settings
@@ -2689,8 +2810,13 @@ class MurmurApp(rumps.App):
             return None
 
     def _cleanup_client(self, config):
-        """The cloud cleanup client for this proxy origin, built once and kept."""
-        base_url = cloud_base_url(config)
+        """The cloud cleanup client for this proxy origin, built once and kept.
+
+        The origin is the one pinned at launch, never the live config's: the
+        text goes to the host the lease belongs to. See
+        :func:`pinned_cloud_config`.
+        """
+        base_url = cloud_base_url(self._hosted_config(config))
         if self._cloud_cleanup_client is not None and self._cloud_cleanup_base_url == base_url:
             return self._cloud_cleanup_client
         if self.license_service is None:
@@ -2713,6 +2839,12 @@ class MurmurApp(rumps.App):
     def _cleanup_callable(self, config, *, cloud_engine_active):
         """Which backend cleans this utterance: the proxy, or the local server.
 
+        Returns ``(cleanup, is_local)``. The flag is not a convenience: the
+        caller used to recover it with ``cleanup is self.cleanup_runtime.cleanup``,
+        and comparing two freshly bound methods of the same object is always
+        False in Python, so the local branch it guards — the "Preparing
+        cleanup…" pill through a 2 GB model load — never once ran.
+
         Cloud cleanup travels with cloud transcription and never on its own —
         :func:`~cleanup.cloud_cleanup.should_use_cloud_cleanup` refuses it when
         the dictation stayed on this Mac, because sending the text up after
@@ -2723,11 +2855,11 @@ class MurmurApp(rumps.App):
             pro_gate=is_pro_feature_enabled,
             cloud_engine_active=cloud_engine_active,
         ):
-            return self.cleanup_runtime.cleanup
+            return self.cleanup_runtime.cleanup, True
         client = self._cleanup_client(config)
         if client is None:
-            return self.cleanup_runtime.cleanup
-        return self._cloud_cleanup_with_fallback(client)
+            return self.cleanup_runtime.cleanup, True
+        return self._cloud_cleanup_with_fallback(client), False
 
     def _cloud_cleanup_with_fallback(self, client):
         """Wrap the proxy's cleanup so a refusal lands on the local server.
@@ -2795,8 +2927,9 @@ class MurmurApp(rumps.App):
             logger.debug("Cleanup not run: %s", plan.reason)
             return text
 
-        cleanup = self._cleanup_callable(config, cloud_engine_active=cloud_engine_active)
-        local_cleanup = cleanup is self.cleanup_runtime.cleanup
+        cleanup, local_cleanup = self._cleanup_callable(
+            config, cloud_engine_active=cloud_engine_active
+        )
         if pill is not None and local_cleanup and not self.cleanup_runtime.is_started:
             # The first cleaned utterance waits on a 2 GB model load. The menu
             # bar says so, but the user is looking at the pill, and a pill that
@@ -3176,6 +3309,11 @@ class MurmurApp(rumps.App):
         """
         config = self.runtime_config()
         self.cloud_base_url = cloud_base_url(config)
+        #: True when the lease could not be stored — see
+        #: :meth:`_build_license_service`. Read by the menu and the Account tab.
+        self.secret_store_is_volatile = False
+        #: Said once a session, not once a dictation. See :meth:`_hosted_config`.
+        self._base_url_drift_logged = False
         self.usage = UsageService(config_store=UsageConfigStore(self.persistence))
         self.license_service = self._build_license_service(self.cloud_base_url)
         #: The hosted engine in use, with the config it was built from.
@@ -3187,6 +3325,11 @@ class MurmurApp(rumps.App):
         self._cloud_cleanup_base_url = None
         #: Read and written only by the entitlement thread.
         self._entitlements_refreshed_at = None
+        #: Consecutive failed renewals, and when the next one may be tried.
+        self._entitlement_failures = 0
+        self._entitlements_retry_at = None
+        #: Notice kinds already shown this session. See :meth:`_announce_route`.
+        self._session_notices = set()
         self.account_item = None
         # Published here, synchronously, before anything asks the gate: reading
         # the stored lease is a Keychain read and a signature check, no network,
@@ -3202,8 +3345,21 @@ class MurmurApp(rumps.App):
         one when it is not: a lease that cannot be persisted is worth nothing
         after a quit, but it lets the Account tab open and the app run rather
         than raising out of ``__init__``.
+
+        That substitution is recorded in ``secret_store_is_volatile`` and said
+        out loud in both places the account is shown. Signing in, seeing "Pro",
+        quitting and being Free again is the kind of thing a user reports as a
+        billing failure; a Mac that cannot keep the lease has to say so before
+        the sign-in, not after the relaunch.
         """
-        secret_store = self._keychain() or InMemorySecretStore()
+        secret_store = self._keychain()
+        self.secret_store_is_volatile = secret_store is None
+        if secret_store is None:
+            logger.warning(
+                "No Keychain: the licence lease is kept in memory only and the "
+                "sign-in will not survive a quit."
+            )
+            secret_store = InMemorySecretStore()
         try:
             return LicenseService(secret_store, boske_http_transport, base_url)
         except Exception as error:  # noqa: BLE001 - a bad base URL raises ValueError
@@ -3237,23 +3393,59 @@ class MurmurApp(rumps.App):
             time.sleep(ENTITLEMENT_POLL_INTERVAL_S)
 
     def _refresh_entitlements_once(self):
-        """One pass of the loop above: renew when due, then publish and redraw."""
-        if should_refresh_entitlements(
-            last_refresh_at=self._entitlements_refreshed_at, now=time.time()
-        ):
-            self._entitlements_refreshed_at = time.time()
-            if self.license_service is not None:
+        """One pass of the loop above: renew when due, then publish and redraw.
+
+        The clock is stamped on **success** only. Stamping it before the call
+        meant a renewal that failed — no network at launch is the ordinary case —
+        counted as done and was not tried again for six hours, so a paying Mac
+        spent the afternoon on the free tier. A failure now backs off instead:
+        five minutes, doubling to an hour. See :func:`next_refresh_delay`.
+        """
+        if self._entitlement_refresh_due():
+            if self.license_service is None:
+                self._entitlement_refresh_succeeded()
+            else:
                 try:
                     self.license_service.refresh_if_needed()
                 except Exception as error:  # noqa: BLE001 - transport raises widely
-                    logger.warning("Lease refresh failed: %s", type(error).__name__)
+                    self._entitlement_refresh_failed(error)
+                else:
+                    self._entitlement_refresh_succeeded()
         entitlements = publish_entitlements(self.license_service)
         self._refresh_account_menu(entitlements)
+
+    def _entitlement_refresh_due(self):
+        """Whether to attempt a renewal now: the interval, or a due retry."""
+        now = time.time()
+        retry_at = self._entitlements_retry_at
+        if retry_at is not None:
+            # A retry is always sooner than the interval, so it is the answer
+            # whenever one is outstanding.
+            return now >= retry_at
+        return should_refresh_entitlements(
+            last_refresh_at=self._entitlements_refreshed_at, now=now
+        )
+
+    def _entitlement_refresh_succeeded(self):
+        """Stamp the clock and forget the backoff."""
+        self._entitlements_refreshed_at = time.time()
+        self._entitlement_failures = 0
+        self._entitlements_retry_at = None
+
+    def _entitlement_refresh_failed(self, error):
+        """Leave the clock alone and schedule the next attempt."""
+        self._entitlement_failures += 1
+        delay = next_refresh_delay(self._entitlement_failures)
+        self._entitlements_retry_at = time.time() + delay
+        logger.warning(
+            "Lease refresh failed (%s); retrying in %d s", type(error).__name__, int(delay)
+        )
 
     def _refresh_account_menu(self, entitlements=None):
         """Redraw the menu's account line. Safe to call from any thread."""
         title = account_menu_title(
-            entitlements if entitlements is not None else get_current_entitlements()
+            entitlements if entitlements is not None else get_current_entitlements(),
+            store_is_volatile=bool(getattr(self, "secret_store_is_volatile", False)),
         )
 
         def apply():
@@ -3267,26 +3459,64 @@ class MurmurApp(rumps.App):
         """Menu → "Sign in with Boske ID…": Settings, on the Account tab."""
         self.open_settings_window_safely(TAB_ACCOUNT)
 
+    def _hosted_config(self, config):
+        """``config`` with the proxy origin pinned to the one built at launch.
+
+        The only door to a hosted client, so every one of them — the lease, the
+        audio, the cleanup text — reaches the host the licence service was
+        built for. A ``cloud_base_url`` edited mid-session is honoured at the
+        next launch and said once here, because saying it per dictation would
+        bury it.
+        """
+        pinned = pinned_cloud_config(config, self.cloud_base_url)
+        if pinned is not config and not getattr(self, "_base_url_drift_logged", False):
+            self._base_url_drift_logged = True
+            logger.warning(
+                "cloud_base_url has changed since launch; this session keeps "
+                "using the origin it signed in against. Restart Murmur to use "
+                "the new one."
+            )
+        return pinned
+
     def _remote_engine_for(self, engine_id, config):
         """The hosted engine for this dictation, built once and kept.
 
-        Rebuilt only when the config it was built from changed — the proxy
-        origin, or the own-key provider and model. The lease is not part of that
-        key: it is read through a callable at request time, so signing out and
-        back in needs no rebuild.
+        Rebuilt only when the config it was built from changed — the own-key
+        provider and model. The lease is not part of that key: it is read
+        through a callable at request time, so signing out and back in needs no
+        rebuild. Neither is the live proxy origin, which :meth:`_hosted_config`
+        has already replaced with the pinned one.
+
+        Everything that can fail here comes back as an
+        :class:`~engines.base.EngineError`, because that is the one exception
+        the caller falls back on. ``build_engine`` raises ``ValueError`` for a
+        missing own-key provider and the engines raise it for a non-HTTPS
+        endpoint; those used to escape :meth:`_transcribe_routed` untouched and
+        cost the user the transcript they had just dictated.
         """
+        config = self._hosted_config(config)
         key = remote_engine_key(engine_id, config)
         with self._remote_engine_lock:
             if self._remote_engine is not None and self._remote_engine_key == key:
                 return self._remote_engine
-            engine = build_engine(
-                engine_id,
-                config=config,
-                model_store=app_model_store(),
-                license_service=self.license_service,
-                keychain=self._keychain(),
-            )
-            engine.load()
+            try:
+                engine = build_engine(
+                    engine_id,
+                    config=config,
+                    model_store=app_model_store(),
+                    license_service=self.license_service,
+                    keychain=self._keychain(),
+                )
+                engine.load()
+            except EngineError:
+                # Already the right kind, and the subclass carries the wording:
+                # re-wrapping would turn a rejected key into "something failed".
+                raise
+            except Exception as exc:  # noqa: BLE001 - config and the factory raise widely
+                # The type only: the message can quote the config it choked on.
+                raise EngineError(
+                    f"the {engine_id} engine could not be built ({type(exc).__name__})"
+                ) from exc
             self._remote_engine = engine
             self._remote_engine_key = key
             logger.info("Built the %s engine (%s)", engine_id, engine.runtime_summary())
@@ -3348,6 +3578,14 @@ class MurmurApp(rumps.App):
         propagates — a transcript that could not be produced must not look like
         one that was, and re-running the engine that just failed would only
         fail again.
+
+        Which hosted engine failed decides the wording. The two proxy
+        exceptions mean nothing to a user's own provider, so an own-key failure
+        is read by :func:`after_byok_failure` instead — a rejected key used to
+        match neither and fall back with no notice at all, which downgraded
+        every dictation silently for as long as the key stayed revoked. Those
+        notices are shown once a session: the answer is in Settings, and
+        repeating it on every utterance would be nagging.
         """
         self._announce_route(route.notice)
         hosted = route.engine_id in (ENGINE_CLOUD, ENGINE_BYOK)
@@ -3363,15 +3601,24 @@ class MurmurApp(rumps.App):
         except EngineError as error:
             if not hosted:
                 raise
-            fallback = after_cloud_failure(
-                error,
-                local_engine_id=self.engine_id or default_engine_for_current_machine(),
-            )
+            local_engine_id = self.engine_id or default_engine_for_current_machine()
+            own_key = route.engine_id == ENGINE_BYOK
+            if own_key:
+                fallback = after_byok_failure(
+                    error,
+                    local_engine_id=local_engine_id,
+                    provider=byok_provider_name(config),
+                )
+            else:
+                fallback = after_cloud_failure(error, local_engine_id=local_engine_id)
             logger.info(
-                "Murmur Cloud did not take the clip (%s); transcribing on this Mac",
+                "The %s engine did not take the clip (%s); transcribing on this Mac",
+                route.engine_id,
                 fallback.reason,
             )
-            self._announce_route(fallback.notice)
+            self._announce_route(
+                fallback.notice, once_key=fallback.reason if own_key else None
+            )
             transcript = self._run_engine(
                 fallback.engine_id,
                 config,
@@ -3383,13 +3630,18 @@ class MurmurApp(rumps.App):
             return transcript, fallback.engine_id
         return transcript, route.engine_id
 
-    def _announce_route(self, notice):
+    def _announce_route(self, notice, *, once_key=None):
         """Say a routing notice out loud, at most as often as it may be said.
 
         A notification, never an alert: the user is mid-dictation and a modal
         would take the key focus the paste needs. The allowance notice is marked
         shown only once it has actually been shown, so a route computed and
         discarded never burns the one notice the user gets per period.
+
+        ``once_key`` names a class of notice worth saying once a session — the
+        own-key failures, where the fix is a trip to Settings and every further
+        utterance would only repeat it. Like the allowance notice, the key is
+        recorded only after the notification actually went out.
         """
         pending = True
         if self.usage is not None:
@@ -3402,6 +3654,13 @@ class MurmurApp(rumps.App):
         message = notice_to_show(notice, fallback_pending=pending)
         if message is None:
             return
+        if once_key is not None:
+            shown = getattr(self, "_session_notices", None)
+            if shown is None:
+                shown = self._session_notices = set()
+            if once_key in shown:
+                return
+            shown.add(once_key)
         rumps.notification(APP_NAME, "Murmur Cloud", message)
         if message == ALLOWANCE_MESSAGE and self.usage is not None:
             try:
@@ -3470,12 +3729,19 @@ class MurmurApp(rumps.App):
         :func:`~services.license_service.is_pro_feature_enabled` unadorned: it
         reads the published entitlements out of memory, so the tabs may ask it
         once per gated control without touching the disk.
+
+        ``secret_store_volatile`` is the Keychain being unreachable. The Account
+        tab is where a sign-in is offered, so it is where the app has to admit
+        that the sign-in will not outlive the process.
         """
         return {
             "usage": self.usage.summary if self.usage is not None else None,
             "license": self.license_service,
             "pro_gate": is_pro_feature_enabled,
             "keychain": self._keychain(),
+            "secret_store_volatile": bool(
+                getattr(self, "secret_store_is_volatile", False)
+            ),
             "scheduler": None,
             "version": APP_VERSION,
             "build_info": read_build_info(),

@@ -44,6 +44,7 @@ from ui.settings.account_tab import (
     LINK_PENDING,
     LINK_SUCCESS,
     STATUS_FREE,
+    STATUS_NOT_PERSISTED,
     STATUS_UNAVAILABLE,
     AccountTab,
     AccountTabModel,
@@ -214,6 +215,30 @@ class StatusLineTest(unittest.TestCase):
             entitlements=FakeEntitlements(pro=True, in_grace=True, source="lease")
         )
         self.assertEqual("Pro (grace)", harness.model.status_line())
+
+    def test_a_volatile_secret_store_warns_next_to_the_sign_in(self):
+        # The tab is where signing in is offered, so it is where the app has to
+        # admit the sign-in dies with the process.
+        harness = ModelHarness(secret_store_volatile=True)
+
+        line = harness.model.status_line()
+
+        self.assertTrue(line.startswith(STATUS_FREE))
+        self.assertIn(STATUS_NOT_PERSISTED, line)
+
+    def test_the_warning_rides_along_with_a_pro_line_too(self):
+        harness = ModelHarness(
+            entitlements=FakeEntitlements(pro=True, source="lease"),
+            secret_store_volatile=True,
+        )
+
+        self.assertEqual(f"Pro — {STATUS_NOT_PERSISTED}", harness.model.status_line())
+
+    def test_a_working_keychain_leaves_the_line_alone(self):
+        harness = ModelHarness(entitlements=FakeEntitlements(pro=True, source="lease"))
+
+        self.assertEqual("Pro", harness.model.status_line())
+        self.assertFalse(harness.model.secret_store_volatile)
 
     def test_licence_provider_failure_is_reported_not_raised(self):
         harness = ModelHarness()
