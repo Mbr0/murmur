@@ -1,6 +1,6 @@
 # MASTER: Murmur v2
 
-**Status:** ✅ approved 2026-09-02 · Wave 0 in progress
+**Status:** ✅ approved 2026-09-02 · Wave 0 in PR #4 · Wave 1 next
 **Base branch:** `main` (after PR #2)
 **Source:** study in `../2026-09-02-competitive-analysis/`, Part II "What should change"
 
