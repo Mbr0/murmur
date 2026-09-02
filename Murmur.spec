@@ -86,7 +86,6 @@ datas = [
     ("assets/icons/icon_processing.png", "assets/icons"),
     ("assets/icons/icon_error.png", "assets/icons"),
     ("history_window.py", "."),
-    ("settings_window.py", "."),
     ("ui_theme.py", "."),
     ("ui_alerts.py", "."),
     ("transcription_filters.py", "."),

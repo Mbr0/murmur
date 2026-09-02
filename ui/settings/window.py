@@ -145,6 +145,9 @@ class SettingsWindowController:
         self.tab_view = None
         self._delegate = None
         self._window_delegate = None
+        #: The one context the tabs were built with, kept so a live engine swap
+        #: can update it in place — the tabs hold this same object.
+        self._live_context: TabContext | None = None
 
     # -- config ----------------------------------------------------------
 
@@ -265,6 +268,7 @@ class SettingsWindowController:
         self.tab_view.setAppearance_(theme.control_appearance())
 
         context = self.context()
+        self._live_context = context
         self.build_tabs()
         for identifier in self.identifiers:
             tab = self.tabs[identifier]
@@ -279,6 +283,31 @@ class SettingsWindowController:
         self.window.setDelegate_(self._window_delegate)
         content.addSubview_(self.tab_view)
         return self.window
+
+    # -- the running app talking back --------------------------------------
+
+    def engine_reloaded(self, info: Any) -> None:
+        """The app finished swapping engines: tell the tabs about the new one.
+
+        The window reads the engine once, when it opens, and hands that
+        ``EngineInfo`` to every tab in the one context they share. A background
+        swap makes it stale — the Language popup would go on offering the old
+        engine's languages — so the context is updated in place and each tab is
+        asked to re-read it. Called on the main thread by the app.
+        """
+        self._engine_info = info
+        if self._live_context is not None:
+            self._live_context.engine_info = info
+        for identifier, tab in self.tabs.items():
+            refresh = getattr(tab, "refresh", None)
+            if refresh is None:
+                continue
+            try:
+                refresh()
+            except Exception as error:  # noqa: BLE001 - one tab must not stop the rest
+                logger.warning(
+                    "Settings tab %r could not follow the engine swap: %s", identifier, error
+                )
 
     # -- closing ---------------------------------------------------------
 
@@ -401,4 +430,13 @@ def open_settings(
     elif app is not None:
         _CONTROLLER.app = app
     _CONTROLLER.show(tab)
+    return _CONTROLLER
+
+
+def current_controller() -> SettingsWindowController | None:
+    """The Settings window's controller, or ``None`` before it is first opened.
+
+    How the running app reaches an open window — to tell it the engine was
+    swapped, say — without importing the window's private state.
+    """
     return _CONTROLLER

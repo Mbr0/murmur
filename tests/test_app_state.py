@@ -1,11 +1,23 @@
+import ast
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from murmur import (
     APP_CATALOG,
+    APP_VERSION,
+    AUDIO_DIR,
+    HISTORY_ORIGIN_BY_ENGINE,
+    SM_STATUS_ENABLED,
+    LaunchAtLoginUnavailable,
+    MurmurApp,
+    apply_launch_at_login,
+    history_origin_for,
+    launch_at_login_enabled,
+    login_item_service,
     CLEANUP_DOWNLOAD_MENU_TITLE,
     CLEANUP_MODEL_MISSING_REASON,
     CLEANUP_NOTICE_NOTIFY,
@@ -80,7 +92,15 @@ from cleanup.llama_server import CLEANUP_MODEL_SPEC, CleanupResult, LlamaServerE
 from cleanup.modes import MODE_IDS, TONE_IDS
 from cleanup.vocabulary import vocabulary_from_config
 from engines.model_store import CATALOG, ModelIntegrityError
-from services.persistence_service import DEFAULT_CONFIG
+from services.keychain import KeychainUnavailable
+from services.persistence_service import (
+    DEFAULT_CONFIG,
+    ORIGIN_BYOK,
+    ORIGIN_CLOUD,
+    ORIGIN_LOCAL,
+    validate_history_origin,
+)
+from ui.settings.general_tab import supports_launch_at_login
 from services.hotkey_service import (
     ACTION_START,
     ACTION_STOP,
@@ -1532,6 +1552,377 @@ class AppCatalogTests(unittest.TestCase):
 
     def test_the_speech_catalog_itself_stays_speech_only(self):
         self.assertNotIn(CLEANUP_MODEL_SPEC.id, [spec.id for spec in CATALOG])
+
+
+# -- Settings wiring ---------------------------------------------------------
+#
+# ``MurmurApp`` is a ``rumps.App`` and cannot be constructed without a menu
+# bar, so the methods below are called unbound against a stand-in ``self``
+# carrying only the attributes each one actually reads. That is also the point
+# of the tests: these methods must not reach past what they are given.
+
+
+class SettingsServicesTests(unittest.TestCase):
+    """The one dict Settings is handed, and what each key means."""
+
+    KEYS = {
+        "usage",
+        "license",
+        "pro_gate",
+        "keychain",
+        "scheduler",
+        "version",
+        "build_info",
+        "persistence",
+        "audio_dir",
+    }
+
+    def _services(self, keychain=None):
+        app = SimpleNamespace(persistence=object(), _keychain=lambda: keychain)
+        return MurmurApp._settings_services(app), app
+
+    def test_every_key_the_window_documents_is_present(self):
+        services, app = self._services()
+
+        self.assertEqual(set(services), self.KEYS)
+        self.assertIs(services["persistence"], app.persistence)
+        self.assertIs(services["pro_gate"], pro_enabled)
+        self.assertEqual(services["version"], APP_VERSION)
+        self.assertEqual(services["audio_dir"], AUDIO_DIR)
+        self.assertIsInstance(services["build_info"], dict)
+
+    def test_the_wave_four_providers_are_named_but_empty(self):
+        services, _ = self._services()
+
+        self.assertIsNone(services["usage"])
+        self.assertIsNone(services["license"])
+
+    def test_the_scheduler_is_left_to_the_account_tab(self):
+        # The tab's own default polls off the main thread and then redraws on
+        # it; anything handed in here would replace both halves.
+        services, _ = self._services()
+
+        self.assertIsNone(services["scheduler"])
+
+    def test_the_keychain_is_whatever_the_probe_found(self):
+        store = object()
+        services, _ = self._services(keychain=store)
+
+        self.assertIs(services["keychain"], store)
+
+    def test_an_unreachable_keychain_reaches_the_tabs_as_none(self):
+        class Unavailable:
+            @property
+            def backend(self):
+                raise KeychainUnavailable("no Security framework")
+
+        app = SimpleNamespace(
+            persistence=object(), _keychain_probed=False, _keychain_store=None
+        )
+        with patch("murmur.KeychainStore", Unavailable):
+            services = MurmurApp._settings_services(
+                SimpleNamespace(
+                    persistence=app.persistence,
+                    _keychain=lambda: MurmurApp._keychain(app),
+                )
+            )
+
+        self.assertIsNone(services["keychain"])
+
+
+class KeychainProbeTests(unittest.TestCase):
+    def test_an_unreachable_keychain_becomes_none(self):
+        class Unavailable:
+            @property
+            def backend(self):
+                raise KeychainUnavailable("no Security framework")
+
+        app = SimpleNamespace(_keychain_probed=False, _keychain_store=None)
+        with patch("murmur.KeychainStore", Unavailable):
+            store = MurmurApp._keychain(app)
+
+        self.assertIsNone(store)
+        self.assertTrue(app._keychain_probed)
+
+    def test_the_keychain_is_asked_about_once(self):
+        made = []
+
+        class Fine:
+            backend = object()
+
+            def __init__(self):
+                made.append(self)
+
+        app = SimpleNamespace(_keychain_probed=False, _keychain_store=None)
+        with patch("murmur.KeychainStore", Fine):
+            first = MurmurApp._keychain(app)
+            second = MurmurApp._keychain(app)
+
+        self.assertIs(first, second)
+        self.assertEqual(len(made), 1)
+
+
+class HistoryOriginTests(unittest.TestCase):
+    """Where a transcription happened, decided in one place."""
+
+    def test_the_shipped_engines_all_run_on_this_mac(self):
+        for engine_id in ("whispercpp", "voxtral_mlx"):
+            self.assertEqual(history_origin_for(engine_id), ORIGIN_LOCAL)
+
+    def test_the_cloud_and_own_key_engines_are_named(self):
+        self.assertEqual(history_origin_for("cloud"), ORIGIN_CLOUD)
+        self.assertEqual(history_origin_for("byok"), ORIGIN_BYOK)
+
+    def test_an_unknown_or_missing_engine_reads_as_local(self):
+        # Never the other way round: claiming audio left the Mac when it did
+        # not is the failure that matters here.
+        self.assertEqual(history_origin_for("something-new"), ORIGIN_LOCAL)
+        self.assertEqual(history_origin_for(None), ORIGIN_LOCAL)
+        self.assertEqual(history_origin_for(""), ORIGIN_LOCAL)
+
+    def test_every_mapped_origin_is_one_history_accepts(self):
+        for origin in HISTORY_ORIGIN_BY_ENGINE.values():
+            self.assertEqual(validate_history_origin(origin), origin)
+
+
+class AddToHistoryTests(unittest.TestCase):
+    """Every entry says which engine wrote it, where, and how long the clip was."""
+
+    def _app(self, engine_id="whispercpp", save_history=True):
+        recorded = {}
+
+        def add_history_entry(history, **kwargs):
+            recorded.update(kwargs)
+            return ["entry"]
+
+        app = SimpleNamespace(
+            history=[],
+            engine=SimpleNamespace(info=lambda: SimpleNamespace(id=engine_id)),
+            engine_id=engine_id,
+            persistence=SimpleNamespace(add_history_entry=add_history_entry),
+            runtime_config=lambda: {"save_history": save_history},
+            save_history=lambda: None,
+        )
+        app.current_engine_id = lambda: MurmurApp.current_engine_id(app)
+        return app, recorded
+
+    def test_a_local_clip_carries_its_engine_origin_and_length(self):
+        app, recorded = self._app()
+
+        MurmurApp.add_to_history(app, "hello", "live", duration_s=3.5)
+
+        self.assertEqual(recorded["origin"], ORIGIN_LOCAL)
+        self.assertEqual(recorded["engine_id"], "whispercpp")
+        self.assertEqual(recorded["duration_s"], 3.5)
+
+    def test_a_cloud_engine_is_recorded_as_cloud(self):
+        app, recorded = self._app(engine_id="cloud")
+
+        MurmurApp.add_to_history(app, "hello", "live")
+
+        self.assertEqual(recorded["origin"], ORIGIN_CLOUD)
+        self.assertEqual(recorded["engine_id"], "cloud")
+
+    def test_the_engine_that_is_loaded_wins_over_the_one_config_asked_for(self):
+        app, recorded = self._app(engine_id="whispercpp")
+        app.engine = SimpleNamespace(info=lambda: SimpleNamespace(id="cloud"))
+
+        MurmurApp.add_to_history(app, "hello", "live")
+
+        self.assertEqual(recorded["engine_id"], "cloud")
+
+    def test_an_engine_that_cannot_be_asked_falls_back_to_the_configured_id(self):
+        app, recorded = self._app()
+        app.engine = SimpleNamespace(info=_raise_engine_error)
+
+        MurmurApp.add_to_history(app, "hello", "live")
+
+        self.assertEqual(recorded["engine_id"], "whispercpp")
+        self.assertEqual(recorded["origin"], ORIGIN_LOCAL)
+
+    def test_history_turned_off_writes_nothing(self):
+        app, recorded = self._app(save_history=False)
+
+        MurmurApp.add_to_history(app, "hello", "live")
+
+        self.assertEqual(recorded, {})
+
+
+def _raise_engine_error():
+    raise RuntimeError("the engine is mid-swap")
+
+
+class _BridgedAppService:
+    """``SMAppService`` as PyObjC bridges it: ``registerAndReturnError_``."""
+
+    def __init__(self, status=0, ok=True):
+        self._status = status
+        self._ok = ok
+        self.calls = []
+
+    def status(self):
+        return self._status
+
+    def registerAndReturnError_(self, _error):
+        self.calls.append("register")
+        if self._ok:
+            self._status = SM_STATUS_ENABLED
+        return (self._ok, None if self._ok else "denied")
+
+    def unregisterAndReturnError_(self, _error):
+        self.calls.append("unregister")
+        if self._ok:
+            self._status = 0
+        return (self._ok, None if self._ok else "denied")
+
+
+class _PlainAppService:
+    """The same service without the error out-parameter."""
+
+    def __init__(self, status=0):
+        self._status = status
+        self.calls = []
+
+    def status(self):
+        return self._status
+
+    def register(self):
+        self.calls.append("register")
+        self._status = SM_STATUS_ENABLED
+
+    def unregister(self):
+        self.calls.append("unregister")
+        self._status = 0
+
+
+class LaunchAtLoginDecisionTests(unittest.TestCase):
+    def test_turning_it_on_registers_the_login_item(self):
+        service = _BridgedAppService()
+
+        self.assertTrue(apply_launch_at_login(service, True))
+        self.assertEqual(service.calls, ["register"])
+
+    def test_turning_it_off_unregisters_it(self):
+        service = _BridgedAppService(status=SM_STATUS_ENABLED)
+
+        self.assertFalse(apply_launch_at_login(service, False))
+        self.assertEqual(service.calls, ["unregister"])
+
+    def test_asking_for_the_state_it_is_already_in_touches_nothing(self):
+        # Re-registering can put the approval prompt back in front of a user
+        # who never touched the switch.
+        already_on = _BridgedAppService(status=SM_STATUS_ENABLED)
+        already_off = _BridgedAppService()
+
+        self.assertTrue(apply_launch_at_login(already_on, True))
+        self.assertFalse(apply_launch_at_login(already_off, False))
+        self.assertEqual(already_on.calls, [])
+        self.assertEqual(already_off.calls, [])
+
+    def test_the_plain_bridge_shape_is_driven_too(self):
+        service = _PlainAppService()
+
+        self.assertTrue(apply_launch_at_login(service, True))
+        self.assertEqual(service.calls, ["register"])
+
+    def test_no_service_at_all_is_unavailable_rather_than_silent(self):
+        with self.assertRaises(LaunchAtLoginUnavailable):
+            apply_launch_at_login(None, True)
+
+    def test_a_refusal_from_the_framework_is_not_an_unavailable_build(self):
+        service = _BridgedAppService(ok=False)
+
+        with self.assertRaises(RuntimeError) as caught:
+            apply_launch_at_login(service, True)
+        self.assertNotIsInstance(caught.exception, LaunchAtLoginUnavailable)
+
+    def test_reading_the_current_state(self):
+        self.assertFalse(launch_at_login_enabled(None))
+        self.assertFalse(launch_at_login_enabled(_BridgedAppService()))
+        self.assertTrue(
+            launch_at_login_enabled(_BridgedAppService(status=SM_STATUS_ENABLED))
+        )
+
+    def test_probing_for_the_framework_never_raises(self):
+        # macOS 12 and every source run land here; a menu bar must still appear.
+        service = login_item_service()
+
+        self.assertTrue(service is None or hasattr(service, "status"))
+
+
+class SetLaunchAtLoginTests(unittest.TestCase):
+    def test_it_applies_the_decision_and_reports_the_new_state(self):
+        service = _BridgedAppService()
+        app = SimpleNamespace(_login_item_service=service)
+
+        self.assertTrue(MurmurApp.set_launch_at_login(app, True))
+        self.assertEqual(service.calls, ["register"])
+
+    def test_without_the_framework_it_raises_instead_of_pretending(self):
+        app = SimpleNamespace(_login_item_service=None)
+
+        with self.assertRaises(LaunchAtLoginUnavailable):
+            MurmurApp.set_launch_at_login(app, True)
+
+    def test_a_refusal_is_told_to_the_user_not_raised_into_the_click(self):
+        service = _BridgedAppService(ok=False)
+        app = SimpleNamespace(_login_item_service=service)
+
+        with patch("murmur.ui_alerts.show_alert") as alert:
+            state = MurmurApp.set_launch_at_login(app, True)
+
+        self.assertFalse(state)
+        self.assertTrue(alert.called)
+
+    def test_settings_offers_the_switch_only_where_it_works(self):
+        # __init__ shadows the method with None when the probe found nothing,
+        # which is exactly what the General tab's check reads.
+        self.assertFalse(supports_launch_at_login(SimpleNamespace(set_launch_at_login=None)))
+        self.assertFalse(supports_launch_at_login(None))
+        self.assertTrue(
+            supports_launch_at_login(SimpleNamespace(set_launch_at_login=lambda on: on))
+        )
+
+
+class ArchivedSettingsWindowTests(unittest.TestCase):
+    """``settings_window.py`` is in ``_archive/``; nothing may reach for it."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+    SKIP = {"_archive", ".git", "__pycache__", ".worktrees", "venv", ".venv", "build", "dist"}
+
+    def _sources(self):
+        for path in self.ROOT.rglob("*.py"):
+            if any(part in self.SKIP for part in path.relative_to(self.ROOT).parts):
+                continue
+            yield path
+
+    def test_nothing_imports_the_archived_module(self):
+        offenders = []
+        for path in self._sources():
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    names = [node.module or ""]
+                else:
+                    continue
+                if any(
+                    name == "settings_window" or name.startswith("settings_window.")
+                    for name in names
+                ):
+                    offenders.append(f"{path.relative_to(self.ROOT)}:{node.lineno}")
+
+        self.assertEqual(offenders, [])
+
+    def test_the_module_lives_in_the_archive_and_nowhere_else(self):
+        self.assertFalse((self.ROOT / "settings_window.py").exists())
+        self.assertTrue((self.ROOT / "_archive" / "settings_window.py").exists())
+
+    def test_the_bundle_no_longer_ships_it(self):
+        spec = (self.ROOT / "Murmur.spec").read_text(encoding="utf-8")
+
+        self.assertNotIn("settings_window", spec)
 
 
 if __name__ == "__main__":

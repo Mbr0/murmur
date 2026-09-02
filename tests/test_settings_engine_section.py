@@ -2,19 +2,18 @@
 
 A real :class:`~engines.model_store.ModelStore` over a temporary root backs
 every test, so "installed" means files actually on disk. No AppKit, no network.
+
+The language and vocabulary section tests that used to live here went with
+``settings_window.py`` into ``_archive/``; those rules are now owned by
+``tests/test_settings_general_tab.py`` and ``tests/test_settings_smart_tab.py``.
 """
 
-import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from cleanup.vocabulary import VocabularyError
 from engines.model_store import ModelFile, ModelSpec, ModelStore
 from services.model_profile_service import CHIP_APPLE_SILICON, CHIP_INTEL, VOXTRAL_MIN_RAM_GB
-from engines.base import LANGUAGE_AUTO, WHISPER_LANGUAGES
-from services.language_service import available_languages
-from settings_window import CONFIG_LANGUAGE, LanguageSectionModel, VocabularySectionModel
 from ui.download_sheet import CONFIG_ENGINE_ID, CONFIG_MODEL_ID, EngineSectionModel
 
 TURBO_Q5 = ModelSpec(
@@ -342,165 +341,6 @@ class DetailLineTests(unittest.TestCase):
         section = self.fx.section()
         section.select("voxtral-4bit")
         self.assertEqual(section.detail_line, "3.1 GB on this Mac · Apache-2.0")
-
-
-
-
-class VocabularySectionModelTests(unittest.TestCase):
-    """The Settings "Vocabulary" group's editing rules, without AppKit."""
-
-    CONFIG = {
-        "vocabulary_terms": ["Boske", "Murmur"],
-        "vocabulary_replacements": [
-            {"from": "canopy", "to": "Canopy Studio", "match_case": False}
-        ],
-    }
-
-    def test_loads_terms_and_replacements_from_config(self):
-        model = VocabularySectionModel(self.CONFIG)
-        self.assertEqual(model.terms_text, "Boske\nMurmur")
-        self.assertEqual(model.row_count, 1)
-        self.assertEqual(model.value_for(0, "from"), "canopy")
-        self.assertEqual(model.value_for(0, "to"), "Canopy Studio")
-        self.assertIs(model.value_for(0, "match_case"), False)
-
-    def test_empty_config_is_an_empty_section(self):
-        model = VocabularySectionModel({})
-        self.assertEqual(model.terms_text, "")
-        self.assertEqual(model.row_count, 0)
-
-    def test_terms_box_drops_blanks_and_repeats_and_trims(self):
-        model = VocabularySectionModel({})
-        model.set_terms_text("  Boske \n\nMurmur\nBoske\n   \n")
-        self.assertEqual(model.terms, ["Boske", "Murmur"])
-
-    def test_added_row_starts_blank_and_is_returned_for_editing(self):
-        model = VocabularySectionModel(self.CONFIG)
-        row = model.add_replacement()
-        self.assertEqual(row, 1)
-        self.assertEqual(model.value_for(row, "from"), "")
-        self.assertIs(model.value_for(row, "match_case"), False)
-
-    def test_editing_a_cell_writes_it_back(self):
-        model = VocabularySectionModel(self.CONFIG)
-        model.set_value(0, "from", "boske")
-        model.set_value(0, "to", "Boske")
-        model.set_value(0, "match_case", True)
-        self.assertEqual(model.value_for(0, "from"), "boske")
-        self.assertEqual(model.value_for(0, "to"), "Boske")
-        self.assertIs(model.value_for(0, "match_case"), True)
-
-    def test_editing_rejects_the_wrong_type_rather_than_coercing(self):
-        model = VocabularySectionModel(self.CONFIG)
-        with self.assertRaises(AssertionError):
-            model.set_value(0, "match_case", 1)
-        with self.assertRaises(AssertionError):
-            model.set_value(0, "from", 7)
-
-    def test_unknown_column_and_row_fail_fast(self):
-        model = VocabularySectionModel(self.CONFIG)
-        with self.assertRaises(AssertionError):
-            model.value_for(0, "nope")
-        with self.assertRaises(AssertionError):
-            model.value_for(5, "from")
-
-    def test_removing_selects_the_neighbour_and_minus_one_when_empty(self):
-        model = VocabularySectionModel({})
-        model.add_replacement()
-        model.add_replacement()
-        model.set_value(0, "from", "a")
-        model.set_value(1, "from", "b")
-        self.assertEqual(model.remove_replacement(1), 0)
-        self.assertEqual(model.value_for(0, "from"), "a")
-        self.assertEqual(model.remove_replacement(0), -1)
-        self.assertEqual(model.row_count, 0)
-
-    def test_blank_rows_are_never_saved(self):
-        model = VocabularySectionModel(self.CONFIG)
-        model.add_replacement()
-        saved = model.to_config()
-        self.assertEqual(len(saved["vocabulary_replacements"]), 1)
-        self.assertEqual(saved["vocabulary_terms"], ["Boske", "Murmur"])
-
-    def test_config_round_trips_through_the_section(self):
-        model = VocabularySectionModel(self.CONFIG)
-        self.assertEqual(
-            VocabularySectionModel(model.to_config()).to_config(), model.to_config()
-        )
-
-    def test_csv_round_trips(self):
-        model = VocabularySectionModel(self.CONFIG)
-        exported = model.export_text()
-        empty = VocabularySectionModel({})
-        empty.import_text(exported)
-        self.assertEqual(empty.to_config(), model.to_config())
-
-    def test_a_bad_csv_names_the_line_and_leaves_the_section_alone(self):
-        model = VocabularySectionModel(self.CONFIG)
-        with self.assertRaises(VocabularyError) as caught:
-            model.import_text("kind,from,to,match_case\nterm,Boske,,\nnope,x,y,false\n")
-        self.assertIn("Line 3", str(caught.exception))
-        self.assertEqual(model.terms, ["Boske", "Murmur"])
-        self.assertEqual(model.row_count, 1)
-
-
-class LanguageSectionModelTests(unittest.TestCase):
-    """The Language popup's rows, and the one key it is allowed to write."""
-
-    WHISPER_CODES = available_languages(
-        types.SimpleNamespace(languages=WHISPER_LANGUAGES)
-    )
-
-    def test_an_untouched_popup_writes_nothing(self):
-        model = LanguageSectionModel({CONFIG_LANGUAGE: "fr"}, self.WHISPER_CODES)
-        self.assertEqual(model.changes_for_index(model.selected_index), {})
-
-    def test_saving_a_new_choice_writes_the_code(self):
-        model = LanguageSectionModel({CONFIG_LANGUAGE: "fr"}, self.WHISPER_CODES)
-        index = model.codes.index("nl")
-        self.assertEqual(model.changes_for_index(index), {CONFIG_LANGUAGE: "nl"})
-
-    def test_a_one_row_engine_cannot_overwrite_the_users_language(self):
-        """whisper.cpp reported only "auto"; every Save then wrote language=auto."""
-        model = LanguageSectionModel({CONFIG_LANGUAGE: "fr"}, (LANGUAGE_AUTO,))
-
-        self.assertIn("fr", model.codes)
-        self.assertEqual(model.selected_index, model.codes.index("fr"))
-        self.assertEqual(model.changes_for_index(model.selected_index), {})
-
-    def test_a_missing_language_gets_its_own_row_and_a_title(self):
-        model = LanguageSectionModel({CONFIG_LANGUAGE: "sv"}, (LANGUAGE_AUTO, "en"))
-        self.assertEqual(model.codes, (LANGUAGE_AUTO, "en", "sv"))
-        self.assertEqual(model.titles, ("Automatic", "English", "SV"))
-
-    def test_auto_is_the_default_when_config_says_nothing(self):
-        model = LanguageSectionModel({}, self.WHISPER_CODES)
-        self.assertEqual(model.initial, LANGUAGE_AUTO)
-        self.assertEqual(model.code_at(model.selected_index), LANGUAGE_AUTO)
-
-    def test_switching_engines_relists_languages_and_keeps_the_choice(self):
-        """The popup used to keep the old engine's list, and save by index."""
-        model = LanguageSectionModel({CONFIG_LANGUAGE: "nl"}, self.WHISPER_CODES)
-        voxtral_codes = (LANGUAGE_AUTO, "en", "es", "fr", "nl", "pt")
-
-        rebuilt = model.rebuilt(voxtral_codes, model.selected_index)
-
-        self.assertEqual(rebuilt.codes, voxtral_codes)
-        self.assertEqual(rebuilt.code_at(rebuilt.selected_index), "nl")
-        self.assertEqual(rebuilt.changes_for_index(rebuilt.selected_index), {})
-
-    def test_a_language_the_new_engine_lacks_survives_the_switch(self):
-        model = LanguageSectionModel({CONFIG_LANGUAGE: "ja"}, self.WHISPER_CODES)
-
-        rebuilt = model.rebuilt((LANGUAGE_AUTO, "en", "fr"), model.selected_index)
-
-        self.assertIn("ja", rebuilt.codes)
-        self.assertEqual(rebuilt.code_at(rebuilt.selected_index), "ja")
-
-    def test_an_out_of_range_row_is_a_programming_error(self):
-        model = LanguageSectionModel({}, (LANGUAGE_AUTO, "en"))
-        with self.assertRaises(AssertionError):
-            model.code_at(2)
 
 
 if __name__ == "__main__":

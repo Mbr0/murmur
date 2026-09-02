@@ -84,6 +84,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from cleanup.coding_mode import transform_spoken_code
 from cleanup.context import AppContext, capture_context, resolve_mode
 from cleanup.llama_server import (
@@ -119,6 +120,7 @@ from ui.download_sheet import (
 from ui.pill_window import PillPresenter
 from ui.onboarding_window import OnboardingCallbacks, should_show, show_onboarding
 from services.audio_capture_service import AudioCaptureService
+from services.keychain import KeychainStore, KeychainUnavailable
 from services.language_service import resolve_language
 from services.hotkey_service import (
     ACTION_START,
@@ -146,6 +148,9 @@ from services.model_profile_service import (
 )
 from services.persistence_service import (
     DEFAULT_CONFIG,
+    ORIGIN_BYOK,
+    ORIGIN_CLOUD,
+    ORIGIN_LOCAL,
     PersistencePaths,
     PersistenceService,
     resolve_cleanup_enabled,
@@ -236,7 +241,6 @@ def resource_path(relative_path):
 # Store window controller references to prevent garbage collection
 _window_controllers = []
 _history_module = None
-_settings_module = None
 
 def _load_window_module(module_name, script_path):
     """Load a window module once; PyObjC classes cannot be safely reloaded."""
@@ -264,14 +268,6 @@ def _get_history_module():
     script_path = resource_path("history_window.py")
     _history_module = _load_window_module("history_window", script_path)
     return _history_module
-
-
-def _get_settings_module():
-    """Load the settings window module."""
-    global _settings_module
-    script_path = resource_path("settings_window.py")
-    _settings_module = _load_window_module("settings_window", script_path)
-    return _settings_module
 
 
 def _cleanup_window_controllers():
@@ -337,25 +333,21 @@ def show_history_window_direct():
         logger.error(f"Error creating history window: {e}")
         raise
 
-def show_settings_window_direct():
-    """Show settings window directly in the same process"""
-    global _window_controllers
-    logger.info("show_settings_window_direct called")
+def show_settings_window_direct(tab=None):
+    """Show the tabbed Settings window in this process, optionally on one tab.
+
+    The window is a singleton owned by :mod:`ui.settings.window`: reopening
+    raises the one that exists rather than stacking a second copy, so there is
+    nothing here to cache or to close first.
+    """
+    logger.info("show_settings_window_direct called (tab=%s)", tab)
     _reload_ui_theme()
-    
-    _cleanup_window_controllers()
-    _close_window_controllers("SettingsWindowController")
-    
-    # Create new window
-    try:
-        settings_module = _get_settings_module()
-        controller = settings_module.SettingsWindowController.alloc().init()
-        controller.createWindow()
-        _window_controllers.append(controller)
-        logger.info("Created new settings window")
-    except Exception as e:
-        logger.error(f"Error creating settings window: {e}")
-        raise
+
+    from ui.settings.window import open_settings
+
+    app = APP_INSTANCE
+    services = app._settings_services() if app is not None else None
+    return open_settings(app, tab=tab, services=services)
 
 ICON_PATH = resource_path("assets/icons/logo_menu_template.png")
 ICON_RECORDING = resource_path("assets/icons/icon_recording.png")
@@ -834,6 +826,121 @@ def pro_enabled(feature: str, config: dict | None = None) -> bool:
     if config is None:
         config = PERSISTENCE.load_config(dict(DEFAULT_CONFIG))
     return bool(config.get(PRO_OVERRIDE_KEY, False))
+
+
+# -- history origin ----------------------------------------------------------
+
+#: Where each engine does its work. Only the exceptions are listed: an engine
+#: that is not here runs on this Mac, which is what a speech engine is unless
+#: it says otherwise. Keeping the table here — rather than an ``if engine_id ==
+#: …`` at each call site — is what lets Wave 4 add a cloud engine by adding one
+#: row, and is why nothing else in this file asks which engine is loaded before
+#: writing history.
+HISTORY_ORIGIN_BY_ENGINE: dict[str, str] = {
+    "cloud": ORIGIN_CLOUD,
+    "byok": ORIGIN_BYOK,
+}
+
+
+def history_origin_for(engine_id: str | None) -> str:
+    """Which of ``local | cloud | byok`` an engine's transcriptions come from.
+
+    An unknown or missing engine id reads as local. That is the honest default:
+    every engine that ships today decodes on this Mac, and labelling a local
+    transcription "cloud" would tell the user their audio left the machine when
+    it did not.
+    """
+    if not engine_id:
+        return ORIGIN_LOCAL
+    return HISTORY_ORIGIN_BY_ENGINE.get(engine_id, ORIGIN_LOCAL)
+
+
+# -- launch at login ---------------------------------------------------------
+
+
+class LaunchAtLoginUnavailable(RuntimeError):
+    """This build cannot register a login item.
+
+    ``ServiceManagement`` is a macOS 13+ framework reached through PyObjC, and
+    ``SMAppService`` only works for a real signed bundle. A source run has
+    neither, so the setting is offered as unavailable rather than as a switch
+    that silently does nothing.
+    """
+
+
+#: ``SMAppServiceStatusEnabled``. Named here so the decision below reads as
+#: English and needs no framework import to test.
+SM_STATUS_ENABLED = 1
+
+
+def launch_at_login_enabled(service: Any) -> bool:
+    """Whether ``service`` says the login item is registered right now."""
+    if service is None:
+        return False
+    return int(service.status()) == SM_STATUS_ENABLED
+
+
+def _sm_call(service: Any, name: str) -> None:
+    """Call ``register``/``unregister`` across the shapes PyObjC exposes.
+
+    PyObjC bridges ``-registerAndReturnError:`` to ``registerAndReturnError_``,
+    returning ``(ok, error)``; some bridge versions also expose the plain
+    Swift-style name. Both are accepted, and a ``False`` return is an error to
+    raise rather than a value to ignore.
+    """
+    bridged = getattr(service, f"{name}AndReturnError_", None)
+    if bridged is not None:
+        ok, error = bridged(None)
+        if not ok:
+            # An operational refusal, not a missing framework: the user may have
+            # switched the item off in System Settings, which they are allowed
+            # to do. Told to them, not raised as "unavailable in this build".
+            raise RuntimeError(f"could not {name} the login item: {error}")
+        return
+    plain = getattr(service, name, None)
+    if plain is None:
+        raise LaunchAtLoginUnavailable(f"SMAppService cannot {name}")
+    plain()
+
+
+def apply_launch_at_login(service: Any, enabled: bool) -> bool:
+    """Register or unregister the login item; returns the state afterwards.
+
+    The whole decision, over an injected ``SMAppService`` so it is testable
+    without the framework. Asking for the state it is already in does nothing:
+    ``register()`` on an already-registered service can put the approval
+    prompt back in front of a user who never touched the switch.
+    """
+    assert isinstance(enabled, bool), f"expected a bool, got {enabled!r}"
+    if service is None:
+        raise LaunchAtLoginUnavailable("ServiceManagement is not available in this build")
+    if enabled == launch_at_login_enabled(service):
+        return enabled
+    _sm_call(service, "register" if enabled else "unregister")
+    return enabled
+
+
+def login_item_service() -> Any | None:
+    """``SMAppService.mainAppService()``, or ``None`` when there is none.
+
+    ``ServiceManagement`` is imported here and not at module scope on purpose:
+    it does not exist before macOS 13, and an import error at start would take
+    the menu bar down with it over a checkbox.
+    """
+    try:
+        from ServiceManagement import SMAppService
+    except Exception as error:  # noqa: BLE001 - any import failure means "no"
+        logger.info("Launch at login is unavailable: %s", error)
+        return None
+    main_app_service = getattr(SMAppService, "mainAppService", None)
+    if main_app_service is None:
+        logger.info("Launch at login is unavailable: SMAppService has no mainAppService")
+        return None
+    try:
+        return main_app_service()
+    except Exception as error:  # noqa: BLE001 - an unsigned source run raises here
+        logger.info("Launch at login is unavailable: %s", error)
+        return None
 
 
 def language_is_auto(language: str | None) -> bool:
@@ -1543,6 +1650,20 @@ class MurmurApp(rumps.App):
         # model can never be unloaded from under a decode in flight.
         self._engine_lock = threading.Lock()
         self.persistence = PERSISTENCE
+        #: Probed once, here, so Settings can offer the login-item switch only
+        #: where it works. When it does not, ``set_launch_at_login`` is shadowed
+        #: with ``None`` so ``ui.settings.general_tab.supports_launch_at_login``
+        #: — which asks whether the app has a callable of that name — reports
+        #: the truth and the tab shows "Not available in this build" instead of
+        #: a switch that would raise when flipped.
+        self._login_item_service = login_item_service()
+        self.launch_at_login_supported = self._login_item_service is not None
+        if not self.launch_at_login_supported:
+            self.set_launch_at_login = None
+        #: Built on demand by :meth:`_settings_services`; a keychain that is
+        #: unreachable is asked about once rather than on every window open.
+        self._keychain_store = None
+        self._keychain_probed = False
         self.history = self.load_history()
         self.audio_capture = AudioCaptureService(sample_rate=SAMPLE_RATE, logger=logger)
         # Built in load_model(), where a bad config or an unresolvable engine id
@@ -1849,7 +1970,13 @@ class MurmurApp(rumps.App):
         threading.Thread(target=self._check_updates_worker, daemon=True).start()
 
     def _check_updates_worker(self):
-        """Fetch release metadata only. No audio, no text, nothing uploaded."""
+        """Fetch release metadata only. No audio, no text, nothing uploaded.
+
+        The Account tab writes ``update_channel``; nothing reads it yet.
+        """
+        # TODO(wave4): honour config["update_channel"] — UpdateService takes no
+        # channel and UpdateFeed reads one fixed URL, so "beta" needs a second
+        # feed (or a prerelease filter) in services/update_service.py first.
         try:
             info = UpdateService(APP_VERSION).check()
         except Exception as error:
@@ -1965,14 +2092,41 @@ class MurmurApp(rumps.App):
         """Save transcription history to file"""
         self.persistence.save_history(self.history)
     
-    def add_to_history(self, text, source_type, filename=None, audio_path=None):
-        """Add a transcription to history"""
+    def current_engine_id(self):
+        """The id of the engine that produced the last transcription, or None.
+
+        ``self.engine_id`` is what config selected; the engine actually loaded
+        is the authority, because a swap writes the attribute only once the new
+        engine is running. Asked here so history records what did the work.
+        """
+        engine = self.engine
+        if engine is None:
+            return self.engine_id
+        try:
+            return engine.info().id
+        except Exception as error:  # noqa: BLE001 - history must not fail on this
+            logger.warning("Could not read the engine id for history: %s", error)
+            return self.engine_id
+
+    def add_to_history(
+        self, text, source_type, filename=None, audio_path=None, duration_s=None
+    ):
+        """Add a transcription to history.
+
+        ``origin`` and ``engine_id`` are worked out here rather than at the four
+        call sites: the callers know what was said, not where it was decoded,
+        and the answer must be the same for all of them.
+        """
         if not self.runtime_config().get("save_history", DEFAULT_CONFIG["save_history"]):
             return
+        engine_id = self.current_engine_id()
         self.history = self.persistence.add_history_entry(
             self.history,
             text=text,
             source_type=source_type,
+            origin=history_origin_for(engine_id),
+            engine_id=engine_id,
+            duration_s=duration_s,
             filename=filename,
             audio_path=audio_path,
         )
@@ -2023,14 +2177,15 @@ class MurmurApp(rumps.App):
             return
 
         def notify():
-            for controller in list(_window_controllers):
-                hook = getattr(controller, "engine_reloaded", None)
-                if hook is None:
-                    continue
-                try:
-                    hook(info)
-                except Exception as error:
-                    logger.warning("Settings could not follow the engine swap: %s", error)
+            from ui.settings.window import current_controller
+
+            controller = current_controller()
+            if controller is None:
+                return
+            try:
+                controller.engine_reloaded(info)
+            except Exception as error:
+                logger.warning("Settings could not follow the engine swap: %s", error)
 
         self.run_on_main_thread(notify)
 
@@ -2466,15 +2621,97 @@ class MurmurApp(rumps.App):
         finally:
             self._engine_reloading = False
 
-    # -- onboarding ------------------------------------------------------
+    # -- settings ---------------------------------------------------------
 
-    def open_settings_window_safely(self):
-        """Open Settings from any code path without letting AppKit errors escape."""
+    def open_settings_window_safely(self, tab=None):
+        """Open Settings from any code path without letting AppKit errors escape.
+
+        ``tab`` names one of ``ui.settings.base.TAB_ORDER``; ``None`` reopens
+        wherever the user left the window.
+        """
         try:
-            show_settings_window_direct()
+            show_settings_window_direct(tab)
         except Exception:
             logger.error("Could not open settings", exc_info=True)
             ui_alerts.show_alert(APP_NAME, "Could not open Settings.")
+
+    def _keychain(self):
+        """The secret store for the Account tab, or ``None`` when unreachable.
+
+        Resolved once. The Security binding is what can be missing — off macOS,
+        or in a stripped build — and asking again on every window open would
+        only repeat the same failure and the same log line.
+        """
+        if self._keychain_probed:
+            return self._keychain_store
+        self._keychain_probed = True
+        try:
+            store = KeychainStore()
+            store.backend  # resolve now, so an unavailable keychain is known here
+        except KeychainUnavailable as error:
+            logger.warning("The keychain is unavailable; own keys cannot be stored: %s", error)
+            self._keychain_store = None
+        else:
+            self._keychain_store = store
+        return self._keychain_store
+
+    def _settings_services(self):
+        """Everything the Settings tabs are allowed to reach the app through.
+
+        One dict, documented in :mod:`ui.settings.window`. Every key is listed
+        even when its value is ``None``: a tab asking for a provider that does
+        not exist yet is a supported state, and spelling it out here is what
+        makes "Wave 4 fills this in" a visible promise rather than a missing
+        key nobody notices.
+
+        ``scheduler`` is deliberately ``None``. The Account tab's own default
+        polls off the main thread *and* redraws on it; anything handed in here
+        would replace both halves and leave the sign-in line stale.
+        """
+        return {
+            "usage": None,      # Wave 4: the usage/quota service
+            "license": None,    # Wave 4: the licence service
+            "pro_gate": pro_enabled,
+            "keychain": self._keychain(),
+            "scheduler": None,
+            "version": APP_VERSION,
+            "build_info": read_build_info(),
+            "persistence": self.persistence,
+            "audio_dir": AUDIO_DIR,
+        }
+
+    def set_launch_at_login(self, enabled: bool) -> bool:
+        """Register or unregister Murmur as a login item. Returns the new state.
+
+        Shadowed with ``None`` in :meth:`__init__` where ``SMAppService`` is not
+        reachable, so Settings never offers the switch it could not honour; a
+        service that disappears between then and now raises
+        :class:`LaunchAtLoginUnavailable`. A refusal from the framework itself —
+        the user has the item switched off in System Settings, say — is told to
+        the user rather than raised into the click handler that got us here.
+        """
+        assert isinstance(enabled, bool), f"expected a bool, got {enabled!r}"
+        service = self._login_item_service
+        if service is None:
+            raise LaunchAtLoginUnavailable(
+                "ServiceManagement is not available in this build"
+            )
+        try:
+            state = apply_launch_at_login(service, enabled)
+        except LaunchAtLoginUnavailable:
+            raise
+        except Exception as error:  # noqa: BLE001 - the framework raises widely
+            logger.error("Could not change the login item: %s", error)
+            ui_alerts.show_alert(
+                APP_NAME,
+                "Murmur could not change whether it starts at login. "
+                "You can set it in System Settings › General › Login Items.",
+            )
+            return launch_at_login_enabled(service)
+        logger.info("Launch at login %s", "on" if state else "off")
+        return state
+
+    # -- onboarding ------------------------------------------------------
 
     def _maybe_show_onboarding(self, _sender=None):
         """Open the wizard on a first run, once the menu bar exists."""
@@ -3093,7 +3330,12 @@ class MurmurApp(rumps.App):
 
                 # Save to history with audio path when retention is enabled
                 history_audio_path = audio_path if save_audio else None
-                self.add_to_history(text, "live", audio_path=history_audio_path)
+                self.add_to_history(
+                    text,
+                    "live",
+                    audio_path=history_audio_path,
+                    duration_s=duration_seconds,
+                )
             else:
                 if is_hallucination:
                     logger.info("Filtered hallucination")
@@ -3102,7 +3344,12 @@ class MurmurApp(rumps.App):
                     logger.info("No speech detected")
                     history_text = "(No speech detected)"
                 history_audio_path = audio_path if save_audio else None
-                self.add_to_history(history_text, "live", audio_path=history_audio_path)
+                self.add_to_history(
+                    history_text,
+                    "live",
+                    audio_path=history_audio_path,
+                    duration_s=duration_seconds,
+                )
                 if pill is not None:
                     pill.error("No speech detected")
                 rumps.notification(
@@ -3246,6 +3493,7 @@ class MurmurApp(rumps.App):
                     "file",
                     os.path.basename(file_path),
                     audio_path=audio_path if save_audio else None,
+                    duration_s=transcript.duration_s,
                 )
                 
                 # Update UI on main thread
