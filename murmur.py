@@ -35,7 +35,6 @@ import sounddevice as sd
 import numpy as np
 import urllib.error
 import urllib.request
-import whisper
 import logging
 
 
@@ -100,6 +99,8 @@ import scipy.io.wavfile as wav
 import time
 import shutil
 import tempfile
+from pathlib import Path
+from engines import create_engine
 from transcription_filters import is_likely_hallucination, should_skip_audio
 from services.audio_capture_service import AudioCaptureService
 from services.hotkey_service import (
@@ -125,13 +126,6 @@ from services.persistence_service import (
     should_log_sensitive,
 )
 from services.text_insertion_service import TextInsertionService
-from services.transcription_service import (
-    extract_text,
-    load_whisper_with_fallback,
-    resolve_whisper_device,
-    transcribe_audio,
-    transcribe_audio_file,
-)
 import ui_alerts
 
 import objc
@@ -347,6 +341,15 @@ if os.path.exists(ICON_ERROR):
 _MENU_BAR_IMAGES = {}
 _INSTANCE_LOCK = None
 BUNDLE_ID = "com.canopystudio.murmur"
+
+
+def engine_is_ready(engine) -> bool:
+    """Whether the engine exists and has finished loading.
+
+    It is built inside :meth:`MurmurApp.load_model`, so it is None until that runs
+    and a construction failure is reported through the same UI as a load failure.
+    """
+    return engine is not None and engine.is_loaded
 
 
 def should_reject_toggle(*, loading: bool, is_processing: bool, model_ready: bool) -> bool:
@@ -604,9 +607,10 @@ class MurmurApp(rumps.App):
         self.persistence = PERSISTENCE
         self.history = self.load_history()
         self.audio_capture = AudioCaptureService(sample_rate=SAMPLE_RATE, logger=logger)
-        self.model = None
-        self._whisper_device = "cpu"
-        self._whisper_fp16 = False
+        # Built in load_model(), where a bad config or an unresolvable engine id
+        # becomes the same status/notification/alert as a failed load instead of
+        # killing the app before the menu bar exists.
+        self.engine = None
         self.text_inserter = TextInsertionService(logger=logger)
         
         # Menu items - SuperWhisper style
@@ -821,22 +825,14 @@ class MurmurApp(rumps.App):
         self.save_history()
     
     def load_model(self):
-        """Load Whisper model"""
+        """Load the transcription engine"""
         logger.info(f"Loading model: {MODEL_SIZE}")
         self.update_status("Loading model...")
         self._set_menu_bar_state("processing")
         try:
-            device = resolve_whisper_device()
-            logger.info("Loading Whisper on device=%s", device)
-            self.model, self._whisper_device, self._whisper_fp16 = load_whisper_with_fallback(
-                lambda d: whisper.load_model(MODEL_SIZE, device=d),
-                device,
-            )
-            logger.info(
-                "Model loaded successfully on device=%s fp16=%s",
-                self._whisper_device,
-                self._whisper_fp16,
-            )
+            self.engine = create_engine("whisper_openai", model_name=MODEL_SIZE)
+            self.engine.load()
+            logger.info("Model loaded successfully %s", self.engine.runtime_summary())
             self.loading = False
             self.update_status(f"Ready ({format_hotkey_from_config(self.runtime_config())} to record)")
             self._set_menu_bar_state("ready")
@@ -1015,12 +1011,12 @@ class MurmurApp(rumps.App):
         if should_reject_toggle(
             loading=self.loading,
             is_processing=self.is_processing,
-            model_ready=self.model is not None,
+            model_ready=engine_is_ready(self.engine),
         ):
             if self.loading:
                 logger.warning("Model still loading, cannot record")
                 rumps.notification(APP_NAME, "Please wait", "Model is still loading...")
-            elif self.model is None:
+            elif not engine_is_ready(self.engine):
                 logger.warning("Model unavailable, cannot record")
                 rumps.notification(
                     APP_NAME,
@@ -1141,13 +1137,8 @@ class MurmurApp(rumps.App):
             # Transcribe with better parameters
             logger.info("Starting transcription...")
             with self._whisper_lock:
-                result = transcribe_audio(
-                    self.model,
-                    audio_path,
-                    device=self._whisper_device,
-                    fp16=self._whisper_fp16,
-                )
-            text = extract_text(result)
+                transcript = self.engine.transcribe(Path(audio_path), language=None)
+            text = transcript.text
             if should_log_sensitive(config):
                 logger.info("Transcription completed")
             
@@ -1223,11 +1214,11 @@ class MurmurApp(rumps.App):
             loading=self.loading,
             is_recording=self.is_recording,
             is_processing=self.is_processing,
-            model_ready=self.model is not None,
+            model_ready=engine_is_ready(self.engine),
         ):
             if self.loading:
                 rumps.notification(APP_NAME, "Please wait", "Model is still loading...")
-            elif self.model is None:
+            elif not engine_is_ready(self.engine):
                 rumps.notification(
                     APP_NAME,
                     "Model unavailable",
@@ -1287,14 +1278,13 @@ class MurmurApp(rumps.App):
                 shutil.copy2(file_path, audio_path)
             
             with self._whisper_lock:
-                result = transcribe_audio_file(
-                    self.model,
-                    file_path,
-                    device=self._whisper_device,
-                    fp16=self._whisper_fp16,
+                # A whole-file import, not dictation: the decoder may condition on
+                # the text it already produced for earlier windows.
+                transcript = self.engine.transcribe(
+                    Path(file_path), language=None, long_form=True
                 )
-            text = extract_text(result)
-            
+            text = transcript.text
+
             if text:
                 # Copy to clipboard
                 pyperclip.copy(text)

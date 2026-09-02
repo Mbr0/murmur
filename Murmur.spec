@@ -88,6 +88,12 @@ hiddenimports = [
     "services.persistence_service",
     "services.text_insertion_service",
     "services.transcription_service",
+    "engines",
+    "engines.base",
+    "engines.model_store",
+    "engines.whisper_openai",
+    "engines.whispercpp",
+    "engines.voxtral_mlx",
 ]
 
 for package in ("whisper", "torch", "quickmachotkey"):

@@ -1,10 +1,12 @@
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from murmur import (
     check_for_update_message,
     clear_mic_device_selection,
+    engine_is_ready,
     fetch_latest_release_tag,
     is_newer_version,
     normalize_release_tag,
@@ -67,6 +69,19 @@ class AppStateGuardTests(unittest.TestCase):
     def test_should_not_force_ready_while_recording(self):
         self.assertFalse(should_apply_ready_on_reset(is_recording=True))
         self.assertTrue(should_apply_ready_on_reset(is_recording=False))
+
+
+class EngineReadinessTests(unittest.TestCase):
+    """The engine is built inside load_model(), so it is None until that runs."""
+
+    def test_engine_is_not_ready_before_it_is_constructed(self):
+        self.assertFalse(engine_is_ready(None))
+
+    def test_engine_is_not_ready_until_it_is_loaded(self):
+        self.assertFalse(engine_is_ready(SimpleNamespace(is_loaded=False)))
+
+    def test_engine_is_ready_once_loaded(self):
+        self.assertTrue(engine_is_ready(SimpleNamespace(is_loaded=True)))
 
 
 class MicDeviceConfigTests(unittest.TestCase):

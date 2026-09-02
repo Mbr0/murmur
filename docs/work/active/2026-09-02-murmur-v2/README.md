@@ -1,6 +1,6 @@
 # Murmur v2
 
-**Status:** Draft for approval
+**Status:** ✅ approved 2026-09-02 · Wave 0 in progress
 **Plan:** [MASTER.md](./MASTER.md) · **Skill:** `@murmur-v2`
 **Study:** [`../2026-09-02-competitive-analysis/`](../2026-09-02-competitive-analysis/) (Part II is the source of this plan)
 

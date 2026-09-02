@@ -1,0 +1,24 @@
+{
+  "clips": [
+    {
+      "path": "en/001.wav",
+      "language": "en",
+      "text": "Please send the quarterly report to the finance team by Friday afternoon."
+    },
+    {
+      "path": "fr/001.wav",
+      "language": "fr",
+      "text": "Merci d'envoyer le rapport trimestriel à l'équipe financière avant vendredi après-midi."
+    },
+    {
+      "path": "nl/001.wav",
+      "language": "nl",
+      "text": "Stuur het kwartaalrapport voor vrijdagmiddag naar het financiële team."
+    },
+    {
+      "path": "de/001.wav",
+      "language": "de",
+      "text": "Bitte senden Sie den Quartalsbericht bis Freitagnachmittag an das Finanzteam."
+    }
+  ]
+}

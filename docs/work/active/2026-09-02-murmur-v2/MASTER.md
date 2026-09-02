@@ -1,6 +1,6 @@
 # MASTER: Murmur v2
 
-**Status:** Draft for approval
+**Status:** ✅ approved 2026-09-02 · Wave 0 in progress
 **Base branch:** `main` (after PR #2)
 **Source:** study in `../2026-09-02-competitive-analysis/`, Part II "What should change"
 
@@ -63,10 +63,10 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 | E0f (serial) | `murmur.py`, `services/transcription_service.py` | Route existing transcription through `Engine`. Keep `openai-whisper` behind an `engines/whisper_openai.py` adapter for this wave only, so behaviour is unchanged until D1 is confirmed. |
 
 **Done when**
-- [ ] Bake-off table in `decisions.md` with WER and latency for whisper.cpp turbo, Voxtral Realtime 4-bit, and current openai-whisper on the same clips
-- [ ] D1 recorded with data
-- [ ] App runs unchanged for users through the adapter
-- [ ] Suite green
+- [ ] Bake-off table in `decisions.md` with WER and latency for whisper.cpp turbo, Voxtral Realtime 4-bit, and current openai-whisper on the same clips (harness landed; needs real recordings, see `tests/fixtures/audio/README.md`)
+- [ ] D1 recorded with data (blocked on the recordings above)
+- [x] App runs unchanged for users through the adapter
+- [x] Suite green (249 tests, 2026-09-02)
 
 ## Wave 1 — Foundation, needed before selling (PARALLEL except 1a and 1d)
 
