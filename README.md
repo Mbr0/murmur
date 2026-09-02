@@ -48,7 +48,7 @@ The global shortcut does **not** require Input Monitoring.
 
 ## Settings
 
-Open **Settings** from the menu bar:
+Open **Settings** from the menu bar. It has five tabs — General, Engine, Smart, Privacy and Account — and reopens on the one you used last:
 
 - Speech engine: whisper.cpp, or on Apple Silicon with 16 GB of RAM or more, Voxtral Mini 4B Realtime — models download on demand and are stored under `~/Library/Application Support/Murmur/models/`
 - Push-to-talk mode: toggle, hold, or automatic
