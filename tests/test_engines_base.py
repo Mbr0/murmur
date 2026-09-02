@@ -273,7 +273,7 @@ class RegistryTests(unittest.TestCase):
         unregister_engine("test_fake")
 
     def test_engine_ids(self):
-        self.assertEqual(ENGINE_IDS, ("whispercpp", "voxtral_mlx", "whisper_openai"))
+        self.assertEqual(ENGINE_IDS, ("whispercpp", "voxtral_mlx"))
 
     def test_unknown_engine_id_raises_value_error(self):
         with self.assertRaises(ValueError):
@@ -295,10 +295,10 @@ class RegistryTests(unittest.TestCase):
             create_engine("test_fake")
 
     def test_module_is_imported_lazily_and_engine_class_instantiated(self):
-        module = types.ModuleType("engines.whisper_openai")
+        module = types.ModuleType("engines.voxtral_mlx")
         module.ENGINE_CLASS = FakeEngine
-        with patch.dict(sys.modules, {"engines.whisper_openai": module}):
-            engine = create_engine("whisper_openai", model_id="lazy")
+        with patch.dict(sys.modules, {"engines.voxtral_mlx": module}):
+            engine = create_engine("voxtral_mlx", model_id="lazy")
         self.assertIsInstance(engine, FakeEngine)
         self.assertEqual(engine.info().model_id, "lazy")
 

@@ -25,6 +25,12 @@ if ! brew list portaudio &> /dev/null; then
     brew install portaudio
 fi
 
+# cmake builds the bundled whisper.cpp server (decision D2)
+if ! command -v cmake &> /dev/null; then
+    echo "📦 Installing cmake..."
+    brew install cmake
+fi
+
 # Create virtual environment
 echo ""
 echo "📦 Creating virtual environment..."
@@ -39,6 +45,21 @@ echo "📦 Installing dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
+# MLX (the Voxtral engine) installs on Apple Silicon only; on Intel the
+# requirements markers skip it and whisper.cpp is the only engine (decision D7).
+if [ "$(uname -m)" = "arm64" ]; then
+    echo "✅ Apple Silicon: MLX speech engine installed"
+else
+    echo "ℹ️  Intel Mac: MLX skipped, whisper.cpp is the engine (decision D7)"
+fi
+
+# The whisper.cpp server is a bundled binary, not a wheel (decision D2).
+if [ ! -f "${ROOT}/vendor/whispercpp/whisper-server" ]; then
+    echo ""
+    echo "🔨 Building the whisper.cpp server (a few minutes, once)..."
+    bash "${ROOT}/scripts/tools/fetch_whispercpp.sh"
+fi
+
 echo ""
 echo "✅ Setup complete!"
 echo ""
@@ -49,7 +70,7 @@ echo "  python murmur.py"
 echo ""
 echo "Or use: ./run.sh"
 echo ""
-echo "⚠️  First run will download the Whisper model (~140MB for 'base')"
+echo "⚠️  First run downloads the speech model on demand (Settings → Speech engine)"
 echo ""
 echo "📋 Grant these permissions in System Settings → Privacy & Security:"
 echo "   - Microphone (recording)"

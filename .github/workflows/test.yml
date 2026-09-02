@@ -7,8 +7,11 @@ on:
     branches: [main, release]
 
 jobs:
-  unit-tests:
-    runs-on: macos-latest
+  unit-tests-macos:
+    name: Unit tests (macOS, arm64)
+    # macOS 26 on Apple Silicon: the MLX wheels are tagged macosx_26_0_arm64,
+    # so nothing older can install the Voxtral engine's dependencies.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
@@ -28,3 +31,46 @@ jobs:
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  unit-tests-linux:
+    name: Unit tests (Linux, no MLX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Assert the Apple Silicon wheels stayed out
+        # Decision D7: MLX is Apple Silicon only. If a marker regresses, this
+        # job would otherwise fail later with a confusing import error.
+        run: |
+          if pip show mlx >/dev/null 2>&1 || pip show mlx-audio >/dev/null 2>&1; then
+            echo "MLX installed on Linux — check the platform_machine markers in requirements.txt"
+            exit 1
+          fi
+          echo "MLX correctly skipped on $(python -c 'import platform; print(platform.machine())')"
+
+      - name: Run the platform-independent tests
+        # Everything except the modules that import AppKit, Quartz or rumps.
+        # Wave 5 puts those behind seams and this skip list shrinks to nothing.
+        env:
+          MACOS_ONLY_TESTS: "test_app_state test_hotkey_service test_text_insertion_service"
+        run: |
+          MODULES=$(python - <<'PY'
+          import os
+          import pathlib
+
+          skip = set(os.environ["MACOS_ONLY_TESTS"].split())
+          names = sorted(p.stem for p in pathlib.Path("tests").glob("test_*.py"))
+          print(" ".join(f"tests.{name}" for name in names if name not in skip))
+          PY
+          )
+          echo "Running: ${MODULES}"
+          python -m unittest ${MODULES} -v

@@ -249,6 +249,46 @@ class PersistenceServiceTests(unittest.TestCase):
             self.assertEqual(items[0]["text"], "entry-119")
             self.assertEqual(items[-1]["text"], "entry-20")
 
+    def test_save_and_load_config_round_trips_all_keys(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Path(tmp_dir) / "config.json"
+            history = Path(tmp_dir) / "history.json"
+            service = PersistenceService(
+                PersistencePaths(str(config), str(history)),
+                logger=TestLogger(),
+            )
+
+            full_config = {
+                "save_audio": True,
+                "save_history": True,
+                "privacy_mode": False,
+                "appearance_mode": "dark",
+                "hotkey_keycode": 12,
+                "hotkey_command": True,
+                "hotkey_option": False,
+                "hotkey_control": True,
+                "hotkey_shift": True,
+                "hotkey_fn": True,
+                "hotkey_mode": "toggle",
+                "mic_device_index": 2,
+                "mic_device_name": "USB Mic",
+                "language": "fr",
+                "language_by_app": {"com.apple.Terminal": "en"},
+                "vocabulary_terms": ["Murmur", "Voxtral"],
+                "vocabulary_replacements": [
+                    {"from": "teh", "to": "the", "match_case": False}
+                ],
+                "engine_id": "voxtral_mlx",
+                "model_id": "voxtral-mini-4b-realtime-4bit",
+            }
+            # Fails loudly if DEFAULT_CONFIG gains a key this fixture forgot.
+            self.assertEqual(set(full_config.keys()), set(DEFAULT_CONFIG.keys()))
+
+            service.save_config(full_config)
+            loaded = service.load_config(DEFAULT_CONFIG)
+
+            self.assertEqual(loaded, full_config)
+
 
 if __name__ == "__main__":
     unittest.main()

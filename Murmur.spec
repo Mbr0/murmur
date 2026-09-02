@@ -1,14 +1,50 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for Murmur.app"""
+"""PyInstaller spec for Murmur.app
 
+Wave 1d changes:
+
+- ``torch`` and ``openai-whisper`` are gone. Every candidate for decision D1
+  drops them, so they are excluded outright rather than merely not collected —
+  ``mlx_audio`` carries TTS modules that import torch, and a torch left in the
+  build environment would otherwise be dragged back in through them.
+- The whisper.cpp ``whisper-server`` binary is bundled as ``bin/whisper-server``
+  (decision D2). ``engines.whispercpp.resolve_whisper_server_binary()`` looks
+  for it at ``<sys._MEIPASS>/bin/whisper-server`` when frozen.
+- MLX wheels are collected on Apple Silicon only (decision D7: Intel Macs run
+  whisper.cpp).
+- First-party packages (``services``, ``engines``, ``ui``, ``cleanup``) are
+  enumerated from disk, so a package another Wave 1 agent lands does not need a
+  spec edit, and one that does not exist yet costs nothing.
+"""
+
+import importlib.util
 import os
+import platform
 import shutil
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-import whisper
+try:
+    ROOT = os.path.abspath(SPECPATH)  # noqa: F821 - injected by PyInstaller
+except NameError:  # pragma: no cover - only when the spec is read outside PyInstaller
+    ROOT = os.path.abspath(os.getcwd())
 
-whisper_assets_path = os.path.join(os.path.dirname(whisper.__file__), "assets")
+IS_ARM64 = platform.machine() == "arm64"
+
+# --- bundled whisper.cpp server (decision D2) -------------------------------
+
+WHISPER_SERVER = os.path.join(ROOT, "vendor", "whispercpp", "whisper-server")
+if not os.path.isfile(WHISPER_SERVER):
+    raise SystemExit(
+        "Murmur.spec: vendor/whispercpp/whisper-server is missing.\n"
+        "  Build it first:  bash scripts/tools/fetch_whispercpp.sh\n"
+        "  (decision D2 — the app talks HTTP to a bundled whisper-server child\n"
+        "   process; without the binary the default engine cannot start.)"
+    )
+
+# --- ffmpeg -----------------------------------------------------------------
+# Still bundled for the legacy openai-whisper adapter, which murmur.py patches
+# onto PATH at startup. Drop both once engines/whisper_openai.py is archived.
 # PATH first; then Apple Silicon Homebrew, then Intel Homebrew.
 # If none exist, keep a conventional path — isfile checks below skip bundling.
 ffmpeg_path = next(
@@ -49,10 +85,10 @@ datas = [
     ("ui_theme.py", "."),
     ("ui_alerts.py", "."),
     ("transcription_filters.py", "."),
-    (whisper_assets_path, "whisper/assets"),
 ]
 
-binaries = []
+# Destination "bin" puts it at <sys._MEIPASS>/bin/whisper-server.
+binaries = [(WHISPER_SERVER, "bin")]
 if os.path.isfile(ffmpeg_path):
     binaries.append((ffmpeg_path, "."))
 if os.path.isfile(ffprobe_path):
@@ -60,8 +96,6 @@ if os.path.isfile(ffprobe_path):
 
 hiddenimports = [
     "rumps",
-    "whisper",
-    "torch",
     "sounddevice",
     "scipy",
     "numpy",
@@ -76,31 +110,69 @@ hiddenimports = [
     "AppKit",
     "Foundation",
     "Quartz",
+    "ApplicationServices",
     "ui_theme",
     "ui_alerts",
     "transcription_filters",
-    "services",
-    "services.audio_capture_service",
-    "services.hotkey_service",
-    "ApplicationServices",
-    "Foundation",
-    "services.model_profile_service",
-    "services.persistence_service",
-    "services.text_insertion_service",
-    "services.transcription_service",
-    "engines",
-    "engines.base",
-    "engines.model_store",
-    "engines.whisper_openai",
-    "engines.whispercpp",
-    "engines.voxtral_mlx",
 ]
 
-for package in ("whisper", "torch", "quickmachotkey"):
+
+def local_package(name):
+    """Hidden imports for a first-party package that may not exist yet.
+
+    ``engines`` and ``services`` import their members dynamically, so every
+    submodule has to be named. ``ui`` and ``cleanup`` arrive later in Wave 1
+    and Wave 2; until then this returns nothing instead of a build warning.
+    """
+    if not os.path.isfile(os.path.join(ROOT, name, "__init__.py")):
+        return []
+    return [name, *collect_submodules(name)]
+
+
+for package in ("services", "engines", "ui", "cleanup"):
+    hiddenimports += local_package(package)
+
+# --- MLX, Apple Silicon only (decisions D1 and D7) --------------------------
+
+MLX_REQUIRED = ("mlx", "mlx_audio")
+#: Runtime companions of mlx-audio. sentencepiece is listed because some
+#: tokenizers need it; it is skipped when the environment does not have it.
+MLX_OPTIONAL = ("tokenizers", "safetensors", "sentencepiece", "huggingface_hub", "miniaudio")
+
+collect_packages = ["quickmachotkey"]
+
+if IS_ARM64:
+    missing = [name for name in MLX_REQUIRED if importlib.util.find_spec(name) is None]
+    if missing:
+        raise SystemExit(
+            "Murmur.spec: missing Apple Silicon speech dependencies: "
+            + ", ".join(missing)
+            + "\n  Install them first:  pip install -r requirements.txt"
+        )
+    collect_packages += list(MLX_REQUIRED)
+    collect_packages += [name for name in MLX_OPTIONAL if importlib.util.find_spec(name) is not None]
+    # transformers is pulled in by mlx-audio; hooks-contrib ships a hook for it,
+    # so it is left to static analysis rather than collected wholesale (its
+    # module tree is thousands of model files we never load).
+    hiddenimports.append("transformers")
+
+for package in collect_packages:
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries
     hiddenimports += pkg_hidden
+
+# Torch and openai-whisper must not come back through a transitive import.
+excludes = [
+    "torch",
+    "torchaudio",
+    "torchvision",
+    "whisper",
+    "tensorflow",
+    "numba",
+    "llvmlite",
+    "tiktoken",
+]
 
 a = Analysis(
     ["murmur.py"],
@@ -111,10 +183,31 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     noarchive=False,
     optimize=0,
 )
+
+def drop_torch_metadata(toc):
+    """Remove torch ``.dist-info`` folders from the collected data files.
+
+    hooks-contrib's transformers hook copies the metadata of every dependency
+    it finds in the build environment, torch included when a developer still
+    has it installed for the Wave 0 bake-off. The package itself is excluded,
+    so the metadata is only misleading — it makes the bundle look like it
+    carries torch when it does not.
+    """
+    kept = []
+    for entry in toc:
+        top = str(entry[0]).replace("\\", "/").split("/")[0]
+        if top.endswith(".dist-info") and top.split("-")[0] in ("torch", "torchvision", "torchaudio"):
+            continue
+        kept.append(entry)
+    return kept
+
+
+a.datas = drop_torch_metadata(a.datas)
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

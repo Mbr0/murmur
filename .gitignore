@@ -32,3 +32,10 @@ RELEASE_SIGNING.md
 !.agents/
 !.agents/skills/
 !.agents/skills/**
+
+# Bake-off fixture audio (synthetic or recorded) is never committed
+tests/fixtures/audio/**/*.wav
+tests/fixtures/audio/manifest.json
+
+# Local git worktrees
+.worktrees/

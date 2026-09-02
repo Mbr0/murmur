@@ -7,9 +7,25 @@ import logging
 import sys
 import os
 import subprocess
-from services.model_profile_service import default_model_for_current_machine
+from dataclasses import replace as dataclass_replace
+from cleanup.vocabulary import (
+    Replacement,
+    Vocabulary,
+    VocabularyError,
+    export_csv,
+    import_csv,
+    vocabulary_from_config,
+    vocabulary_to_config,
+)
+from engines import LANGUAGE_AUTO
+from services.language_service import available_languages, language_display_name
 from services.hotkey_service import (
     DEFAULT_HOTKEY,
+    HOTKEY_MODE_AUTO,
+    HOTKEY_MODE_CONFIG_KEY,
+    HOTKEY_MODE_HOLD,
+    HOTKEY_MODE_TOGGLE,
+    HOTKEY_MODES,
     HotkeyBinding,
     MODIFIER_KEYCODES,
     binding_from_ns_flags,
@@ -17,6 +33,7 @@ from services.hotkey_service import (
     capture_label_for_binding,
     format_hotkey,
     hotkey_from_config,
+    hotkey_mode_from_config,
     hotkey_permissions_ok,
     hotkey_to_config,
     open_privacy_settings,
@@ -24,6 +41,14 @@ from services.hotkey_service import (
     ns_modifier_flags,
 )
 from services.persistence_service import DEFAULT_CONFIG, PersistencePaths, PersistenceService
+from engines.model_store import ModelStore
+from ui.download_sheet import (
+    PHASE_CANCELLED,
+    PHASE_DONE,
+    PHASE_FAILED,
+    DownloadController,
+    EngineSectionModel,
+)
 
 # PyObjC imports
 import objc
@@ -33,11 +58,14 @@ from Cocoa import (
     NSButton, NSRoundedBezelStyle, NSTextField, NSObject, NSApp, NSView,
     NSApplicationActivationPolicyAccessory, NSPopUpButton, NSBox, NSBoxSeparator,
     NSAlert, NSInformationalAlertStyle, NSWarningAlertStyle, NSOnState, NSOffState,
-    NSAlertFirstButtonReturn, NSAppearance, NSScrollView,
+    NSAlertFirstButtonReturn, NSAppearance, NSScrollView, NSBezelBorder,
+    NSPanel, NSProgressIndicator, NSTextView, NSTableView, NSTableColumn,
+    NSButtonCell, NSOpenPanel, NSSavePanel,
     NSEvent, NSEventMaskKeyDown, NSEventMaskFlagsChanged, NSEventTypeFlagsChanged,
     NSEventModifierFlagCommand, NSEventModifierFlagOption,
     NSEventModifierFlagControl, NSEventModifierFlagShift, NSEventModifierFlagFunction,
 )
+from Foundation import NSIndexSet
 from PyObjCTools import AppHelper
 import ui_alerts
 import ui_theme
@@ -55,23 +83,156 @@ PERSISTENCE = PersistenceService(
     logger=logger,
 )
 
-# Model info
-MODELS = {
-    "tiny": {"size": "~39 MB", "vram": "~1 GB", "speed": "~32x", "quality": "Basic", "recommended_for": "Testing only"},
-    "base": {"size": "~74 MB", "vram": "~1 GB", "speed": "~16x", "quality": "Good", "recommended_for": "Quick transcriptions"},
-    "small": {"size": "~244 MB", "vram": "~2 GB", "speed": "~6x", "quality": "Better", "recommended_for": "Good balance"},
-    "medium": {"size": "~769 MB", "vram": "~5 GB", "speed": "~2x", "quality": "Great", "recommended_for": "Most users"},
-    "large": {"size": "~1550 MB", "vram": "~10 GB", "speed": "~1x", "quality": "Best", "recommended_for": "Maximum accuracy"},
-}
-
 SETTINGS_WIDTH = 520
 SETTINGS_HEIGHT = 660
+
+DOWNLOAD_SHEET_WIDTH = 380
+DOWNLOAD_SHEET_HEIGHT = 156
 
 APPEARANCE_LABELS = {
     "system": "System",
     "dark": "Dark",
     "light": "Light",
 }
+
+#: What each shortcut behaviour means in the popup, in ``HOTKEY_MODES`` order.
+HOTKEY_MODE_LABELS = {
+    HOTKEY_MODE_TOGGLE: "Toggle",
+    HOTKEY_MODE_HOLD: "Hold to talk",
+    HOTKEY_MODE_AUTO: "Automatic",
+}
+
+#: Languages offered when no engine is loaded to ask. Same shape as
+#: ``available_languages``: auto first, ISO codes after it, sorted.
+FALLBACK_LANGUAGES = (LANGUAGE_AUTO, "de", "en", "es", "fr", "it", "nl", "pt")
+
+#: Columns of the replacements table, in display order.
+REPLACEMENT_COLUMNS = ("from", "to", "match_case")
+REPLACEMENT_COLUMN_TITLES = {
+    "from": "From",
+    "to": "To",
+    "match_case": "Match case",
+}
+
+VOCABULARY_CSV_NAME = "murmur-vocabulary.csv"
+
+
+class VocabularySectionModel:
+    """Editing state for the Settings "Vocabulary" group.
+
+    Plain Python, so the editing rules — how a box of text becomes a term
+    list, what a fresh replacement row holds, which row is selected after a
+    removal, what actually gets saved — are testable without AppKit. The
+    AppKit code in :class:`SettingsWindowController` is a rendering of this.
+    """
+
+    def __init__(self, config: dict) -> None:
+        assert config is not None, "config is required"
+        vocabulary = vocabulary_from_config(config)
+        self.terms: list[str] = list(vocabulary.terms)
+        self.replacements: list[Replacement] = list(vocabulary.replacements)
+
+    # -- terms -----------------------------------------------------------
+
+    @property
+    def terms_text(self) -> str:
+        """The terms box's contents: one term per line."""
+        return "\n".join(self.terms)
+
+    def set_terms_text(self, text: str) -> None:
+        """Read the terms box back. One per line; blanks and repeats dropped.
+
+        Deduplicating here rather than at save time means the box the user
+        sees next is the list Murmur actually holds.
+        """
+        assert text is not None, "text is required"
+        seen: set[str] = set()
+        terms: list[str] = []
+        for line in text.splitlines():
+            term = line.strip()
+            if not term or term in seen:
+                continue
+            seen.add(term)
+            terms.append(term)
+        self.terms = terms
+
+    # -- replacements ----------------------------------------------------
+
+    @property
+    def row_count(self) -> int:
+        """Rows in the replacements table, blank ones included."""
+        return len(self.replacements)
+
+    def value_for(self, row: int, column: str):
+        """The value one table cell displays."""
+        assert 0 <= row < len(self.replacements), f"row {row} is out of range"
+        assert column in REPLACEMENT_COLUMNS, f"unknown column: {column!r}"
+        replacement = self.replacements[row]
+        if column == "from":
+            return replacement.from_text
+        if column == "to":
+            return replacement.to_text
+        return replacement.match_case
+
+    def set_value(self, row: int, column: str, value) -> None:
+        """Write one edited table cell back into the row."""
+        assert 0 <= row < len(self.replacements), f"row {row} is out of range"
+        assert column in REPLACEMENT_COLUMNS, f"unknown column: {column!r}"
+        replacement = self.replacements[row]
+        if column == "match_case":
+            assert isinstance(value, bool), f"match_case must be a bool, got {value!r}"
+            self.replacements[row] = dataclass_replace(replacement, match_case=value)
+            return
+        assert isinstance(value, str), f"{column} must be a string, got {value!r}"
+        field = "from_text" if column == "from" else "to_text"
+        self.replacements[row] = dataclass_replace(replacement, **{field: value})
+
+    def add_replacement(self) -> int:
+        """Append a blank row and return its index, so the table can edit it."""
+        self.replacements.append(Replacement(from_text="", to_text="", match_case=False))
+        return len(self.replacements) - 1
+
+    def remove_replacement(self, row: int) -> int:
+        """Delete a row; return the row to select next, or -1 when none is left."""
+        assert 0 <= row < len(self.replacements), f"row {row} is out of range"
+        del self.replacements[row]
+        if not self.replacements:
+            return -1
+        return min(row, len(self.replacements) - 1)
+
+    # -- persistence -----------------------------------------------------
+
+    @property
+    def vocabulary(self) -> Vocabulary:
+        """What gets saved. A row with no ``from`` text replaces nothing, so
+        the half-typed row left behind by a stray "+" is dropped rather than
+        persisted as a rule that can never match.
+        """
+        return Vocabulary(
+            terms=tuple(self.terms),
+            replacements=tuple(
+                item for item in self.replacements if item.from_text.strip()
+            ),
+        )
+
+    def to_config(self) -> dict:
+        """The two config keys the vocabulary lives in."""
+        return vocabulary_to_config(self.vocabulary)
+
+    def export_text(self) -> str:
+        """CSV for the Export button."""
+        return export_csv(self.vocabulary)
+
+    def import_text(self, text: str) -> None:
+        """Replace both lists from CSV.
+
+        Raises :class:`~cleanup.vocabulary.VocabularyError`, whose message
+        names the offending line, and leaves the current lists untouched when
+        it does — a bad file never half-imports.
+        """
+        imported = import_csv(text)
+        self.terms = list(imported.terms)
+        self.replacements = list(imported.replacements)
 
 
 def _murmur_app_instance():
@@ -139,10 +300,7 @@ def get_system_info():
 
 def load_config():
     """Load configuration"""
-    default = {"model": default_model_for_current_machine(), **DEFAULT_CONFIG}
-    if not os.path.exists(CONFIG_FILE) and os.path.exists(LEGACY_CONFIG_FILE):
-        return PERSISTENCE.load_config(default)
-    return PERSISTENCE.load_config(default)
+    return PERSISTENCE.load_config(dict(DEFAULT_CONFIG))
 
 
 def save_config(config):
@@ -164,13 +322,55 @@ class SettingsWindowController(NSObject):
         self.hotkey_label = self.config.get("hotkey_label")
         self._hotkey_monitor = None
         self._capture_modifiers = 0
-        self.model_popup = None
         self.save_audio_switch = None
         self.save_history_switch = None
         self.appearance_popup = None
-        self.needs_restart = False
-        
+
+        self.model_store = ModelStore()
+        self.engine_section = EngineSectionModel(
+            self.config,
+            self.model_store,
+            on_engine_change=self._engine_changed,
+            save=save_config,
+        )
+        self.download_controller = DownloadController(
+            self.model_store, on_change=self._download_state_changed
+        )
+        self.engine_popup = None
+        self.engine_detail_label = None
+        self.engine_download_button = None
+        self.engine_delete_button = None
+        self.download_sheet = None
+        self.download_status_label = None
+        self.download_progress_bar = None
+
+        self.hotkey_mode = hotkey_mode_from_config(self.config)
+        self.hotkey_mode_popup = None
+        self.language_codes = self._language_codes()
+        self.language_popup = None
+        self.vocabulary_section = VocabularySectionModel(self.config)
+        self.terms_view = None
+        self.replacements_table = None
+
         return self
+
+    @objc.python_method
+    def _language_codes(self):
+        """Languages to offer: the loaded engine's own list, else the known set.
+
+        Asking the engine keeps the picker honest about what the running model
+        can actually do, and this is the one place that reads it — no engine
+        branch anywhere else in the UI.
+        """
+        app = _murmur_app_instance()
+        engine = getattr(app, "engine", None) if app is not None else None
+        if engine is None:
+            return FALLBACK_LANGUAGES
+        try:
+            return available_languages(engine.info())
+        except Exception as error:
+            logger.warning("Could not read languages from the engine: %s", error)
+            return FALLBACK_LANGUAGES
     
     def createWindow(self):
         """Create and show the settings window"""
@@ -238,8 +438,6 @@ class SettingsWindowController(NSObject):
     @objc.python_method
     def _add_settings_sections(self, content_view, width, start_y=16):
         """Lay out settings sections top-to-bottom in a flipped scroll document."""
-        current_model = self.config.get("model", "medium")
-        rec_model = self.system_info["recommended_model"]
         content_width = width - ui_theme.MARGIN * 2
         y = start_y
 
@@ -262,39 +460,93 @@ class SettingsWindowController(NSObject):
         add(self._create_label(
             f"Memory: {self.system_info['ram']} GB RAM", x=ui_theme.MARGIN, y=y, width=content_width
         ))
-        add(self._create_label(
-            f"Recommended: {rec_model.capitalize()}",
-            x=ui_theme.MARGIN,
-            y=y,
-            width=content_width,
-            color=ui_theme.brand_accent_color(),
-        ))
         rule()
 
         add(self._create_label(
-            "Whisper Model", x=ui_theme.MARGIN, y=y, width=content_width, bold=True, size=13
+            "Speech engine", x=ui_theme.MARGIN, y=y, width=content_width, bold=True, size=13
         ))
-        self.model_popup = NSPopUpButton.alloc().initWithFrame_(NSMakeRect(ui_theme.MARGIN, y, 160, 26))
-        for model_name in MODELS:
-            display = model_name.capitalize()
-            if model_name == rec_model:
-                display += " ✓"
-            self.model_popup.addItemWithTitle_(display)
-        for i, model_name in enumerate(MODELS.keys()):
-            if model_name == current_model:
-                self.model_popup.selectItemAtIndex_(i)
-                break
-        self.model_popup.setTarget_(self)
-        self.model_popup.setAction_(objc.selector(self.modelChanged_, signature=b'v@:@'))
-        ui_theme.style_popup_on_dark(self.model_popup)
-        content_view.addSubview_(self.model_popup)
+        self.engine_popup = NSPopUpButton.alloc().initWithFrame_(
+            NSMakeRect(ui_theme.MARGIN, y, content_width, 26)
+        )
+        self.engine_popup.setTarget_(self)
+        self.engine_popup.setAction_(objc.selector(self.engineChanged_, signature=b'v@:@'))
+        ui_theme.style_popup_on_dark(self.engine_popup)
+        content_view.addSubview_(self.engine_popup)
         y += 34
 
-        self.model_info_label = self._create_label(
-            "", x=ui_theme.MARGIN, y=y, width=content_width, size=11, color=ui_theme.muted_text_color()
+        self.engine_detail_label = self._create_label(
+            "", x=ui_theme.MARGIN, y=y, width=content_width, size=11,
+            color=ui_theme.muted_text_color(),
         )
-        add(self.model_info_label)
-        self._update_model_info()
+        add(self.engine_detail_label)
+
+        self.engine_download_button = NSButton.alloc().initWithFrame_(
+            NSMakeRect(ui_theme.MARGIN, y, 140, 28)
+        )
+        self.engine_download_button.setTitle_("Download")
+        ui_theme.style_dark_button(self.engine_download_button)
+        self.engine_download_button.setTarget_(self)
+        self.engine_download_button.setAction_(
+            objc.selector(self.downloadModelClicked_, signature=b'v@:@')
+        )
+        content_view.addSubview_(self.engine_download_button)
+
+        self.engine_delete_button = NSButton.alloc().initWithFrame_(
+            NSMakeRect(ui_theme.MARGIN + 152, y, 140, 28)
+        )
+        self.engine_delete_button.setTitle_("Delete Model")
+        ui_theme.style_dark_button(self.engine_delete_button)
+        self.engine_delete_button.setTarget_(self)
+        self.engine_delete_button.setAction_(
+            objc.selector(self.deleteModelClicked_, signature=b'v@:@')
+        )
+        content_view.addSubview_(self.engine_delete_button)
+        y += 38
+
+        add(self._create_label(
+            "Models are downloaded once and kept on this Mac. Switching model "
+            "reloads the engine in the background — no restart.",
+            x=ui_theme.MARGIN,
+            y=y,
+            width=content_width,
+            size=11,
+            color=ui_theme.muted_text_color(),
+            height=32,
+        ))
+        self._refresh_engine_controls()
+        rule()
+
+        add(self._create_label(
+            "Language", x=ui_theme.MARGIN, y=y, width=content_width, bold=True, size=13
+        ))
+        self.language_popup = NSPopUpButton.alloc().initWithFrame_(
+            NSMakeRect(ui_theme.MARGIN, y, 220, 26)
+        )
+        for code in self.language_codes:
+            self.language_popup.addItemWithTitle_(
+                "Automatic" if code == LANGUAGE_AUTO else language_display_name(code)
+            )
+        current_language = self.config.get("language", LANGUAGE_AUTO)
+        if current_language not in self.language_codes:
+            current_language = LANGUAGE_AUTO
+        self.language_popup.selectItemAtIndex_(self.language_codes.index(current_language))
+        ui_theme.style_popup_on_dark(self.language_popup)
+        content_view.addSubview_(self.language_popup)
+        y += 34
+
+        add(self._create_label(
+            "Automatic detects the language for each recording. Picking one is "
+            "faster and stops short phrases being mistaken for another language.",
+            x=ui_theme.MARGIN,
+            y=y,
+            width=content_width,
+            size=11,
+            color=ui_theme.muted_text_color(),
+            height=32,
+        ))
+        rule()
+
+        y = self._add_vocabulary_section(content_view, y, content_width)
         rule()
 
         add(self._create_label(
@@ -371,6 +623,31 @@ class SettingsWindowController(NSObject):
         content_view.addSubview_(reset_hotkey_btn)
         y += 34
 
+        add(self._create_label(
+            "Shortcut behaviour", x=ui_theme.MARGIN, y=y, width=content_width, size=12
+        ))
+        self.hotkey_mode_popup = NSPopUpButton.alloc().initWithFrame_(
+            NSMakeRect(ui_theme.MARGIN, y, 220, 26)
+        )
+        for mode in HOTKEY_MODES:
+            self.hotkey_mode_popup.addItemWithTitle_(HOTKEY_MODE_LABELS[mode])
+        self.hotkey_mode_popup.selectItemAtIndex_(HOTKEY_MODES.index(self.hotkey_mode))
+        ui_theme.style_popup_on_dark(self.hotkey_mode_popup)
+        content_view.addSubview_(self.hotkey_mode_popup)
+        y += 34
+
+        add(self._create_label(
+            "Toggle starts and stops on separate presses. Hold to talk records "
+            "only while the keys are down. Automatic decides from how long you "
+            "hold: a tap toggles, a hold talks.",
+            x=ui_theme.MARGIN,
+            y=y,
+            width=content_width,
+            size=11,
+            color=ui_theme.muted_text_color(),
+            height=44,
+        ))
+
         permissions_btn = NSButton.alloc().initWithFrame_(NSMakeRect(ui_theme.MARGIN, y, 190, 28))
         permissions_btn.setTitle_("Open Privacy Settings")
         ui_theme.style_dark_button(permissions_btn)
@@ -390,6 +667,200 @@ class SettingsWindowController(NSObject):
         ))
         return y + 16
     
+    # -- Vocabulary section ----------------------------------------------
+
+    @objc.python_method
+    def _add_vocabulary_section(self, content_view, y, content_width):
+        """Terms box, replacements table, and the CSV buttons. Returns the next y."""
+        label = self._create_label(
+            "Vocabulary", x=ui_theme.MARGIN, y=y, width=content_width, bold=True, size=13
+        )
+        content_view.addSubview_(label)
+        y += label.frame().size.height + 6
+
+        hint = self._create_label(
+            "Terms bias what the engine hears — names, jargon, product names. "
+            "One per line.",
+            x=ui_theme.MARGIN,
+            y=y,
+            width=content_width,
+            size=11,
+            color=ui_theme.muted_text_color(),
+            height=30,
+        )
+        content_view.addSubview_(hint)
+        y += 32
+
+        terms_scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(ui_theme.MARGIN, y, content_width, 84)
+        )
+        terms_scroll.setHasVerticalScroller_(True)
+        terms_scroll.setHasHorizontalScroller_(False)
+        terms_scroll.setBorderType_(NSBezelBorder)
+        self.terms_view = NSTextView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, content_width, 84)
+        )
+        self.terms_view.setString_(self.vocabulary_section.terms_text)
+        self.terms_view.setFont_(NSFont.systemFontOfSize_(12))
+        self.terms_view.setRichText_(False)
+        self.terms_view.setAutomaticQuoteSubstitutionEnabled_(False)
+        self.terms_view.setAppearance_(ui_theme.control_appearance())
+        self.terms_view.setAccessibilityLabel_("Vocabulary terms, one per line")
+        terms_scroll.setDocumentView_(self.terms_view)
+        content_view.addSubview_(terms_scroll)
+        y += 92
+
+        replacements_hint = self._create_label(
+            "Replacements rewrite finished text, whole words only.",
+            x=ui_theme.MARGIN,
+            y=y,
+            width=content_width,
+            size=11,
+            color=ui_theme.muted_text_color(),
+        )
+        content_view.addSubview_(replacements_hint)
+        y += 24
+
+        table_scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(ui_theme.MARGIN, y, content_width, 110)
+        )
+        table_scroll.setHasVerticalScroller_(True)
+        table_scroll.setBorderType_(NSBezelBorder)
+        self.replacements_table = NSTableView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, content_width, 110)
+        )
+        self.replacements_table.setUsesAlternatingRowBackgroundColors_(True)
+        self.replacements_table.setAllowsMultipleSelection_(False)
+        self.replacements_table.setAppearance_(ui_theme.control_appearance())
+        self.replacements_table.setAccessibilityLabel_("Text replacements")
+        for identifier, width in (("from", 170), ("to", 170), ("match_case", 90)):
+            column = NSTableColumn.alloc().initWithIdentifier_(identifier)
+            column.headerCell().setStringValue_(REPLACEMENT_COLUMN_TITLES[identifier])
+            column.setWidth_(width)
+            if identifier == "match_case":
+                cell = NSButtonCell.alloc().init()
+                cell.setButtonType_(3)  # NSSwitchButton
+                cell.setTitle_("")
+                column.setDataCell_(cell)
+            else:
+                column.dataCell().setEditable_(True)
+            self.replacements_table.addTableColumn_(column)
+        self.replacements_table.setDataSource_(self)
+        table_scroll.setDocumentView_(self.replacements_table)
+        content_view.addSubview_(table_scroll)
+        y += 118
+
+        for title, action, offset, width in (
+            ("+", self.addReplacementClicked_, 0, 40),
+            ("−", self.removeReplacementClicked_, 48, 40),
+            ("Import CSV…", self.importVocabularyClicked_, 100, 120),
+            ("Export CSV…", self.exportVocabularyClicked_, 232, 120),
+        ):
+            button = NSButton.alloc().initWithFrame_(
+                NSMakeRect(ui_theme.MARGIN + offset, y, width, 28)
+            )
+            button.setTitle_(title)
+            ui_theme.style_dark_button(button)
+            button.setTarget_(self)
+            button.setAction_(objc.selector(action, signature=b'v@:@'))
+            content_view.addSubview_(button)
+        return y + 38
+
+    def numberOfRowsInTableView_(self, table_view):
+        """Replacements table data source."""
+        return self.vocabulary_section.row_count
+
+    def tableView_objectValueForTableColumn_row_(self, table_view, column, row):
+        """One cell of the replacements table."""
+        return self.vocabulary_section.value_for(int(row), str(column.identifier()))
+
+    def tableView_setObjectValue_forTableColumn_row_(self, table_view, value, column, row):
+        """Write an edited cell back, converting AppKit's value to Python's."""
+        identifier = str(column.identifier())
+        if identifier == "match_case":
+            self.vocabulary_section.set_value(int(row), identifier, bool(int(value)))
+            return
+        self.vocabulary_section.set_value(int(row), identifier, str(value))
+
+    def addReplacementClicked_(self, sender):
+        """Append a blank replacement and put the cursor in its From cell."""
+        row = self.vocabulary_section.add_replacement()
+        self.replacements_table.reloadData()
+        self.replacements_table.selectRowIndexes_byExtendingSelection_(
+            NSIndexSet.indexSetWithIndex_(row), False
+        )
+        self.replacements_table.editColumn_row_withEvent_select_(0, row, None, True)
+
+    def removeReplacementClicked_(self, sender):
+        """Delete the selected replacement, then select its neighbour."""
+        row = self.replacements_table.selectedRow()
+        if row < 0:
+            return
+        next_row = self.vocabulary_section.remove_replacement(int(row))
+        self.replacements_table.reloadData()
+        if next_row >= 0:
+            self.replacements_table.selectRowIndexes_byExtendingSelection_(
+                NSIndexSet.indexSetWithIndex_(next_row), False
+            )
+
+    def importVocabularyClicked_(self, sender):
+        """Load terms and replacements from a CSV, replacing what is here."""
+        panel = NSOpenPanel.openPanel()
+        panel.setTitle_("Import vocabulary")
+        panel.setPrompt_("Import")
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(False)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setAllowedFileTypes_(["csv"])
+        if panel.runModal() != 1:
+            return
+        urls = panel.URLs()
+        if not urls:
+            return
+        path = str(urls[0].path())
+        try:
+            with open(path, encoding="utf-8") as handle:
+                self.vocabulary_section.import_text(handle.read())
+        except VocabularyError as error:
+            ui_alerts.show_alert(
+                APP_NAME,
+                f"That file could not be imported.\n\n{error}",
+                style=NSWarningAlertStyle,
+            )
+            return
+        except OSError as error:
+            ui_alerts.show_alert(
+                APP_NAME,
+                f"That file could not be read.\n\n{error}",
+                style=NSWarningAlertStyle,
+            )
+            return
+        self.terms_view.setString_(self.vocabulary_section.terms_text)
+        self.replacements_table.reloadData()
+
+    def exportVocabularyClicked_(self, sender):
+        """Write the current terms and replacements out as CSV."""
+        self.vocabulary_section.set_terms_text(str(self.terms_view.string()))
+        panel = NSSavePanel.savePanel()
+        panel.setTitle_("Export vocabulary")
+        panel.setPrompt_("Export")
+        panel.setNameFieldStringValue_(VOCABULARY_CSV_NAME)
+        panel.setAllowedFileTypes_(["csv"])
+        if panel.runModal() != 1:
+            return
+        url = panel.URL()
+        if url is None:
+            return
+        try:
+            with open(str(url.path()), "w", encoding="utf-8") as handle:
+                handle.write(self.vocabulary_section.export_text())
+        except OSError as error:
+            ui_alerts.show_alert(
+                APP_NAME,
+                f"That file could not be written.\n\n{error}",
+                style=NSWarningAlertStyle,
+            )
+
     def _create_label(self, text, x, y, width, bold=False, size=12, color=None, height=20):
         """Create a text label"""
         label = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y, width, height))
@@ -415,20 +886,157 @@ class SettingsWindowController(NSObject):
         switch.setAppearance_(ui_theme.control_appearance())
         return switch
     
+    # -- Speech engine section -------------------------------------------
+
     @objc.python_method
-    def _update_model_info(self):
-        """Update model info display"""
-        idx = self.model_popup.indexOfSelectedItem()
-        model_name = list(MODELS.keys())[idx]
-        info = MODELS[model_name]
-        
-        text = f"Size: {info['size']} | VRAM: {info['vram']} | {info['recommended_for']}"
-        self.model_info_label.setStringValue_(text)
-    
-    def modelChanged_(self, sender):
-        """Handle model selection change"""
-        self._update_model_info()
-        self.needs_restart = True
+    def _refresh_engine_controls(self):
+        """Redraw the popup, the detail line and the two buttons from the model."""
+        section = self.engine_section
+        section.refresh()
+        if self.engine_popup is not None:
+            self.engine_popup.removeAllItems()
+            for choice in section.choices:
+                self.engine_popup.addItemWithTitle_(choice.title)
+            self.engine_popup.selectItemAtIndex_(section.selected_index)
+        if self.engine_detail_label is not None:
+            self.engine_detail_label.setStringValue_(section.detail_line)
+        if self.engine_download_button is not None:
+            self.engine_download_button.setEnabled_(
+                section.can_download and not self.download_controller.is_running
+            )
+        if self.engine_delete_button is not None:
+            self.engine_delete_button.setEnabled_(
+                section.can_delete and not self.download_controller.is_running
+            )
+
+    @objc.python_method
+    def _engine_changed(self, engine_id, model_id):
+        """Ask the running app to swap engines in the background. No restart."""
+        app = _murmur_app_instance()
+        reload_engine = getattr(app, "reload_engine", None) if app is not None else None
+        if reload_engine is None:
+            logger.info(
+                "Speech engine set to %s/%s; no running app to reload",
+                engine_id,
+                model_id,
+            )
+            return
+        reload_engine(engine_id, model_id)
+
+    def engineChanged_(self, sender):
+        """Popup selection changed: activate the model when it is installed."""
+        self.engine_section.select_index(self.engine_popup.indexOfSelectedItem())
+        self._refresh_engine_controls()
+
+    def downloadModelClicked_(self, sender):
+        """Fetch the highlighted model, showing a progress sheet."""
+        if self.download_controller.is_running:
+            return
+        choice = self.engine_section.selected_choice
+        self._begin_download_sheet(choice)
+        self.download_controller.start(choice.model_id, total_bytes=choice.size_bytes)
+        self._refresh_engine_controls()
+
+    def cancelDownloadClicked_(self, sender):
+        """Stop the running download; the partial file is kept for a resume."""
+        self.download_controller.cancel()
+
+    def deleteModelClicked_(self, sender):
+        """Remove the highlighted model's files, unless it is the one in use."""
+        refusal = self.engine_section.delete()
+        if refusal is not None:
+            ui_alerts.show_alert(APP_NAME, refusal)
+            return
+        self._refresh_engine_controls()
+
+    @objc.python_method
+    def _begin_download_sheet(self, choice):
+        """Show a sheet with a determinate progress bar and a Cancel button."""
+        width = DOWNLOAD_SHEET_WIDTH
+        height = DOWNLOAD_SHEET_HEIGHT
+        sheet = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, width, height),
+            NSWindowStyleMaskTitled,
+            NSBackingStoreBuffered,
+            False,
+        )
+        sheet.setTitle_("Downloading")
+        ui_theme.apply_window_theme(sheet)
+        view = sheet.contentView()
+
+        view.addSubview_(self._create_label(
+            choice.display_name,
+            x=ui_theme.MARGIN,
+            y=height - 46,
+            width=width - ui_theme.MARGIN * 2,
+            bold=True,
+            size=13,
+        ))
+
+        self.download_status_label = self._create_label(
+            "Ready to download",
+            x=ui_theme.MARGIN,
+            y=height - 70,
+            width=width - ui_theme.MARGIN * 2,
+            size=11,
+            color=ui_theme.muted_text_color(),
+        )
+        view.addSubview_(self.download_status_label)
+
+        bar = NSProgressIndicator.alloc().initWithFrame_(
+            NSMakeRect(ui_theme.MARGIN, height - 96, width - ui_theme.MARGIN * 2, 16)
+        )
+        bar.setStyle_(0)  # NSProgressIndicatorBarStyle
+        bar.setIndeterminate_(False)
+        bar.setMinValue_(0.0)
+        bar.setMaxValue_(100.0)
+        bar.setDoubleValue_(0.0)
+        bar.setAppearance_(ui_theme.control_appearance())
+        view.addSubview_(bar)
+        self.download_progress_bar = bar
+
+        cancel = NSButton.alloc().initWithFrame_(
+            NSMakeRect(width - ui_theme.MARGIN - 96, 18, 96, 28)
+        )
+        cancel.setTitle_("Cancel")
+        ui_theme.style_dark_button(cancel)
+        cancel.setTarget_(self)
+        cancel.setAction_(objc.selector(self.cancelDownloadClicked_, signature=b'v@:@'))
+        view.addSubview_(cancel)
+
+        self.download_sheet = sheet
+        self.window.beginSheet_completionHandler_(sheet, None)
+
+    @objc.python_method
+    def _end_download_sheet(self):
+        """Take the sheet down and forget its controls."""
+        if self.download_sheet is not None:
+            self.window.endSheet_(self.download_sheet)
+            self.download_sheet.orderOut_(None)
+        self.download_sheet = None
+        self.download_status_label = None
+        self.download_progress_bar = None
+
+    @objc.python_method
+    def _download_state_changed(self, state):
+        """Render one download state change. Runs on the main thread."""
+        if self.download_status_label is not None:
+            self.download_status_label.setStringValue_(state.status_line())
+        if self.download_progress_bar is not None:
+            self.download_progress_bar.setDoubleValue_(state.percent)
+        if state.phase not in (PHASE_DONE, PHASE_FAILED, PHASE_CANCELLED):
+            return
+
+        self._end_download_sheet()
+        if state.phase == PHASE_DONE:
+            self.engine_section.on_download_finished(state.model_id)
+        elif state.phase == PHASE_FAILED:
+            ui_alerts.show_alert(
+                APP_NAME,
+                f"{state.model_id} could not be downloaded.\n\n{state.error}",
+                style=NSWarningAlertStyle,
+            )
+        self._refresh_engine_controls()
 
     @objc.python_method
     def _stop_hotkey_capture(self):
@@ -501,11 +1109,12 @@ class SettingsWindowController(NSObject):
         return None
     
     def saveClicked_(self, sender):
-        """Save settings"""
-        idx = self.model_popup.indexOfSelectedItem()
-        model_name = list(MODELS.keys())[idx]
-        
-        self.config["model"] = model_name
+        """Save settings.
+
+        The speech engine is not saved here: choosing a model applies at once
+        and reloads the engine in the background, so there is nothing to defer
+        and no restart to ask for.
+        """
         save_audio = self.save_audio_switch.state() == NSOnState
         save_history = self.save_history_switch.state() == NSOnState
         self.config["save_audio"] = save_audio
@@ -514,23 +1123,21 @@ class SettingsWindowController(NSObject):
         appearance_idx = self.appearance_popup.indexOfSelectedItem()
         self.config["appearance_mode"] = ui_theme.APPEARANCE_MODES[appearance_idx]
         self.config.update(hotkey_to_config(self.hotkey_binding, label=self.hotkey_label))
+        self.config[HOTKEY_MODE_CONFIG_KEY] = HOTKEY_MODES[
+            self.hotkey_mode_popup.indexOfSelectedItem()
+        ]
+        self.config["language"] = self.language_codes[
+            self.language_popup.indexOfSelectedItem()
+        ]
+        self.vocabulary_section.set_terms_text(str(self.terms_view.string()))
+        self.config.update(self.vocabulary_section.to_config())
         save_config(self.config)
         ui_theme.set_appearance_mode(self.config["appearance_mode"])
 
         app = _murmur_app_instance()
         if app is not None:
             app.reload_hotkey(prompt=False)
-        
-        if self.needs_restart:
-            alert = NSAlert.alloc().init()
-            alert.setMessageText_("Settings Saved")
-            alert.setInformativeText_(
-                f"Model changed to '{model_name.capitalize()}'. Please restart Murmur for the changes to take effect."
-            )
-            alert.setAlertStyle_(NSInformationalAlertStyle)
-            ui_alerts.configure_alert(alert)
-            alert.runModal()
-        
+
         self.window.close()
         if __name__ == "__main__":
             NSApp.terminate_(None)

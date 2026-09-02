@@ -63,8 +63,8 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 | E0f (serial) | `murmur.py`, `services/transcription_service.py` | Route existing transcription through `Engine`. Keep `openai-whisper` behind an `engines/whisper_openai.py` adapter for this wave only, so behaviour is unchanged until D1 is confirmed. |
 
 **Done when**
-- [ ] Bake-off table in `decisions.md` with WER and latency for whisper.cpp turbo, Voxtral Realtime 4-bit, and current openai-whisper on the same clips (harness landed; needs real recordings, see `tests/fixtures/audio/README.md`)
-- [ ] D1 recorded with data (blocked on the recordings above)
+- [x] Bake-off table in `decisions.md` with WER and latency for whisper.cpp turbo, Voxtral Realtime 4-bit, and current openai-whisper on the same clips (synthetic clips 2026-09-02; re-run on real recordings, see `tests/fixtures/audio/README.md`)
+- [x] D1 recorded with data (provisional, synthetic clips)
 - [x] App runs unchanged for users through the adapter
 - [x] Suite green (249 tests, 2026-09-02)
 

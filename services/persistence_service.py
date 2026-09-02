@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""Persistence service for local config/history data."""
+"""Persistence service for local config/history data.
+
+Config keys (defaults live in ``DEFAULT_CONFIG`` below):
+
+- ``save_audio``, ``save_history``, ``privacy_mode``: user data retention toggles.
+- ``appearance_mode``: ``"system" | "light" | "dark"``.
+- ``hotkey_keycode``, ``hotkey_command``, ``hotkey_option``, ``hotkey_control``,
+  ``hotkey_shift``, ``hotkey_fn``: the push-to-talk key combo.
+- ``hotkey_mode``: ``"auto" | "toggle" | "hold"`` — how a hotkey press behaves
+  (``services/hotkey_service.py``, Wave 1a).
+- ``mic_device_index``, ``mic_device_name``: the selected input device.
+- ``language``: ``"auto"`` or an ISO code, the default transcription language
+  (``services/language_service.py``).
+- ``language_by_app``: ``{bundle_id: language_code}``, overriding ``language``
+  per front app (``services/language_service.py``).
+- ``vocabulary_terms``: list of terms biasing transcription
+  (``cleanup/vocabulary.py``).
+- ``vocabulary_replacements``: list of ``{"from", "to", "match_case"}`` text
+  replacements applied to transcripts (``cleanup/vocabulary.py``).
+- ``engine_id``, ``model_id``: the chosen speech engine and model id; ``None``
+  until chosen at first run (Wave 1c).
+"""
 
 from __future__ import annotations
 
@@ -22,8 +43,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hotkey_control": False,
     "hotkey_shift": False,
     "hotkey_fn": False,
+    "hotkey_mode": "auto",
     "mic_device_index": None,
     "mic_device_name": None,
+    "language": "auto",
+    "language_by_app": {},
+    "vocabulary_terms": [],
+    "vocabulary_replacements": [],
+    "engine_id": None,
+    "model_id": None,
 }
 
 DEBUG_LOG_PATHS: tuple[str, ...] = (

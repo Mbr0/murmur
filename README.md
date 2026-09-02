@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <strong>100% on-device</strong> · Whisper · No cloud · Menu bar app
+  <strong>100% on-device</strong> · Local speech engine · No cloud · Menu bar app
 </p>
 
 <br>
@@ -22,6 +22,8 @@ Get the latest **`.dmg`** from [GitHub Releases](https://github.com/Mbr0/murmur/
 2. Launch Murmur from Applications
 3. Grant **Microphone** when prompted
 4. For paste-at-cursor: menu bar → **Enable Shortcut Permission…** → allow **Accessibility**
+
+A first-run wizard walks through the microphone and Accessibility checks, downloads a speech engine model, and lets you try a test sentence — skippable, and reopenable anytime from the menu bar. Signed builds check GitHub Releases for updates and verify the Developer ID signature before installing.
 
 ## How it works
 
@@ -48,8 +50,11 @@ The global shortcut does **not** require Input Monitoring.
 
 Open **Settings** from the menu bar:
 
-- Whisper model (`tiny` → `large`)
+- Speech engine: whisper.cpp, or on Apple Silicon with 16 GB of RAM or more, Voxtral Mini 4B Realtime — models download on demand and are stored under `~/Library/Application Support/Murmur/models/`
+- Push-to-talk mode: toggle, hold, or automatic
 - Custom keyboard shortcut
+- Language: auto-detect or a fixed language, remembered per app
+- Vocabulary: bias terms and text replacements, import/export as CSV
 - Dark / light / system appearance
 - Optional local history and audio retention
 - Delete all local data
@@ -64,7 +69,7 @@ Open **Settings** from the menu bar:
 
 ## Privacy
 
-All transcription runs **locally** on your Mac using [OpenAI Whisper](https://github.com/openai/whisper). No audio or text is sent to the cloud. Optional history and audio files are stored only on your machine under `~/.murmur_*`.
+All transcription runs **locally** on your Mac. The local speech engine is [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (bundled `whisper-server`, `large-v3-turbo`) or, on Apple Silicon with 16 GB of RAM or more, Voxtral Mini 4B Realtime through [mlx-audio](https://github.com/Blaizzy/mlx-audio). No audio or text is sent to the cloud. Speech engine models download on demand from **Settings → Speech engine** and live under `~/Library/Application Support/Murmur/models/`; history and audio files, when enabled, are stored under `~/.murmur_*`.
 
 ## Troubleshooting
 
@@ -83,18 +88,18 @@ Enable **Accessibility** for Murmur: menu bar → **Enable Shortcut Permission�
 <details>
 <summary><strong>No audio / model loading forever</strong></summary>
 
-Allow **Microphone** access in System Settings. On first launch, Whisper downloads a model — this can take a minute depending on your connection and model size.
+Allow **Microphone** access in System Settings. On first launch, the wizard downloads the speech engine model — this can take a few minutes depending on your connection and model size.
 </details>
 
 <details>
 <summary><strong>Transcription is slow</strong></summary>
 
-Use a smaller model in **Settings** (`tiny` or `base` for speed, `medium` or `large` for accuracy).
+Use the quantised whisper.cpp model in **Settings → Speech engine** for speed, or the full-precision model for accuracy.
 </details>
 
 ## Development
 
-Requires macOS and Python 3.12+.
+Requires macOS and Python 3.12+. Intel Macs run the whisper.cpp engine only; Voxtral Mini 4B Realtime needs Apple Silicon with 16 GB of RAM or more.
 
 ```bash
 git clone https://github.com/Mbr0/murmur.git
@@ -110,6 +115,10 @@ Run tests:
 source venv/bin/activate
 python -m unittest discover -s tests -p "test_*.py"
 ```
+
+## Acknowledgements
+
+Local transcription runs on [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT) and, on Apple Silicon, Voxtral Mini 4B Realtime (Apache 2.0) through [mlx-audio](https://github.com/Blaizzy/mlx-audio) (MIT). Both build on research from [OpenAI Whisper](https://github.com/openai/whisper).
 
 ## License
 

@@ -2,7 +2,7 @@
 
 *App visual overlay. Studio charter: [STUDIO_DESIGN_MANIFEST.md](../../../docs/STUDIO_DESIGN_MANIFEST.md)*
 
-> **Grove register** — macOS menu-bar utility. Local Whisper, forest green chrome.
+> **Grove register** — macOS menu-bar utility. Local speech engine, forest green chrome.
 
 ---
 
