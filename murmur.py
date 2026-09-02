@@ -74,7 +74,6 @@ logger = _configure_logging()
 if hasattr(sys, '_MEIPASS'):
     logger.info(f"Added bundled resources to PATH: {sys._MEIPASS}")
 
-import functools
 import itertools
 import pyperclip
 import threading
@@ -83,9 +82,12 @@ import scipy.io.wavfile as wav
 import time
 import shutil
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from cleanup.cloud_cleanup import CloudCleanupClient, should_use_cloud_cleanup, words_in
 from cleanup.coding_mode import transform_spoken_code
 from cleanup.context import AppContext, capture_context, resolve_mode
 from cleanup.llama_server import (
@@ -97,19 +99,39 @@ from cleanup.llama_server import (
     LlamaServerError,
 )
 from cleanup.modes import (
+    DEFAULT_MODE_ID,
     MODE_IDS,
     MODES,
     TONE_IDS,
     TONES,
+    mode_from_config,
     render_system_prompt,
     tone_from_config,
 )
+from cleanup.snippets import expand_snippets, snippets_from_config
 from cleanup.vocabulary import (
+    Vocabulary,
     apply_replacements,
     hints_from_vocabulary,
     vocabulary_from_config,
 )
 from engines import create_engine
+from engines._http import open_no_cross_host_redirect
+from engines.base import EngineError
+from engines.cloud import (
+    ALLOWANCE_MESSAGE,
+    CloudAllowanceExhausted,
+    CloudAuthError,
+    fetch_usage,
+    wav_duration_seconds,
+)
+from engines.factory import (
+    CONFIG_BYOK_MODEL,
+    CONFIG_BYOK_PROVIDER,
+    build_engine,
+    byok_item_name,
+    cloud_base_url,
+)
 from engines.model_store import CATALOG, ModelIntegrityError, ModelStore, models_for_engine
 from transcription_filters import is_likely_hallucination, should_skip_audio
 from ui.download_sheet import (
@@ -121,8 +143,24 @@ from ui.download_sheet import (
 from ui.pill_window import PillPresenter
 from ui.onboarding_window import OnboardingCallbacks, should_show, show_onboarding
 from services.audio_capture_service import AudioCaptureService
+from services.engine_router import (
+    CLOUD_MODE_MURMUR,
+    ENGINE_BYOK,
+    ENGINE_CLOUD,
+    after_cloud_failure,
+    effective_vocabulary_terms,
+    route_engine,
+)
 from services.keychain import KeychainStore, KeychainUnavailable
 from services.language_service import resolve_language
+from services.license_service import (
+    Entitlements,
+    InMemorySecretStore,
+    LicenseService,
+    get_current_entitlements,
+    is_pro_feature_enabled,
+    set_current_entitlements,
+)
 from services.hotkey_service import (
     ACTION_START,
     ACTION_STOP,
@@ -159,6 +197,8 @@ from services.persistence_service import (
 )
 from services.text_insertion_service import TextInsertionService
 from services.update_service import UpdateService, cleanup_previous_bundles, read_build_info
+from services.usage_service import UsageService, USAGE_DEFAULTS
+from ui.settings.base import TAB_ACCOUNT
 import ui_alerts
 
 import objc
@@ -744,17 +784,15 @@ def stream_text_for_token(result, token) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Cleanup pipeline (Wave 2)
+# Cleanup pipeline (Wave 2), gated by the licence (Wave 4)
 # ---------------------------------------------------------------------------
-
-#: TEMPORARY, until Wave 4 lands ``services/license_service.py``. That wave
-#: replaces every call below with the one real gate,
-#: ``is_pro_feature_enabled(feature)``; this stand-in exists so the Wave 2
-#: wiring can be written and tested against the shape of that gate rather than
-#: against nothing. The hidden ``pro_override_for_dev`` key is a developer
-#: switch, deliberately absent from ``DEFAULT_CONFIG`` so it never appears in a
-#: user's file, and it goes away with this function.
-PRO_OVERRIDE_KEY = "pro_override_for_dev"
+#
+# The Wave 2 placeholder ``pro_enabled(feature, config)`` is gone. Every gate in
+# this file is now :func:`services.license_service.is_pro_feature_enabled`,
+# called with a feature name and nothing else: the answer comes from the lease
+# the licence service published, never from the config file. There is no
+# developer override key — a hidden config flag that unlocked Pro was fine while
+# the gate was a stand-in and would be a licence bypass now.
 
 #: Menu status while the cleanup server is coming up for the first time.
 CLEANUP_PREPARING_STATUS = "Preparing cleanup…"
@@ -816,17 +854,90 @@ MODE_MENU_AUTOMATIC = "Automatic (by app)"
 CODE_TRANSFORM_LANGUAGES = ("en", "fr")
 
 
-def pro_enabled(feature: str, config: dict | None = None) -> bool:
-    """Whether a Pro feature is unlocked. Placeholder — see :data:`PRO_OVERRIDE_KEY`.
+#: Free-tier mode. Everything else the Smart tab offers is a Pro mode.
+FREE_MODE_ID = DEFAULT_MODE_ID
 
-    Wave 4 replaces the body with the licensed gate. Everything that gates on
-    Pro calls this one function today so that replacement is a single edit, and
-    so no feature check ever grows its own opinion of what "Pro" means.
+
+def configured_mode_id(config: dict) -> str:
+    """The mode the user pinned in Settings, ignoring the front app entirely.
+
+    What a free install gets: :func:`~cleanup.context.resolve_mode` also reads
+    the bundle-id table and the per-app overrides, and both of those are the
+    ``context`` entitlement. A config naming a mode this build does not have
+    falls back to dictation rather than taking the utterance down with it.
     """
-    assert feature, "feature is required"
-    if config is None:
-        config = PERSISTENCE.load_config(dict(DEFAULT_CONFIG))
-    return bool(config.get(PRO_OVERRIDE_KEY, False))
+    assert config is not None, "config is required"
+    try:
+        return mode_from_config(config).id
+    except Exception as error:  # noqa: BLE001 - an unknown id is user data
+        logger.warning("Ignoring an unreadable cleanup_mode: %s", error)
+        return FREE_MODE_ID
+
+
+def resolve_plan_mode(config: dict, context, *, pro=is_pro_feature_enabled) -> str:
+    """The cleanup mode for this utterance, under the Pro gate.
+
+    Two entitlements meet here, and they are separate on purpose:
+
+    * ``context`` buys the *resolution* — the bundle-id table and the per-app
+      overrides that pick a mode from what the user is typing into. Without it
+      the configured default applies everywhere, which is what a single-mode
+      install looks like.
+    * ``modes`` buys the *modes themselves*. Free is verbatim dictation, so a
+      config still naming Mail (a lapsed plan, or a hand-edited file) lands on
+      dictation rather than quietly getting a paid rewrite.
+    """
+    assert config is not None, "config is required"
+    assert callable(pro), "pro must be callable"
+    mode_id = resolve_mode(context, config) if pro("context") else configured_mode_id(config)
+    if mode_id != FREE_MODE_ID and not pro("modes"):
+        return FREE_MODE_ID
+    return mode_id
+
+
+def gated_vocabulary(vocabulary, *, pro=is_pro_feature_enabled):
+    """The vocabulary this install may actually use for one utterance.
+
+    Terms past :data:`~cleanup.vocabulary.FREE_TERM_LIMIT` are dropped for this
+    pass only — nothing is deleted from the user's list, so a subscription
+    brings every term straight back. Replacements are untouched: the gate is
+    named for terms, and silently dropping a user's spelling corrections would
+    change what their transcript *says*, not how much of it is biased.
+    """
+    assert vocabulary is not None, "vocabulary is required"
+    terms = effective_vocabulary_terms(vocabulary.terms, pro)
+    if terms == tuple(vocabulary.terms):
+        return vocabulary
+    return Vocabulary(terms=terms, replacements=vocabulary.replacements)
+
+
+def expand_gated_snippets(
+    text: str,
+    config: dict,
+    *,
+    pro=is_pro_feature_enabled,
+    load=snippets_from_config,
+    expand=expand_snippets,
+) -> str:
+    """Expand the user's spoken snippets, when the plan includes them.
+
+    Runs on the transcript before cleanup, so the model sees the expanded text
+    and can punctuate around it. Unreadable snippet data costs the expansion,
+    never the transcript.
+    """
+    assert text is not None, "text is required"
+    assert config is not None, "config is required"
+    assert callable(pro), "pro must be callable"
+    if not pro("snippets"):
+        return text
+    try:
+        snippets = load(config)
+    except Exception as error:  # noqa: BLE001 - snippets are user data
+        logger.warning("Ignoring unreadable snippets in the config: %s", error)
+        return text
+    if not snippets:
+        return text
+    return expand(text, snippets)
 
 
 # -- history origin ----------------------------------------------------------
@@ -838,8 +949,8 @@ def pro_enabled(feature: str, config: dict | None = None) -> bool:
 #: row, and is why nothing else in this file asks which engine is loaded before
 #: writing history.
 HISTORY_ORIGIN_BY_ENGINE: dict[str, str] = {
-    "cloud": ORIGIN_CLOUD,
-    "byok": ORIGIN_BYOK,
+    ENGINE_CLOUD: ORIGIN_CLOUD,
+    ENGINE_BYOK: ORIGIN_BYOK,
 }
 
 
@@ -854,6 +965,262 @@ def history_origin_for(engine_id: str | None) -> str:
     if not engine_id:
         return ORIGIN_LOCAL
     return HISTORY_ORIGIN_BY_ENGINE.get(engine_id, ORIGIN_LOCAL)
+
+
+# ---------------------------------------------------------------------------
+# Engine routing and the licence (Wave 4)
+# ---------------------------------------------------------------------------
+#
+# Three pure functions and one dataclass, so the whole routing table can be
+# asserted as a table. The app method that calls them does nothing but gather
+# ``self`` into arguments; every decision lives here.
+
+#: Timeout for one Boske licence call. Every one of them is a small JSON
+#: round trip, and none of them may hold a background thread open for minutes.
+LICENSE_HTTP_TIMEOUT_S = 20.0
+
+#: How often the background thread renews a lease and republishes entitlements.
+ENTITLEMENT_REFRESH_INTERVAL_S = 6 * 3600
+
+#: How long that thread sleeps between checks. Short enough that a sign-in in
+#: Settings is reflected in the menu without waiting six hours for it.
+ENTITLEMENT_POLL_INTERVAL_S = 60.0
+
+#: Menu line naming the plan. One of three, and never a number.
+ACCOUNT_STATUS_FREE = "Account: Free"
+ACCOUNT_STATUS_PRO = "Account: Pro"
+ACCOUNT_STATUS_PRO_GRACE = "Account: Pro (grace)"
+
+#: Menu item that opens Settings on the Account tab.
+SIGN_IN_MENU_TITLE = "Sign in with Boske ID…"
+
+
+@dataclass(frozen=True)
+class RemoteEngineKey:
+    """Everything about the config a hosted engine was built from.
+
+    The cloud and own-key engines are built once and kept, because building one
+    is cheap but rebuilding it per utterance would re-read config on the
+    dictation path. They must still follow a settings change, so the cached
+    engine carries the config it was built from and is discarded the moment any
+    of it differs. The lease is deliberately absent: it is read through a
+    callable at request time, so a sign-out needs no rebuild.
+    """
+
+    engine_id: str
+    base_url: str
+    provider: str | None
+    model: str | None
+
+
+def remote_engine_key(engine_id: str, config: dict) -> RemoteEngineKey:
+    """The cache key for the hosted engine ``engine_id`` under ``config``."""
+    assert engine_id, "engine_id is required"
+    assert config is not None, "config is required"
+    provider = config.get(CONFIG_BYOK_PROVIDER)
+    model = config.get(CONFIG_BYOK_MODEL)
+    return RemoteEngineKey(
+        engine_id=engine_id,
+        base_url=cloud_base_url(config),
+        provider=provider if isinstance(provider, str) and provider.strip() else None,
+        model=model if isinstance(model, str) and model.strip() else None,
+    )
+
+
+def own_key_present(keychain, config: dict) -> bool:
+    """Whether the own-key provider named in ``config`` has a key stored.
+
+    Every failure reads as "no key": an unreachable Keychain must send the
+    dictation to the local engine with the "add your key" notice, not raise on
+    the recording path.
+    """
+    assert config is not None, "config is required"
+    if keychain is None:
+        return False
+    provider = config.get(CONFIG_BYOK_PROVIDER) or DEFAULT_CONFIG[CONFIG_BYOK_PROVIDER]
+    if not isinstance(provider, str) or not provider.strip():
+        return False
+    try:
+        return bool(keychain.has(byok_item_name(provider)))
+    except Exception as error:  # noqa: BLE001 - the Keychain backend raises widely
+        logger.warning("Could not ask the Keychain for the own key: %s", type(error).__name__)
+        return False
+
+
+def lease_is_present(license_service) -> bool:
+    """Whether a usable lease is stored right now.
+
+    ``current_lease_token`` is already strict — expired, tampered with or issued
+    to another Mac all read as None — so this only has to survive the service
+    being absent or the Keychain being locked.
+    """
+    if license_service is None:
+        return False
+    try:
+        return license_service.current_lease_token() is not None
+    except Exception as error:  # noqa: BLE001 - the secret store raises widely
+        logger.warning("Could not read the stored lease: %s", type(error).__name__)
+        return False
+
+
+def notice_to_show(notice: str | None, *, fallback_pending: bool) -> str | None:
+    """The routing notice to actually put on screen, or None.
+
+    The allowance notice is the one the folder rules cap: cloud → local is the
+    only fallback Murmur takes on its own, and it says so **once** per billing
+    period. Every other notice answers a choice the user just made (own key with
+    no key, not signed in) and is shown whenever it applies.
+    """
+    if not notice:
+        return None
+    if notice == ALLOWANCE_MESSAGE and not fallback_pending:
+        return None
+    return notice
+
+
+def should_consume_trial(entitlements) -> bool:
+    """Whether a finished cloud clip spends the free trial rather than the plan.
+
+    An account with ``cloud_voice`` is paying for its minutes and must not have
+    its one-time trial drained by them; an account without it reached the proxy
+    *because* of the trial, so the trial is what it spends.
+    """
+    return not bool(getattr(entitlements, "cloud_voice", False))
+
+
+def should_refresh_allowance(usage, *, cloud_mode: str) -> bool:
+    """Whether to re-read ``GET /v1/voice/usage`` after this dictation.
+
+    Only for Murmur Cloud — no other mode meters anything — and only when the
+    cached reading is too old to act on. Off the dictation path by construction:
+    the answer is used to start a thread once a transcript is already pasted.
+    """
+    if usage is None:
+        return False
+    if str(cloud_mode or "").strip() != CLOUD_MODE_MURMUR:
+        return False
+    try:
+        return bool(usage.allowance_is_stale())
+    except Exception as error:  # noqa: BLE001 - a corrupt config must not raise here
+        logger.warning("Could not check the cloud allowance age: %s", type(error).__name__)
+        return False
+
+
+def should_refresh_entitlements(
+    *,
+    last_refresh_at: float | None,
+    now: float,
+    interval_s: float = ENTITLEMENT_REFRESH_INTERVAL_S,
+) -> bool:
+    """Whether the background thread should renew the lease now.
+
+    True at startup (nothing has been refreshed yet) and every ``interval_s``
+    after that. A clock that jumped backwards refreshes rather than waiting the
+    difference out: an extra request is cheaper than a lease that never renews.
+    """
+    assert interval_s > 0, "interval_s must be positive"
+    if last_refresh_at is None:
+        return True
+    elapsed = now - last_refresh_at
+    return elapsed < 0 or elapsed >= interval_s
+
+
+def account_menu_title(entitlements) -> str:
+    """The menu's one-line account status: Free, Pro, or Pro in its grace week."""
+    if entitlements is None or not getattr(entitlements, "pro", False):
+        return ACCOUNT_STATUS_FREE
+    if getattr(entitlements, "in_grace", False):
+        return ACCOUNT_STATUS_PRO_GRACE
+    return ACCOUNT_STATUS_PRO
+
+
+def publish_entitlements(license_service) -> Any:
+    """Re-read the stored lease and publish it to the one Pro gate.
+
+    Returns the entitlements, or None when there is no licence service to ask.
+    Never raises: a locked Keychain drops the app to the free tier for this
+    pass, which is the safe direction, and says so in the log.
+    """
+    if license_service is None:
+        set_current_entitlements(Entitlements.none())
+        return None
+    try:
+        entitlements = license_service.current_entitlements()
+    except Exception as error:  # noqa: BLE001 - verification and storage raise widely
+        logger.warning("Could not read the licence: %s", type(error).__name__)
+        return None
+    # ``current_entitlements`` publishes too; saying it here keeps the contract
+    # readable and lets a test double be a plain object with one method.
+    set_current_entitlements(entitlements)
+    return entitlements
+
+
+def boske_http_transport(
+    method: str,
+    url: str,
+    data: dict,
+    headers: dict,
+) -> tuple[int, dict]:
+    """The production :data:`services.license_service.HttpTransport`.
+
+    One JSON round trip through the hardened opener, so a 30x can never re-send
+    the lease to another host. Returns ``(status, payload)`` with an empty
+    payload for a body that is not a JSON object; the licence service treats
+    that as a failed call, which is what it is.
+
+    An HTTP error is a status, not an exception: ``poll_device_link`` reads
+    ``authorization_pending`` out of a 400 body, and raising here would turn the
+    normal case of the device flow into a transport failure.
+    """
+    assert method, "method is required"
+    payload = json.dumps(data or {}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method=method,
+    )
+    try:
+        with open_no_cross_host_redirect(request, LICENSE_HTTP_TIMEOUT_S) as response:
+            status = int(response.getcode() or 0)
+            body = response.read()
+    except urllib.error.HTTPError as error:
+        status = int(error.code)
+        body = error.read()
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return status, {}
+    return status, parsed if isinstance(parsed, dict) else {}
+
+
+class UsageConfigStore:
+    """The ``load()``/``save()`` pair :class:`UsageService` counts through.
+
+    ``load`` is the whole config, because the service reads its own ten keys out
+    of it. ``save`` writes **only** those ten back, through
+    :meth:`~services.persistence_service.PersistenceService.update_config`: the
+    service hands back the config it loaded, and saving that snapshot verbatim
+    would revert every key Settings or the engine wrote while a dictation was in
+    flight. This adapter is the difference between counting minutes and losing a
+    model switch.
+    """
+
+    #: The keys this store is allowed to write. Exactly the service's own.
+    KEYS: tuple[str, ...] = tuple(USAGE_DEFAULTS)
+
+    def __init__(self, persistence) -> None:
+        assert persistence is not None, "persistence is required"
+        self._persistence = persistence
+
+    def load(self) -> dict:
+        return self._persistence.load_config(dict(DEFAULT_CONFIG))
+
+    def save(self, config: dict) -> None:
+        assert config is not None, "config is required"
+        self._persistence.update_config(
+            {key: config[key] for key in self.KEYS if key in config}
+        )
 
 
 # -- launch at login ---------------------------------------------------------
@@ -1005,17 +1372,21 @@ class CleanupPlan:
     reason: str | None = None
 
 
-def cleanup_plan(config: dict, context, *, pro=pro_enabled) -> CleanupPlan:
+def cleanup_plan(config: dict, context, *, pro=is_pro_feature_enabled) -> CleanupPlan:
     """Resolve mode and tone for this utterance and decide whether to clean it.
 
     Three gates, in the order the plan names them: the Pro entitlement, the
     user's on/off switch, and the mode itself — Dictation is verbatim by
     definition, so it is a skip of the LLM, not a skip of cleanup.
+
+    The mode is resolved under the gate too (:func:`resolve_plan_mode`), so a
+    free install lands on dictation and takes the passthrough exit even when
+    ``cleanup`` itself is somehow open.
     """
     assert config is not None, "config is required"
-    mode_id = resolve_mode(context, config)
+    mode_id = resolve_plan_mode(config, context, pro=pro)
     tone_id = tone_from_config(config).id
-    if not pro("cleanup", config):
+    if not pro("cleanup"):
         return CleanupPlan(mode_id, tone_id, False, CLEANUP_OFF_PRO)
     if not resolve_cleanup_enabled(config):
         return CleanupPlan(mode_id, tone_id, False, CLEANUP_OFF_DISABLED)
@@ -1133,26 +1504,30 @@ def run_cleanup(
     vocabulary_terms: tuple[str, ...] = (),
     transform_code=transform_spoken_code,
     render=render_system_prompt,
+    pro=is_pro_feature_enabled,
 ) -> CleanupOutcome:
     """Run the LLM pass for one utterance. Never raises on a bad reply.
 
     Code mode runs the deterministic spoken-punctuation transform *first*: it is
     idempotent and rule-based, so doing it before the model means the model sees
     real code tokens (``--force``) rather than the words for them, and cannot
-    "correct" them back into prose.
+    "correct" them back into prose. The transform is its own Pro feature
+    (``coding_mode``) and is asked for by name here, at the one place it runs.
 
     ``cleanup`` is the callable that actually talks to the server —
-    ``CleanupRuntime.cleanup`` in the app, a fake in the tests. It returns a
+    ``CleanupRuntime.cleanup`` in the app, ``CloudCleanupClient.cleanup`` when
+    the dictation went through Murmur Cloud, a fake in the tests. It returns a
     :class:`~cleanup.llama_server.CleanupResult`, whose ``skipped`` flag carries
     the original text: a skip costs the improvement, never the transcript.
     """
     assert text is not None, "text is required"
     assert plan is not None, "plan is required"
     assert callable(cleanup), "cleanup must be callable"
+    assert callable(pro), "pro must be callable"
     if not plan.enabled:
         return CleanupOutcome(text=text, ran=False)
 
-    if plan.mode_id == "code":
+    if plan.mode_id == "code" and pro("coding_mode"):
         text = transform_code(text, language=code_transform_language(language))
 
     system_prompt = render(
@@ -1667,10 +2042,14 @@ class MurmurApp(rumps.App):
         self.launch_at_login_supported = self._login_item_service is not None
         if not self.launch_at_login_supported:
             self.set_launch_at_login = None
-        #: Built on demand by :meth:`_settings_services`; a keychain that is
-        #: unreachable is asked about once rather than on every window open.
+        #: Probed once by :meth:`_keychain` and reused by everything that needs
+        #: a secret store: the licence lease, the own-key API keys and the
+        #: Account tab. A keychain that is unreachable is asked about once
+        #: rather than on every window open.
         self._keychain_store = None
         self._keychain_probed = False
+        # -- Wave 4: the licence, the counters and the hosted clients -----
+        self._build_services()
         self.history = self.load_history()
         self.audio_capture = AudioCaptureService(sample_rate=SAMPLE_RATE, logger=logger)
         # Built in load_model(), where a bad config or an unresolvable engine id
@@ -1751,6 +2130,17 @@ class MurmurApp(rumps.App):
         self._build_mode_menu()
         self._build_tone_menu()
 
+        # Account: a status line the entitlement thread keeps current, and the
+        # one click that leads to signing in. Both live next to the engine
+        # status because "which plan" and "which engine" answer the same
+        # question — where is this dictation going to be transcribed.
+        self.account_item = rumps.MenuItem(
+            account_menu_title(get_current_entitlements()), callback=None
+        )
+        self.sign_in_item = rumps.MenuItem(
+            SIGN_IN_MENU_TITLE, callback=self.open_account_settings
+        )
+
         self.menu = [
             self.start_stop_item,
             self.upload_item,
@@ -1761,6 +2151,8 @@ class MurmurApp(rumps.App):
             self.tone_menu,
             None,  # Separator
             self.model_item,
+            self.account_item,
+            self.sign_in_item,
             rumps.MenuItem(about_menu_title(APP_VERSION, read_build_info()), callback=None),
             rumps.MenuItem("Check for Updates...", callback=self.check_updates),
             rumps.MenuItem("Welcome Tour…", callback=self.open_welcome_tour),
@@ -1772,6 +2164,11 @@ class MurmurApp(rumps.App):
         # Load model in background
         self.loading = True
         threading.Thread(target=self.load_model, daemon=True).start()
+
+        # The lease is read, renewed and published off the main thread: it
+        # reaches the Keychain and, when due, the network. Started after the
+        # menu exists so the first pass has an account line to write into.
+        self._start_entitlement_refresh()
 
         # An update leaves the bundle it replaced beside the new one. This is
         # the launch that can safely delete it: nothing is loading out of it.
@@ -2114,17 +2511,29 @@ class MurmurApp(rumps.App):
             return self.engine_id
 
     def add_to_history(
-        self, text, source_type, filename=None, audio_path=None, duration_s=None
+        self,
+        text,
+        source_type,
+        filename=None,
+        audio_path=None,
+        duration_s=None,
+        engine_id=None,
     ):
         """Add a transcription to history.
 
-        ``origin`` and ``engine_id`` are worked out here rather than at the four
-        call sites: the callers know what was said, not where it was decoded,
-        and the answer must be the same for all of them.
+        ``origin`` is worked out from ``engine_id`` rather than at the call
+        sites: the callers know what was said, not what "cloud" means, and the
+        answer must be the same for all of them.
+
+        ``engine_id`` is passed in by the dictation paths, which know which
+        engine the router actually sent the clip to — the loaded local engine is
+        not the authority once a clip can go to the proxy. It defaults to the
+        loaded engine for the callers that never route.
         """
         if not self.runtime_config().get("save_history", DEFAULT_CONFIG["save_history"]):
             return
-        engine_id = self.current_engine_id()
+        if not engine_id:
+            engine_id = self.current_engine_id()
         self.history = self.persistence.add_history_entry(
             self.history,
             text=text,
@@ -2279,12 +2688,87 @@ class MurmurApp(rumps.App):
             logger.warning("Could not locate the cleanup model: %s", error)
             return None
 
-    def _clean_up_transcript(self, text, config, language, vocabulary, pill=None):
+    def _cleanup_client(self, config):
+        """The cloud cleanup client for this proxy origin, built once and kept."""
+        base_url = cloud_base_url(config)
+        if self._cloud_cleanup_client is not None and self._cloud_cleanup_base_url == base_url:
+            return self._cloud_cleanup_client
+        if self.license_service is None:
+            return None
+        try:
+            client = CloudCleanupClient(
+                base_url, lambda: self.license_service.current_lease_token()
+            )
+        except Exception as error:  # noqa: BLE001 - a bad base URL raises ValueError
+            logger.warning(
+                "Cloud cleanup is unavailable (%s); cleaning on this Mac instead: %s",
+                type(error).__name__,
+                error,
+            )
+            return None
+        self._cloud_cleanup_client = client
+        self._cloud_cleanup_base_url = base_url
+        return client
+
+    def _cleanup_callable(self, config, *, cloud_engine_active):
+        """Which backend cleans this utterance: the proxy, or the local server.
+
+        Cloud cleanup travels with cloud transcription and never on its own —
+        :func:`~cleanup.cloud_cleanup.should_use_cloud_cleanup` refuses it when
+        the dictation stayed on this Mac, because sending the text up after
+        keeping the audio down would break the promise the Privacy tab makes.
+        """
+        if not should_use_cloud_cleanup(
+            config,
+            pro_gate=is_pro_feature_enabled,
+            cloud_engine_active=cloud_engine_active,
+        ):
+            return self.cleanup_runtime.cleanup
+        client = self._cleanup_client(config)
+        if client is None:
+            return self.cleanup_runtime.cleanup
+        return self._cloud_cleanup_with_fallback(client)
+
+    def _cloud_cleanup_with_fallback(self, client):
+        """Wrap the proxy's cleanup so a refusal lands on the local server.
+
+        The same two failures the transcription path falls back on, with the
+        same notice: a spent allowance or a rejected lease costs the round trip,
+        not the cleanup. Metering happens here too — the proxy charges words for
+        chat, and a skip is not charged, so a skip is not counted.
+        """
+
+        def cleanup(text, system_prompt):
+            try:
+                result = client.cleanup(text, system_prompt)
+            except (CloudAllowanceExhausted, CloudAuthError) as error:
+                fallback = after_cloud_failure(
+                    error,
+                    local_engine_id=self.engine_id or default_engine_for_current_machine(),
+                )
+                logger.info(
+                    "Murmur Cloud did not clean the text (%s); cleaning on this Mac",
+                    fallback.reason,
+                )
+                self._announce_route(fallback.notice)
+                return self.cleanup_runtime.cleanup(text, system_prompt)
+            if not result.skipped:
+                self._record_usage(ORIGIN_CLOUD, 0, words_in(result.text))
+            return result
+
+        return cleanup
+
+    def _clean_up_transcript(
+        self, text, config, language, vocabulary, pill=None, *, cloud_engine_active=False
+    ):
         """Run the cleanup pass for one utterance and report what happened.
 
         Returns the text to paste. Cleanup is an improvement on top of a
         transcript that is already correct, so every failure here ends with the
         original text and a notice — never with nothing.
+
+        ``cloud_engine_active`` is whether *this* dictation was transcribed by
+        Murmur Cloud, which is one of the three conditions cloud cleanup needs.
         """
         try:
             context = capture_context(
@@ -2311,18 +2795,20 @@ class MurmurApp(rumps.App):
             logger.debug("Cleanup not run: %s", plan.reason)
             return text
 
-        if pill is not None and not self.cleanup_runtime.is_started:
+        cleanup = self._cleanup_callable(config, cloud_engine_active=cloud_engine_active)
+        local_cleanup = cleanup is self.cleanup_runtime.cleanup
+        if pill is not None and local_cleanup and not self.cleanup_runtime.is_started:
             # The first cleaned utterance waits on a 2 GB model load. The menu
             # bar says so, but the user is looking at the pill, and a pill that
             # sits on the plain "working" state through several seconds reads as
             # a hang. Naming the wait is the difference between "it's broken"
-            # and "it's coming".
+            # and "it's coming". The proxy has no such wait, so it gets no label.
             pill.working(label=CLEANUP_PREPARING_STATUS)
         try:
             outcome = run_cleanup(
                 text,
                 plan,
-                cleanup=self.cleanup_runtime.cleanup,
+                cleanup=cleanup,
                 language=language,
                 vocabulary_terms=tuple(vocabulary.terms),
             )
@@ -2476,7 +2962,7 @@ class MurmurApp(rumps.App):
         try:
             if not should_prewarm_cleanup(
                 config,
-                pro=pro_enabled("cleanup", config),
+                pro=is_pro_feature_enabled("cleanup"),
                 cleanup_enabled=resolve_cleanup_enabled(config),
                 installed=self._installed_cleanup_model_path() is not None,
                 ram_gb=detect_ram_gb(),
@@ -2672,31 +3158,323 @@ class MurmurApp(rumps.App):
             self._keychain_store = store
         return self._keychain_store
 
+    # -- Wave 4: licence, usage and the hosted clients --------------------
+
+    def _build_services(self):
+        """Compose the licence and usage services once, at startup.
+
+        Both are cheap to build and neither touches the network here: the
+        licence service only reads a stored lease when it is asked, and the
+        usage service only reads config. The proxy origin is read once and kept
+        on ``self`` so the licence service, the cloud engine and cloud cleanup
+        all speak to the same host — a config edited afterwards changes the
+        engines on the next dictation, but never splits the lease from the host
+        it was issued for mid-session.
+
+        Nothing here may raise: a mistyped ``cloud_base_url`` or a locked
+        Keychain must cost the cloud features, not the menu bar.
+        """
+        config = self.runtime_config()
+        self.cloud_base_url = cloud_base_url(config)
+        self.usage = UsageService(config_store=UsageConfigStore(self.persistence))
+        self.license_service = self._build_license_service(self.cloud_base_url)
+        #: The hosted engine in use, with the config it was built from.
+        self._remote_engine = None
+        self._remote_engine_key = None
+        self._remote_engine_lock = threading.Lock()
+        #: The cloud cleanup client, cached the same way and for the same reason.
+        self._cloud_cleanup_client = None
+        self._cloud_cleanup_base_url = None
+        #: Read and written only by the entitlement thread.
+        self._entitlements_refreshed_at = None
+        self.account_item = None
+        # Published here, synchronously, before anything asks the gate: reading
+        # the stored lease is a Keychain read and a signature check, no network,
+        # and every decision taken during startup — the cleanup pre-warm most of
+        # all — would otherwise race the background thread and see the free tier
+        # on a paying Mac.
+        publish_entitlements(self.license_service)
+
+    def _build_license_service(self, base_url):
+        """The licence service, or ``None`` when this build cannot have one.
+
+        The secret store is the Keychain when it is reachable and an in-memory
+        one when it is not: a lease that cannot be persisted is worth nothing
+        after a quit, but it lets the Account tab open and the app run rather
+        than raising out of ``__init__``.
+        """
+        secret_store = self._keychain() or InMemorySecretStore()
+        try:
+            return LicenseService(secret_store, boske_http_transport, base_url)
+        except Exception as error:  # noqa: BLE001 - a bad base URL raises ValueError
+            logger.error(
+                "The licence service could not be built (%s); Pro and Murmur "
+                "Cloud are unavailable this session: %s",
+                type(error).__name__,
+                error,
+            )
+            return None
+
+    def _start_entitlement_refresh(self):
+        """Publish entitlements now, then keep them fresh for the session."""
+        threading.Thread(target=self._entitlement_worker, daemon=True).start()
+
+    def _entitlement_worker(self):
+        """Renew the lease and republish entitlements, at launch and every 6 h.
+
+        A daemon thread that sleeps in short steps rather than for six hours, so
+        a sign-in on the Account tab reaches the menu within the minute. Every
+        failure is logged and slept off; the gate keeps whatever it last had,
+        which for a failed first pass is the free tier.
+        """
+        while True:
+            try:
+                self._refresh_entitlements_once()
+            except Exception as error:  # noqa: BLE001 - a daemon must not die
+                logger.warning(
+                    "The entitlement refresh failed: %s", type(error).__name__
+                )
+            time.sleep(ENTITLEMENT_POLL_INTERVAL_S)
+
+    def _refresh_entitlements_once(self):
+        """One pass of the loop above: renew when due, then publish and redraw."""
+        if should_refresh_entitlements(
+            last_refresh_at=self._entitlements_refreshed_at, now=time.time()
+        ):
+            self._entitlements_refreshed_at = time.time()
+            if self.license_service is not None:
+                try:
+                    self.license_service.refresh_if_needed()
+                except Exception as error:  # noqa: BLE001 - transport raises widely
+                    logger.warning("Lease refresh failed: %s", type(error).__name__)
+        entitlements = publish_entitlements(self.license_service)
+        self._refresh_account_menu(entitlements)
+
+    def _refresh_account_menu(self, entitlements=None):
+        """Redraw the menu's account line. Safe to call from any thread."""
+        title = account_menu_title(
+            entitlements if entitlements is not None else get_current_entitlements()
+        )
+
+        def apply():
+            item = getattr(self, "account_item", None)
+            if item is not None:
+                item.title = title
+
+        self.run_on_main_thread(apply)
+
+    def open_account_settings(self, _=None):
+        """Menu → "Sign in with Boske ID…": Settings, on the Account tab."""
+        self.open_settings_window_safely(TAB_ACCOUNT)
+
+    def _remote_engine_for(self, engine_id, config):
+        """The hosted engine for this dictation, built once and kept.
+
+        Rebuilt only when the config it was built from changed — the proxy
+        origin, or the own-key provider and model. The lease is not part of that
+        key: it is read through a callable at request time, so signing out and
+        back in needs no rebuild.
+        """
+        key = remote_engine_key(engine_id, config)
+        with self._remote_engine_lock:
+            if self._remote_engine is not None and self._remote_engine_key == key:
+                return self._remote_engine
+            engine = build_engine(
+                engine_id,
+                config=config,
+                model_store=app_model_store(),
+                license_service=self.license_service,
+                keychain=self._keychain(),
+            )
+            engine.load()
+            self._remote_engine = engine
+            self._remote_engine_key = key
+            logger.info("Built the %s engine (%s)", engine_id, engine.runtime_summary())
+            return engine
+
+    def _route_for(self, config, clip_seconds):
+        """Where this dictation goes, from the app's state and the router's table."""
+        return route_engine(
+            cloud_mode=config.get("cloud_mode", DEFAULT_CONFIG["cloud_mode"]),
+            local_engine_id=self.engine_id or default_engine_for_current_machine(),
+            entitlements=get_current_entitlements(),
+            has_lease=lease_is_present(self.license_service),
+            usage=self.usage,
+            key_present=own_key_present(self._keychain(), config),
+            clip_seconds=clip_seconds,
+        )
+
+    def _engine_for_route(self, engine_id, config):
+        """The engine object a routed engine id names.
+
+        Anything the router did not send to a hosted engine is *the* local
+        engine — the one the user chose and this app already loaded — so the
+        fallback never quietly starts a second speech model.
+        """
+        if engine_id in (ENGINE_CLOUD, ENGINE_BYOK):
+            return self._remote_engine_for(engine_id, config)
+        return self.engine
+
+    def _run_engine(self, engine_id, config, wav_path, *, language, hints, long_form):
+        """One decode on the engine ``engine_id`` names.
+
+        The engine lock is held for the local engine only: it exists so a model
+        cannot be unloaded from under a decode, and a hosted engine has no model
+        to unload. Holding it across an upload would block every engine swap for
+        the length of a network round trip.
+        """
+        engine = self._engine_for_route(engine_id, config)
+        if engine is None:
+            raise RuntimeError("no speech engine is loaded")
+        if engine is self.engine:
+            with self._engine_lock:
+                return engine.transcribe(
+                    Path(wav_path), language=language, hints=hints, long_form=long_form
+                )
+        return engine.transcribe(
+            Path(wav_path), language=language, hints=hints, long_form=long_form
+        )
+
+    def _transcribe_routed(
+        self, route, config, wav_path, *, language, hints, long_form=False
+    ):
+        """Run one clip through the routed engine; returns ``(transcript, engine_id)``.
+
+        The one deliberate fallback in the app lives here, and only for a clip
+        that went to a hosted engine: a spent allowance says so, a rejected
+        lease asks for a sign-in, and any other proxy failure falls back
+        quietly, because the user asked for a transcript and a transient
+        network error is not theirs to act on. A **local** engine that fails
+        propagates — a transcript that could not be produced must not look like
+        one that was, and re-running the engine that just failed would only
+        fail again.
+        """
+        self._announce_route(route.notice)
+        hosted = route.engine_id in (ENGINE_CLOUD, ENGINE_BYOK)
+        try:
+            transcript = self._run_engine(
+                route.engine_id,
+                config,
+                wav_path,
+                language=language,
+                hints=hints,
+                long_form=long_form,
+            )
+        except EngineError as error:
+            if not hosted:
+                raise
+            fallback = after_cloud_failure(
+                error,
+                local_engine_id=self.engine_id or default_engine_for_current_machine(),
+            )
+            logger.info(
+                "Murmur Cloud did not take the clip (%s); transcribing on this Mac",
+                fallback.reason,
+            )
+            self._announce_route(fallback.notice)
+            transcript = self._run_engine(
+                fallback.engine_id,
+                config,
+                wav_path,
+                language=language,
+                hints=hints,
+                long_form=long_form,
+            )
+            return transcript, fallback.engine_id
+        return transcript, route.engine_id
+
+    def _announce_route(self, notice):
+        """Say a routing notice out loud, at most as often as it may be said.
+
+        A notification, never an alert: the user is mid-dictation and a modal
+        would take the key focus the paste needs. The allowance notice is marked
+        shown only once it has actually been shown, so a route computed and
+        discarded never burns the one notice the user gets per period.
+        """
+        pending = True
+        if self.usage is not None:
+            try:
+                pending = self.usage.fallback_notice_pending
+            except Exception as error:  # noqa: BLE001 - a corrupt config
+                logger.warning(
+                    "Could not read the fallback notice flag: %s", type(error).__name__
+                )
+        message = notice_to_show(notice, fallback_pending=pending)
+        if message is None:
+            return
+        rumps.notification(APP_NAME, "Murmur Cloud", message)
+        if message == ALLOWANCE_MESSAGE and self.usage is not None:
+            try:
+                self.usage.mark_fallback_notice_shown()
+            except Exception as error:  # noqa: BLE001 - a failed write is not fatal
+                logger.warning(
+                    "Could not remember the fallback notice: %s", type(error).__name__
+                )
+
+    def _record_usage(self, origin, seconds, words):
+        """Meter one finished transcription, and spend the trial when it applies.
+
+        Own-key work reaches :meth:`UsageService.record` and is counted nowhere —
+        it is billed by the user's own provider. Cloud work also spends the free
+        trial, but only on an account without ``cloud_voice``: a paying account
+        must not have its one-time hour drained by minutes it already paid for.
+        """
+        if self.usage is None:
+            return
+        try:
+            self.usage.record(origin, max(0.0, float(seconds or 0.0)), int(words or 0))
+            if origin == ORIGIN_CLOUD and should_consume_trial(get_current_entitlements()):
+                self.usage.consume_trial(max(0.0, float(seconds or 0.0)))
+        except Exception as error:  # noqa: BLE001 - counters must not lose a paste
+            logger.warning("Could not record usage: %s", type(error).__name__)
+
+    def _maybe_refresh_allowance(self, config):
+        """Re-read the proxy's allowance off the dictation path, when it is stale."""
+        if not should_refresh_allowance(
+            self.usage, cloud_mode=config.get("cloud_mode", DEFAULT_CONFIG["cloud_mode"])
+        ):
+            return
+        threading.Thread(target=self._refresh_allowance_worker, daemon=True).start()
+
+    def _refresh_allowance_worker(self):
+        """One ``GET /v1/voice/usage``, on its own thread. Never raises."""
+        if self.license_service is None or self.usage is None:
+            return
+        try:
+            remote = fetch_usage(
+                self.cloud_base_url, self.license_service.current_lease_token()
+            )
+        except Exception as error:  # noqa: BLE001 - a failed read keeps the cache
+            logger.info(
+                "Could not refresh the cloud allowance: %s", type(error).__name__
+            )
+            return
+        self.usage.refresh_allowance(remote)
+
     def _settings_services(self):
         """Everything the Settings tabs are allowed to reach the app through.
 
         One dict, documented in :mod:`ui.settings.window`. Every key is listed
-        even when its value is ``None``: a tab asking for a provider that does
-        not exist yet is a supported state, and spelling it out here is what
-        makes "Wave 4 fills this in" a visible promise rather than a missing
-        key nobody notices.
+        even when its value is ``None``: a tab asking for a provider that could
+        not be built — no licence service on a build with an unusable proxy
+        origin — is a supported state, and spelling it out here is what keeps
+        that a visible decision rather than a missing key nobody notices.
 
         ``scheduler`` is deliberately ``None``. The Account tab's own default
         polls off the main thread *and* redraws on it; anything handed in here
         would replace both halves and leave the sign-in line stale.
 
-        ``pro_gate`` is :func:`pro_enabled` bound to one config snapshot, taken
-        here. Still the single gate — the function is unchanged, only its
-        ``config`` argument is filled in — but the tabs ask it several times per
-        refresh, once per gated control, and an unbound ``pro_enabled`` reads
-        the file from disk on every one of those calls, on the main thread. The
-        dict is rebuilt on every Settings open, so the snapshot is never older
-        than the window it is answering for.
+        ``usage`` is the *callable* the Engine tab wants — it asks for a summary
+        on every refresh — and ``license`` is the service itself, whose four
+        methods the Account tab binds. ``pro_gate`` is
+        :func:`~services.license_service.is_pro_feature_enabled` unadorned: it
+        reads the published entitlements out of memory, so the tabs may ask it
+        once per gated control without touching the disk.
         """
         return {
-            "usage": None,      # Wave 4: the usage/quota service
-            "license": None,    # Wave 4: the licence service
-            "pro_gate": functools.partial(pro_enabled, config=self.runtime_config()),
+            "usage": self.usage.summary if self.usage is not None else None,
+            "license": self.license_service,
+            "pro_gate": is_pro_feature_enabled,
             "keychain": self._keychain(),
             "scheduler": None,
             "version": APP_VERSION,
@@ -3296,12 +4074,24 @@ class MurmurApp(rumps.App):
                 logger.info(f"Audio saved to {audio_path}")
             
             # Language follows the front app when it has an override; the
-            # vocabulary biases the decode and then fixes what it got wrong.
+            # vocabulary biases the decode and then fixes what it got wrong,
+            # with the terms past the free limit dropped for this pass.
             language = resolve_language(config, front_app_bundle_id())
-            vocabulary = vocabulary_from_config(config)
+            vocabulary = gated_vocabulary(vocabulary_from_config(config))
             hints = hints_from_vocabulary(vocabulary)
 
-            if stream_text is not None and language_is_auto(language):
+            # Where this dictation goes, decided before a byte is uploaded.
+            route = self._route_for(config, clip_seconds=duration_seconds)
+            logger.info(
+                "Routing this dictation to %s (%s)", route.engine_id, route.reason
+            )
+            cloud_engine_active = route.engine_id == ENGINE_CLOUD
+
+            if (
+                stream_text is not None
+                and language_is_auto(language)
+                and route.engine_id not in (ENGINE_CLOUD, ENGINE_BYOK)
+            ):
                 # The live decoder already produced the whole utterance while
                 # the user was speaking; running the file through the same
                 # engine again would only cost a second and say the same thing.
@@ -3311,21 +4101,29 @@ class MurmurApp(rumps.App):
                 # who chose French would otherwise get whatever the decoder
                 # guessed. The pill still showed them the live words; the batch
                 # pass below is what actually gets pasted.
+                #
+                # And only on a local route: the live decoder is the local
+                # engine, so reusing its words while the user chose the cloud
+                # would silently transcribe somewhere other than the menu, the
+                # history and the meter all say it did.
                 logger.info("Using the live stream result (%d chars)", len(stream_text))
+                self._announce_route(route.notice)
                 raw_text = stream_text
+                engine_id = route.engine_id
             else:
                 if stream_text is not None:
-                    logger.info(
-                        "Ignoring the live stream result: the language is pinned to %s",
-                        language,
-                    )
+                    logger.info("Ignoring the live stream result: it is not this route")
                 logger.info("Starting transcription in language %s", language)
-                with self._engine_lock:
-                    transcript = self.engine.transcribe(
-                        Path(audio_path), language=language, hints=hints
-                    )
+                transcript, engine_id = self._transcribe_routed(
+                    route, config, audio_path, language=language, hints=hints
+                )
+                cloud_engine_active = engine_id == ENGINE_CLOUD
                 self._note_hints_support(config, transcript, vocabulary)
                 raw_text = transcript.text
+            origin = history_origin_for(engine_id)
+            # Metered on what the engine returned, before the filters: the
+            # minutes were spent whatever the hallucination filter then says.
+            self._record_usage(origin, duration_seconds, words_in(raw_text))
             # The hallucination filter reads the engine's raw words; the user's
             # replacements are applied to what survives.
             text, is_hallucination = finalize_transcript(raw_text, vocabulary)
@@ -3333,9 +4131,19 @@ class MurmurApp(rumps.App):
                 logger.info("Transcription completed")
 
             if text and not is_hallucination:
+                # Snippets first: the model should punctuate around the expanded
+                # text, not around the trigger phrase that produced it.
+                text = expand_gated_snippets(text, config)
                 # Cleanup sits between the replacements and the paste: it reads
                 # what the user actually meant to write, terms included.
-                text = self._clean_up_transcript(text, config, language, vocabulary, pill)
+                text = self._clean_up_transcript(
+                    text,
+                    config,
+                    language,
+                    vocabulary,
+                    pill,
+                    cloud_engine_active=cloud_engine_active,
+                )
                 # …and the replacements run once more over what came back: the
                 # model rewrites sentences, and a rewrite re-cases terms.
                 text = reapply_replacements(text, vocabulary)
@@ -3360,6 +4168,7 @@ class MurmurApp(rumps.App):
                     "live",
                     audio_path=history_audio_path,
                     duration_s=duration_seconds,
+                    engine_id=engine_id,
                 )
             else:
                 if is_hallucination:
@@ -3374,6 +4183,7 @@ class MurmurApp(rumps.App):
                     "live",
                     audio_path=history_audio_path,
                     duration_s=duration_seconds,
+                    engine_id=engine_id,
                 )
                 if pill is not None:
                     pill.error("No speech detected")
@@ -3382,6 +4192,10 @@ class MurmurApp(rumps.App):
                     "No speech detected",
                     "Nothing clear enough to paste. Try again closer to the mic.",
                 )
+
+            # The allowance reading ages out; re-read it here, with the
+            # transcript already pasted, so no recording ever waits on it.
+            self._maybe_refresh_allowance(config)
 
             # Re-enable menu items
             self._reset_menu_state()
@@ -3494,24 +4308,41 @@ class MurmurApp(rumps.App):
                 shutil.copy2(file_path, audio_path)
             
             language = resolve_language(config, front_app_bundle_id())
-            vocabulary = vocabulary_from_config(config)
+            vocabulary = gated_vocabulary(vocabulary_from_config(config))
             hints = hints_from_vocabulary(vocabulary)
-            with self._engine_lock:
-                # A whole-file import, not dictation: the decoder may condition on
-                # the text it already produced for earlier windows.
-                transcript = self.engine.transcribe(
-                    Path(file_path), language=language, hints=hints, long_form=True
+            # An imported file routes like a dictation, and its length decides
+            # whether the proxy will take it at all. An unreadable header is not
+            # a reason to refuse the import: an unknown length never blocks the
+            # cloud, because the engine enforces its own cap anyway.
+            try:
+                clip_seconds = wav_duration_seconds(Path(file_path))
+            except Exception as error:  # noqa: BLE001 - not every import is a WAV
+                logger.info(
+                    "Could not read the clip length (%s); routing without it",
+                    type(error).__name__,
                 )
+                clip_seconds = None
+            route = self._route_for(config, clip_seconds=clip_seconds)
+            # A whole-file import, not dictation: the decoder may condition on
+            # the text it already produced for earlier windows.
+            transcript, engine_id = self._transcribe_routed(
+                route, config, file_path, language=language, hints=hints, long_form=True
+            )
             text = apply_replacements(transcript.text, vocabulary)
             self._note_hints_support(config, transcript, vocabulary)
+            self._record_usage(
+                history_origin_for(engine_id),
+                transcript.duration_s or clip_seconds or 0.0,
+                words_in(transcript.text),
+            )
 
             if text:
                 # Copy to clipboard
                 pyperclip.copy(text)
-                
+
                 # Show result length info
                 word_count = len(text.split())
-                
+
                 # Save to history with audio path when retention is enabled
                 self.add_to_history(
                     text,
@@ -3519,6 +4350,7 @@ class MurmurApp(rumps.App):
                     os.path.basename(file_path),
                     audio_path=audio_path if save_audio else None,
                     duration_s=transcript.duration_s,
+                    engine_id=engine_id,
                 )
                 
                 # Update UI on main thread

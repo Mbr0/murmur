@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cleanup.llama_server import CLEANUP_MODEL_ID
+from engines.factory import DEFAULT_CLOUD_BASE_URL
+from services.usage_service import USAGE_DEFAULTS
 from services.persistence_service import (
     CLEANUP_ENABLED_KEY,
     CLOUD_MODE_MURMUR,
@@ -372,6 +374,17 @@ class PersistenceServiceTests(unittest.TestCase):
                 "launch_at_login": True,
                 "settings_last_tab": "account",
                 "snippets": [{"trigger": "my address", "text": "12 Rue Oberkampf"}],
+                "cloud_base_url": "https://proxy.example.test",
+                "usage_month": "2026-09",
+                "usage_cloud_seconds": 612.5,
+                "usage_cloud_words": 1804,
+                "usage_local_seconds": 240.0,
+                "usage_local_words": 700,
+                "cloud_fallback_notice_shown": True,
+                "cloud_trial_seconds_used": 300.0,
+                "usage_allowance_minutes": 600.0,
+                "usage_remote_minutes_used": 12.5,
+                "usage_allowance_fetched_at": "2026-09-02T18:00:00",
             }
             # Fails loudly if DEFAULT_CONFIG gains a key this fixture forgot.
             self.assertEqual(set(full_config.keys()), set(DEFAULT_CONFIG.keys()))
@@ -441,6 +454,27 @@ class CleanupDefaultsTests(unittest.TestCase):
             self.assertTrue(merged[CLEANUP_ENABLED_KEY])
             reloaded = service.load_config(dict(DEFAULT_CONFIG))
             self.assertIs(reloaded[CLEANUP_ENABLED_KEY], True)
+
+
+class CloudAndUsageDefaultsTests(unittest.TestCase):
+    """Wave 4's keys: the proxy origin, and the counters the service owns."""
+
+    def test_the_proxy_origin_is_the_factory_default(self):
+        self.assertEqual(DEFAULT_CONFIG["cloud_base_url"], DEFAULT_CLOUD_BASE_URL)
+
+    def test_every_usage_counter_is_a_default(self):
+        # Merged, not copied: the usage service is the one description of these.
+        for key, value in USAGE_DEFAULTS.items():
+            self.assertIn(key, DEFAULT_CONFIG)
+            self.assertEqual(DEFAULT_CONFIG[key], value)
+
+    def test_no_credential_is_a_config_key(self):
+        # The lease and the own-key API keys belong in the Keychain, and a key
+        # named for one here would be a file on disk holding a secret.
+        for key in DEFAULT_CONFIG:
+            self.assertNotIn("lease", key)
+            self.assertNotIn("token", key)
+            self.assertNotIn("api_key", key)
 
 
 def _service(tmp_dir, logger=None):
