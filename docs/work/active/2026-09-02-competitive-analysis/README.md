@@ -192,3 +192,35 @@ Portable as specifications, not code: `transcription_filters.py`, `transcription
 - Handy: https://github.com/OpenWhispr/openwhispr · VoiceInk: https://github.com/Beingpax/VoiceInk
 - Apple SpeechAnalyzer: https://9to5mac.com/2025/06/18/apple-devices-offer-amazing-speech-to-text-transcription-in-developer-betas-shows-test/
 - Nothing Essential Voice: https://techcrunch.com/2026/04/24/nothing-introduces-an-ai-powered-dictation-tool/
+
+---
+
+## 9. Portfolio leverage (added 2026-09-02, second pass)
+
+Canopy Studio catalog today (canopystudio.eu): Boske, Grove Fit, Little Bean, Murmur, BearBell live; Minne, Carnet, Vardn coming soon. Boske-side open tools: Grove Port, Boske Pulse. Five more repositories (Savvo, Homeapp, Grand Livre, Salad, M-M Cockpit) sit outside the studio brand.
+
+### Engines worth naming
+
+| Engine | Backing | Today | Proposed reach |
+|--------|---------|-------|----------------|
+| Grove models (Boske Labs) | Seed 3B → Forest 24B on llama.cpp. Relabelled Mistral/Ministral weights, no tuned checkpoint yet | Boske chat and agents, Grove Fit catalog | Murmur Pro cleanup, Savvo recipes |
+| Murmur engine | Local STT, whisper.cpp or Parakeet | The Murmur app | Boske Voice local mode ("powered by Murmur"), voice notes in Minne, Carnet, Little Bean, Vardn, Savvo |
+| Boske Sources | rag-api, pgvector | Boske | Boske only |
+| Boske ID | License service, Ed25519 offline leases, unified identity plan | Boske seats | Murmur Pro license, Minne, Carnet accounts |
+| Grove Port | Open workspace import/export | Boske import | Boske only |
+
+### Options
+
+- **A. Engines inside, products outside (recommended).** Keep consumer brands, name the engines, ship Murmur Pro with every Boske seat, label Boske Voice local as powered by Murmur.
+- **B. Fold Murmur into Boske.** Right for the desktop feature, wrong for the brand: loses the free funnel and the only public-repo audience. Do the port later under the Murmur name.
+- **C. One studio membership.** Premature until Boske ID runs in two apps and Minne/Carnet ship.
+
+### Order of work
+
+1. Murmur to whisper.cpp, signing, auto-update, push-to-talk.
+2. Murmur Pro licenses from Boske's license service, included in every seat.
+3. Murmur Pro cleanup with Grove Seed, modes and tone.
+4. Boske desktop dictate-anywhere powered by Murmur (separate plan).
+5. Murmur engine as a mobile package for the consumer apps.
+
+Caution: "powered by Grove models" is honest only once Boske Labs ships a tuned or quantised model. Until then, use the tier names as size tiers only.
