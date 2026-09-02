@@ -26,6 +26,7 @@ from ui.settings.base import (
     TAB_SMART,
     SettingsTab,
     TabContext,
+    TabLifecycle,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "SettingsTab",
     "TabContext",
+    "TabLifecycle",
     "TABS",
     "TAB_MODULES",
     "TAB_ORDER",
@@ -99,12 +101,19 @@ def load_tabs(
     logged and skipped, so the window opens with the tabs that do exist. Any
     other import error is left to propagate: a tab that exists but is broken
     is a bug to see, not a tab to quietly drop.
+
+    That distinction is the reason for :func:`_is_missing_tab_module`. A
+    ``ModuleNotFoundError`` raised by the tab module's *own* imports looks
+    identical from here, and swallowing it would hide a whole working tab
+    behind a typo'd import.
     """
     import_module = importer or importlib.import_module
     for identifier, module_name in (modules or TAB_MODULES).items():
         try:
             import_module(module_name)
         except ModuleNotFoundError as error:
+            if not _is_missing_tab_module(error, module_name):
+                raise
             logger.info(
                 "Settings tab %r skipped: %s is not available (%s)",
                 identifier,
@@ -112,3 +121,17 @@ def load_tabs(
                 error,
             )
     return registered_tabs()
+
+
+def _is_missing_tab_module(error: ModuleNotFoundError, module_name: str) -> bool:
+    """Whether ``error`` says *this tab module* is absent, rather than one of
+    the modules it imports.
+
+    ``ModuleNotFoundError.name`` is set by the import machinery to the module
+    that could not be found. An error carrying no name proves nothing, so it
+    is treated as a real failure and re-raised.
+    """
+    name = getattr(error, "name", None)
+    if not name:
+        return False
+    return name == module_name or name.startswith(f"{module_name}.")

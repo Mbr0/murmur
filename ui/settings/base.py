@@ -95,6 +95,14 @@ class SettingsTab(Protocol):
     ``identifier`` must be one of :data:`TAB_ORDER`; ``title`` is what the tab
     bar shows. ``build`` returns the ``NSView`` for the tab's content and is
     called once; ``refresh`` re-reads config into the controls it created.
+
+    ``close`` is called when the window goes away and is where a tab gives back
+    anything that outlives its view: a poll timer, an event monitor, a thread.
+    It may be called more than once — closing the window reaches it both
+    directly and through the window's delegate — so teardown must be
+    idempotent. A tab that holds nothing inherits the no-op from
+    :class:`TabLifecycle`; the window tolerates a tab without ``close`` at all,
+    so the method is optional to *write* but never optional to *call*.
     """
 
     identifier: str
@@ -105,6 +113,21 @@ class SettingsTab(Protocol):
 
     def refresh(self) -> None:
         ...
+
+    def close(self) -> None:
+        ...
+
+
+class TabLifecycle:
+    """The default ``close`` for a tab with nothing to tear down.
+
+    Mixed into a tab class so "this tab holds nothing live" is stated rather
+    than left to the reader of a missing method.
+    """
+
+    def close(self) -> None:
+        """Nothing to give back."""
+        return None
 
 
 # -- Shared controls ---------------------------------------------------------

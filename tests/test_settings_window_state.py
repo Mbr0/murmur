@@ -7,11 +7,14 @@ and which tab the window opens on.
 """
 
 import unittest
+from unittest.mock import patch
 
+import ui.settings.window as window_module
 from ui.settings import (
     TABS,
     TAB_MODULES,
     TAB_ORDER,
+    TabLifecycle,
     clear_tabs,
     load_tabs,
     register_tab,
@@ -32,18 +35,17 @@ from ui.settings.window import (
 )
 
 
-def stub_tab(identifier, title=None):
+def stub_tab(identifier, title=None, close=None):
     """A minimal class satisfying the SettingsTab protocol."""
-    return type(
-        f"Stub{identifier.title()}Tab",
-        (),
-        {
-            "identifier": identifier,
-            "title": title or identifier.title(),
-            "build": lambda self, context: context,
-            "refresh": lambda self: None,
-        },
-    )
+    body = {
+        "identifier": identifier,
+        "title": title or identifier.title(),
+        "build": lambda self, context: context,
+        "refresh": lambda self: None,
+    }
+    if close is not None:
+        body["close"] = close
+    return type(f"Stub{identifier.title()}Tab", (), body)
 
 
 class RegistryTestCase(unittest.TestCase):
@@ -102,7 +104,11 @@ class LoadTabsTests(RegistryTestCase):
             self.imported.append(module_name)
             identifier = self.by_module[module_name]
             if identifier in missing:
-                raise ModuleNotFoundError(f"No module named {module_name!r}")
+                # ``name`` is what the real import machinery sets, and what
+                # tells "this tab does not exist" from "this tab is broken".
+                raise ModuleNotFoundError(
+                    f"No module named {module_name!r}", name=module_name
+                )
             register_tab(stub_tab(identifier))
 
         return _import
@@ -128,6 +134,34 @@ class LoadTabsTests(RegistryTestCase):
             raise ImportError(f"{module_name} is broken")
 
         with self.assertRaises(ImportError):
+            load_tabs(importer=explode)
+
+    def test_a_tab_whose_own_import_is_missing_is_not_read_as_a_missing_tab(self):
+        """The tab module is there; something it imports is not. That is a bug
+        to see, not a tab to drop — otherwise a typo'd import hides a whole tab."""
+
+        def explode(module_name):
+            raise ModuleNotFoundError(
+                "No module named 'services.nonexistent'", name="services.nonexistent"
+            )
+
+        with self.assertRaises(ModuleNotFoundError):
+            load_tabs(importer=explode)
+
+    def test_a_missing_submodule_of_the_tab_itself_still_counts_as_missing(self):
+        def explode(module_name):
+            raise ModuleNotFoundError(
+                f"No module named {module_name}.helpers", name=f"{module_name}.helpers"
+            )
+
+        with self.assertLogs("ui.settings", level="INFO"):
+            self.assertEqual((), load_tabs(importer=explode))
+
+    def test_a_module_not_found_error_without_a_name_is_not_swallowed(self):
+        def explode(module_name):
+            raise ModuleNotFoundError("no idea which module")
+
+        with self.assertRaises(ModuleNotFoundError):
             load_tabs(importer=explode)
 
 
@@ -256,6 +290,140 @@ class ControllerConfigTests(unittest.TestCase):
         self.assertEqual(controller.config["language"], "nl")
         self.assertIs(context.config, controller.config)
         self.assertIs(context.app, controller.app)
+
+
+class TabTeardownTests(unittest.TestCase):
+    """Closing the window must give back everything the tabs hold open.
+
+    The Account tab polls Boske on a timer and the General tab can be holding a
+    keyboard monitor; both outlive the view unless something calls ``close``.
+    """
+
+    def controller(self, tabs):
+        controller = SettingsWindowController(
+            app=None,
+            config={"language": "auto"},
+            save=lambda changed: None,
+            theme=object(),
+        )
+        controller.tabs = tabs
+        controller.identifiers = tuple(tabs)
+        return controller
+
+    def closing_tab(self, identifier, closed):
+        cls = stub_tab(identifier, close=lambda self: closed.append(identifier))
+        return cls()
+
+    def test_closing_the_window_closes_every_tab(self):
+        closed = []
+        controller = self.controller(
+            {
+                TAB_GENERAL: self.closing_tab(TAB_GENERAL, closed),
+                TAB_ACCOUNT: self.closing_tab(TAB_ACCOUNT, closed),
+            }
+        )
+
+        controller.close()
+
+        self.assertEqual(sorted(closed), sorted([TAB_GENERAL, TAB_ACCOUNT]))
+
+    def test_the_window_delegate_route_closes_the_tabs_too(self):
+        """The title-bar red button never reaches ``close``; it reaches this."""
+        closed = []
+        controller = self.controller({TAB_ACCOUNT: self.closing_tab(TAB_ACCOUNT, closed)})
+
+        controller.window_will_close()
+
+        self.assertEqual(closed, [TAB_ACCOUNT])
+
+    def test_a_tab_without_a_close_is_skipped(self):
+        closed = []
+        controller = self.controller(
+            {
+                TAB_PRIVACY: stub_tab(TAB_PRIVACY)(),
+                TAB_ACCOUNT: self.closing_tab(TAB_ACCOUNT, closed),
+            }
+        )
+
+        controller.close_tabs()
+
+        self.assertEqual(closed, [TAB_ACCOUNT])
+
+    def test_a_tab_that_fails_to_close_is_logged_and_the_rest_still_close(self):
+        closed = []
+
+        def boom(self):
+            raise RuntimeError("teardown went wrong")
+
+        controller = self.controller(
+            {
+                TAB_GENERAL: stub_tab(TAB_GENERAL, close=boom)(),
+                TAB_ACCOUNT: self.closing_tab(TAB_ACCOUNT, closed),
+            }
+        )
+
+        with self.assertLogs("ui.settings.window", level="WARNING") as captured:
+            controller.close_tabs()
+
+        self.assertEqual(closed, [TAB_ACCOUNT])
+        self.assertIn(TAB_GENERAL, "\n".join(captured.output))
+
+    def test_closing_twice_is_harmless(self):
+        closed = []
+        controller = self.controller({TAB_ACCOUNT: self.closing_tab(TAB_ACCOUNT, closed)})
+
+        controller.close()
+        controller.close()
+
+        self.assertEqual(closed, [TAB_ACCOUNT, TAB_ACCOUNT])
+
+    def test_the_lifecycle_mixin_is_the_default_for_a_tab_holding_nothing(self):
+        class QuietTab(TabLifecycle):
+            identifier = TAB_PRIVACY
+            title = "Privacy"
+
+        tab = QuietTab()
+        controller = self.controller({TAB_PRIVACY: tab})
+
+        self.assertIsNone(tab.close())
+        controller.close_tabs()  # no exception, nothing to give back
+
+
+class ServicesTests(unittest.TestCase):
+    """A ``services`` dict must reach every tab's context, end to end."""
+
+    def tearDown(self):
+        window_module._CONTROLLER = None
+
+    def test_services_given_to_the_controller_reach_the_context(self):
+        provider = object()
+        controller = SettingsWindowController(
+            app=None,
+            config={"language": "auto"},
+            save=lambda changed: None,
+            theme=object(),
+            services={"license": provider},
+        )
+
+        self.assertIs(controller.context().services["license"], provider)
+
+    def test_open_settings_forwards_services_to_a_new_controller(self):
+        window_module._CONTROLLER = None
+        created = {}
+
+        class StubController:
+            def __init__(self, *, app=None, services=None):
+                created["app"] = app
+                created["services"] = services
+
+            def show(self, tab):
+                created["tab"] = tab
+
+        with patch.object(window_module, "SettingsWindowController", StubController):
+            window_module.open_settings(app=None, tab="account", services={"keychain": "x"})
+
+        self.assertEqual(created["services"], {"keychain": "x"})
+        self.assertEqual(created["tab"], "account")
 
 
 if __name__ == "__main__":

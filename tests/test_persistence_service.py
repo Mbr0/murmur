@@ -366,8 +366,11 @@ class PersistenceServiceTests(unittest.TestCase):
                 "pill_enabled": False,
                 "cleanup_prewarm": False,
                 "cloud_mode": "murmur_cloud",
-                "byok_provider": "mistral",
+                "byok_provider": "openai",
                 "cleanup_cloud": True,
+                "update_channel": "beta",
+                "launch_at_login": True,
+                "settings_last_tab": "account",
             }
             # Fails loudly if DEFAULT_CONFIG gains a key this fixture forgot.
             self.assertEqual(set(full_config.keys()), set(DEFAULT_CONFIG.keys()))
@@ -665,6 +668,17 @@ class WhatLeavesTheMacTests(unittest.TestCase):
                 {CONFIG_CLEANUP_ENABLED: False, CONFIG_CLEANUP_CLOUD: True},
                 [self.LOCAL, self.DOWNLOADS, self.UPDATES, self.HISTORY_OFF, self.AUDIO_OFF],
             ),
+            (
+                "own key, provider not yet overridden defaults to Mistral",
+                {CONFIG_CLOUD_MODE: CLOUD_MODE_OWN_KEY},
+                [
+                    self.MISTRAL_AUDIO,
+                    self.DOWNLOADS,
+                    self.UPDATES,
+                    self.HISTORY_OFF,
+                    self.AUDIO_OFF,
+                ],
+            ),
         ]
 
         for name, overrides, expected in table:
@@ -704,7 +718,7 @@ class WhatLeavesTheMacTests(unittest.TestCase):
 
     def test_default_config_documents_the_privacy_keys(self):
         self.assertEqual(DEFAULT_CONFIG[CONFIG_CLOUD_MODE], CLOUD_MODE_OFF)
-        self.assertIsNone(DEFAULT_CONFIG["byok_provider"])
+        self.assertEqual(DEFAULT_CONFIG["byok_provider"], "mistral")
         # None, not False: Wave 2 probes the machine once on first load and
         # stores the answer. Until then the privacy text must read it as off.
         self.assertIsNone(DEFAULT_CONFIG[CONFIG_CLEANUP_ENABLED])
@@ -772,7 +786,22 @@ class DeleteAllDataTests(unittest.TestCase):
             self.assertEqual(config["vocabulary_replacements"], [])
             self.assertEqual(config["language_by_app"], {})
             self.assertNotIn("mode_by_app", config)
-            self.assertNotIn("hints_notice_shown", config)
+
+    def test_delete_all_data_does_not_re_arm_a_notice_already_shown(self):
+        """"Delete all data" promises to keep what the user chose. Clearing
+        ``hints_notice_shown`` would replay a once-per-engine notice they have
+        already dismissed — that is a preference, not something they said."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_dir = Path(tmp_dir) / "audio"
+            audio_dir.mkdir()
+            service = _service(tmp_dir)
+            config = self._seeded_config()
+
+            summary = service.delete_all_data(str(audio_dir), config, legacy_paths=())
+
+            self.assertEqual(config["hints_notice_shown"], {"whispercpp": True})
+            self.assertNotIn("hints_notice_shown", summary.config_keys)
+            self.assertNotIn("hints_notice_shown", USER_CONTENT_CONFIG_KEYS)
 
     def test_delete_all_data_writes_the_trimmed_config_back(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

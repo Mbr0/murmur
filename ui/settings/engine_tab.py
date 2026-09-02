@@ -8,8 +8,11 @@ Three groups, one model each:
   installed ones that are not in use. Wave 1 had a popup, so Delete could only
   ever act on the highlighted model; a row list fixes that.
 * **Cloud** — ``off | murmur_cloud | own_key``. Murmur Cloud is only
-  selectable when the licence grants ``cloud_voice``; Own key picks a provider
-  and points at the Account tab for the key itself, which never touches JSON.
+  selectable when the injected Pro gate says so — ``services["pro_gate"]
+  ("cloud_voice")``, the one entitlement question the UI asks — and a stored
+  ``murmur_cloud`` it refuses is turned off on load rather than honoured. Own
+  key picks a provider and points at the Account tab for the key itself, which
+  never touches JSON.
 * **Usage this month** — minutes and words, cloud and local, with a progress
   bar when the plan has an allowance and a plain line when it does not.
 
@@ -108,6 +111,12 @@ DEFAULT_BYOK_PROVIDER = BYOK_PROVIDERS[0]
 BYOK_NOTE = "The {provider} API key is entered on the Account tab and kept in the Keychain."
 
 MURMUR_CLOUD_LOCKED_NOTE = "Sign in with a plan that includes cloud voice to use Murmur Cloud."
+
+#: The one feature name this tab asks the Pro gate about.
+FEATURE_CLOUD_VOICE = "cloud_voice"
+
+#: Said out loud when a stored ``murmur_cloud`` is turned off on load.
+CLOUD_DOWNGRADED_NOTICE = "Murmur Cloud is off: your plan does not include cloud voice"
 
 NOT_SIGNED_IN = "Not signed in"
 
@@ -307,6 +316,7 @@ class EngineTabModel:
         installed: Callable[[str], bool],
         usage_provider: Callable[[], Any] | None = None,
         license_provider: Callable[[], Any] | None = None,
+        pro_gate: Callable[[str], bool] | None = None,
         app: Any | None = None,
         save: Callable[[dict], None] | None = None,
         delete: Callable[[str], None] | None = None,
@@ -318,6 +328,7 @@ class EngineTabModel:
         self._app = app
         self._usage_provider = usage_provider
         self._license_provider = license_provider
+        self._pro_gate = pro_gate
         self._section = EngineSectionModel(
             config,
             _CatalogStore(catalog, installed, delete),
@@ -328,15 +339,24 @@ class EngineTabModel:
             save=save,
         )
         self._license_status = self._read_license()
-        self._cloud_mode = _one_of(
+        stored_mode = _one_of(
             config.get(CONFIG_CLOUD_MODE, DEFAULT_CLOUD_MODE), CLOUD_MODES, DEFAULT_CLOUD_MODE
         )
+        self._cloud_mode = stored_mode
         self._byok_provider = _one_of(
             config.get(CONFIG_BYOK_PROVIDER, DEFAULT_BYOK_PROVIDER),
             BYOK_PROVIDERS,
             DEFAULT_BYOK_PROVIDER,
         )
-        self._original = self.as_config()
+        #: Set when Murmur Cloud was turned off because the plan lacks it.
+        self.downgrade_notice: str | None = None
+        self._enforce_cloud_entitlement()
+        # Measured against what the file actually said, so a downgrade shows up
+        # in ``apply`` and reaches disk.
+        self._original = {
+            CONFIG_CLOUD_MODE: stored_mode,
+            CONFIG_BYOK_PROVIDER: self._byok_provider,
+        }
 
     # -- local models ----------------------------------------------------
 
@@ -415,12 +435,40 @@ class EngineTabModel:
 
     @property
     def cloud_voice_entitled(self) -> bool:
-        """Whether the plan includes cloud voice. The only gate on this tab."""
-        return bool(getattr(self._license_status, "cloud_voice", False))
+        """Whether Murmur Cloud may be chosen. The only gate on this tab.
+
+        Asked of the injected ``pro_gate`` — ``is_pro_feature_enabled(feature)``
+        — and never of the entitlements object, which this tab only ever reads
+        to *describe* a plan in :attr:`license_line`. No gate means no Pro
+        feature: a build that cannot ask must not assume yes, and a gate that
+        falls over is a closed one.
+        """
+        if self._pro_gate is None:
+            return False
+        try:
+            return bool(self._pro_gate(FEATURE_CLOUD_VOICE))
+        except Exception as error:  # noqa: BLE001 - a broken gate is a closed gate
+            logger.warning("The Pro gate could not be asked about cloud voice: %s", error)
+            return False
 
     @property
     def cloud_mode(self) -> str:
         return self._cloud_mode
+
+    def _enforce_cloud_entitlement(self) -> bool:
+        """Turn Murmur Cloud off when the gate does not allow it. Did it move?
+
+        A lapsed plan, a config edited by hand, or an entitlement that goes
+        away under an open window all reach here. Honouring the stored mode
+        would keep sending audio to Murmur Cloud under a radio the user can no
+        longer choose: the setting would say one thing and the app do another.
+        """
+        if self._cloud_mode != CLOUD_MODE_MURMUR or self.cloud_voice_entitled:
+            return False
+        logger.info("Murmur Cloud turned off: this plan does not include cloud voice")
+        self._cloud_mode = CLOUD_MODE_OFF
+        self.downgrade_notice = CLOUD_DOWNGRADED_NOTICE
+        return True
 
     @property
     def cloud_engine_id(self) -> str | None:
@@ -479,15 +527,15 @@ class EngineTabModel:
     def set_cloud_mode(self, mode: str) -> bool:
         """Choose a cloud mode. Returns whether anything moved.
 
-        Murmur Cloud without the ``cloud_voice`` entitlement is refused rather
-        than stored: the radio is disabled, so reaching here at all means the
-        entitlement went away under an open window.
+        Murmur Cloud is refused rather than stored when the Pro gate says no:
+        the radio is disabled, so reaching here at all means the entitlement
+        went away under an open window.
         """
         assert mode in CLOUD_MODES, (
             f"Invalid cloud mode {mode!r}; expected one of {', '.join(CLOUD_MODES)}"
         )
         if mode == CLOUD_MODE_MURMUR and not self.cloud_voice_entitled:
-            logger.info("Murmur Cloud refused: the current licence has no cloud voice")
+            logger.info("Murmur Cloud refused: the Pro gate does not allow cloud voice")
             return False
         if mode == self._cloud_mode:
             return False
@@ -542,9 +590,14 @@ class EngineTabModel:
     # -- persistence -----------------------------------------------------
 
     def refresh(self) -> None:
-        """Re-read install state from disk and the licence from its service."""
+        """Re-read install state from disk and the licence from its service.
+
+        A plan that lapsed while the window was open turns Murmur Cloud off
+        here, exactly as one that had already lapsed on load does.
+        """
         self._section.refresh()
         self._license_status = self._read_license()
+        self._enforce_cloud_entitlement()
 
     def as_config(self) -> dict:
         """Every key this tab owns, at its current value."""
@@ -650,6 +703,7 @@ class EngineTab:
         self._usage_stack: Any = None
         self._cloud_buttons: dict[str, Any] = {}
         self._license_label: Any = None
+        self._downgrade_label: Any = None
         self._provider_row: Any = None
         self._provider_popup: Any = None
         self._byok_label: Any = None
@@ -679,6 +733,7 @@ class EngineTab:
             delete=store.delete,
             usage_provider=context.service("usage"),
             license_provider=context.service("license"),
+            pro_gate=context.service("pro_gate"),
             app=context.app,
             save=context.save,
         )
@@ -730,6 +785,9 @@ class EngineTab:
 
         self._license_label = make_label(NOT_SIGNED_IN, self._theme, size=11)
         rows.append(self._license_label)
+
+        self._downgrade_label = make_hint(CLOUD_DOWNGRADED_NOTICE, self._theme)
+        rows.append(self._downgrade_label)
 
         self._provider_popup = make_popup(
             list(self.model.byok_provider_titles),
@@ -797,10 +855,17 @@ class EngineTab:
     # -- refreshing ------------------------------------------------------
 
     def refresh(self) -> None:
-        """Re-read the model and redraw every control this tab owns."""
+        """Re-read the model and redraw every control this tab owns.
+
+        A cloud mode the model turned off — on load, or because the plan
+        lapsed under an open window — is a real change to the user's settings,
+        so it is written here rather than waiting for a click that may never
+        come. ``_save_cloud`` writes nothing when nothing moved.
+        """
         if self.model is None or self._view is None:
             return
         self.model.refresh()
+        self._save_cloud()
         _replace_arranged(self._rows_stack, [self._build_model_row(r) for r in self.model.rows])
         _replace_arranged(self._usage_stack, self._build_usage_rows())
         self._refresh_cloud()
@@ -818,6 +883,10 @@ class EngineTab:
         line = self.model.license_line
         self._license_label.setStringValue_(line or "")
         self._license_label.setHidden_(line is None)
+
+        notice = self.model.downgrade_notice
+        self._downgrade_label.setStringValue_(notice or "")
+        self._downgrade_label.setHidden_(notice is None)
 
         note = self.model.byok_note
         self._provider_row.setHidden_(not self.model.show_provider_popup)
@@ -951,6 +1020,7 @@ register_tab(EngineTab)
 __all__ = [
     "BYOK_PROVIDERS",
     "BYOK_PROVIDER_LABELS",
+    "CLOUD_DOWNGRADED_NOTICE",
     "CLOUD_MODES",
     "CLOUD_MODE_MURMUR",
     "CLOUD_MODE_OFF",
@@ -960,6 +1030,7 @@ __all__ = [
     "CONFIG_CLOUD_MODE",
     "DEFAULT_BYOK_PROVIDER",
     "DEFAULT_CLOUD_MODE",
+    "FEATURE_CLOUD_VOICE",
     "CloudOption",
     "EngineTab",
     "EngineTabModel",

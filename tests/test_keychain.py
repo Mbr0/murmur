@@ -12,6 +12,7 @@ the module emits no log records at all.
 """
 
 import os
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -293,6 +294,7 @@ class StubSecurity:
     kSecMatchLimitOne = "m_LimitOne"
     kSecAttrAccessible = "pdmn"
     kSecAttrAccessibleWhenUnlockedThisDeviceOnly = "cku"
+    kSecUseDataProtectionKeychain = "u_DataProtection"
 
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], bytes] = {}
@@ -354,6 +356,27 @@ class PyObjCBackendTest(unittest.TestCase):
         )
         self.assertEqual(SECRET.encode("utf-8"), add_query[StubSecurity.kSecValueData])
 
+    def test_no_query_asks_for_the_data_protection_keychain(self):
+        """Deliberate, and the reason is worth a test rather than a comment.
+
+        The legacy keychain these calls reach ignores ``kSecAttrAccessible``,
+        so switching to the data protection keychain looks like a free fix.
+        It is not: that keychain is entitlement-gated, and without
+        ``keychain-access-groups`` every SecItem call returns -34018 — which is
+        every unsigned build, internal build and run from source. Measured
+        against the real Keychain: with the flag, add and delete return -34018;
+        without it, 0. Setting it needs the entitlement and a migration off the
+        keys already stored, not just this line.
+        """
+        self.store.set(ITEM_LEASE, SECRET)
+        self.store.get(ITEM_LEASE)
+        self.store.set(ITEM_LEASE, OTHER_SECRET)  # add, then update
+        self.store.delete(ITEM_LEASE)
+
+        self.assertTrue(self.security.queries)
+        for query in self.security.queries:
+            self.assertNotIn(StubSecurity.kSecUseDataProtectionKeychain, query)
+
     def test_missing_pyobjc_package_reports_unavailable(self):
         with patch("services.keychain._import_security", side_effect=KeychainUnavailable("absent")):
             with self.assertRaises(KeychainUnavailable):
@@ -364,6 +387,26 @@ class CTypesBackendTest(unittest.TestCase):
     def test_missing_framework_reports_unavailable(self):
         with self.assertRaises(KeychainUnavailable):
             CTypesBackend(cf_path="/nonexistent/CoreFoundation", sec_path="/nonexistent/Security")
+
+    @unittest.skipUnless(sys.platform == "darwin", "Security.framework is macOS only")
+    def test_the_constants_the_backend_names_all_exist(self):
+        """A typo'd CFString global is a KeychainUnavailable at first write,
+        which is exactly the failure this backend exists to avoid."""
+        backend = CTypesBackend()
+        for name in (
+            "kSecClass",
+            "kSecClassGenericPassword",
+            "kSecAttrService",
+            "kSecAttrAccount",
+            "kSecValueData",
+            "kSecReturnData",
+            "kSecMatchLimit",
+            "kSecMatchLimitOne",
+            "kSecAttrAccessible",
+            "kSecAttrAccessibleWhenUnlockedThisDeviceOnly",
+        ):
+            with self.subTest(constant=name):
+                self.assertIsNotNone(backend._const(name))
 
 
 @unittest.skipUnless(

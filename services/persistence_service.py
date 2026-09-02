@@ -55,10 +55,17 @@ Wave 3 (cloud and the settings tabs) adds:
 - ``cloud_mode``: ``"off" | "murmur_cloud" | "own_key"`` — where transcription
   happens. ``"off"`` means the local engine and nothing leaving the Mac
   (read by :func:`what_leaves_the_mac`).
-- ``byok_provider``: ``"mistral" | "openai" | None`` — which provider the
-  own-key engine talks to. ``None`` until the user picks one.
+- ``byok_provider``: ``"mistral" | "openai"`` — which provider the own-key
+  engine talks to. Defaults to ``"mistral"``, matching the Engine tab's own
+  default (``ui/settings/engine_tab.py``).
 - ``cleanup_cloud``: whether that cleanup runs in the cloud rather than on this
   Mac. Only meaningful when ``cleanup_enabled`` is true.
+- ``update_channel``: ``"stable" | "beta"``, default ``"stable"``
+  (``ui/settings/account_tab.py``).
+- ``launch_at_login``: whether Murmur starts itself when the user logs in.
+  ``False`` until the user turns it on (``ui/settings/general_tab.py``).
+- ``settings_last_tab``: the identifier of the Settings tab last shown, so the
+  window reopens where the user left it (``ui/settings/window.py``).
 
 Writers that own only a few keys must go through :meth:`PersistenceService.update_config`
 rather than saving a whole config they loaded earlier: a snapshot save silently
@@ -131,8 +138,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cleanup_prewarm": True,
     # -- Wave 3: cloud and the settings tabs ------------------------------
     "cloud_mode": "off",
-    "byok_provider": None,
+    "byok_provider": "mistral",
     "cleanup_cloud": False,
+    "update_channel": "stable",
+    "launch_at_login": False,
+    "settings_last_tab": "general",
 }
 
 #: Config keys the privacy surface reads and writes.
@@ -156,12 +166,16 @@ HISTORY_ORIGINS: tuple[str, ...] = (ORIGIN_LOCAL, ORIGIN_CLOUD, ORIGIN_BYOK)
 
 #: Config keys holding what the user said or typed, as opposed to preferences.
 #: :meth:`PersistenceService.delete_all_data` clears these and keeps the rest.
+#:
+#: ``hints_notice_shown`` is deliberately *not* here: it records which
+#: once-per-engine notices the user has already dismissed, which is a choice
+#: they made, not something they said. Clearing it would replay a notice the
+#: dialog promises to leave alone.
 USER_CONTENT_CONFIG_KEYS: tuple[str, ...] = (
     "vocabulary_terms",
     "vocabulary_replacements",
     "language_by_app",
     "mode_by_app",
-    "hints_notice_shown",
 )
 
 #: Own-key providers, in the words a person would recognise.

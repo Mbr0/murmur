@@ -17,6 +17,7 @@ from services.model_profile_service import (
 from ui.download_sheet import CONFIG_ENGINE_ID, CONFIG_MODEL_ID
 from ui.settings.engine_tab import (
     BYOK_PROVIDERS,
+    CLOUD_DOWNGRADED_NOTICE,
     CLOUD_MODE_MURMUR,
     CLOUD_MODE_OFF,
     CLOUD_MODE_OWN_KEY,
@@ -26,8 +27,10 @@ from ui.settings.engine_tab import (
     CONFIG_CLOUD_MODE,
     DEFAULT_BYOK_PROVIDER,
     DEFAULT_CLOUD_MODE,
+    FEATURE_CLOUD_VOICE,
     EngineTab,
     EngineTabModel,
+    format_license_line,
 )
 
 TURBO_Q5 = ModelSpec(
@@ -103,6 +106,12 @@ class Fixture:
         self.app = FakeApp()
         self.license = FakeLicense()
         self.usage = None
+        self.gate_asked: list[str] = []
+
+    def pro_gate(self, feature):
+        """Stands in for ``is_pro_feature_enabled``: the one question the UI asks."""
+        self.gate_asked.append(feature)
+        return bool(getattr(self.license, feature, False))
 
     def is_installed(self, model_id):
         return model_id in self.installed_ids
@@ -123,7 +132,16 @@ class Fixture:
         with_license=True,
         with_usage=False,
         with_app=True,
+        pro_gate=True,
     ):
+        """``pro_gate`` is the injected gate: True for the fixture's own, a
+        callable to use that one, or False for a build with no gate at all."""
+        if pro_gate is True:
+            gate = self.pro_gate if with_license else None
+        elif pro_gate is False:
+            gate = None
+        else:
+            gate = pro_gate
         return EngineTabModel(
             self.config,
             catalog=CATALOG,
@@ -132,6 +150,7 @@ class Fixture:
             installed=self.is_installed,
             usage_provider=(lambda: self.usage) if with_usage else None,
             license_provider=(lambda: self.license) if with_license else None,
+            pro_gate=gate,
             app=self.app if with_app else None,
             save=self.save,
             delete=self.delete,
@@ -338,10 +357,7 @@ class CloudSectionTests(unittest.TestCase):
         self.assertEqual(model.license_line, "Pro · Cloud voice included · Renews 31 Jan 2027")
 
     def test_the_licence_line_says_not_signed_in_without_a_provider(self):
-        fx = Fixture()
-        fx.config[CONFIG_CLOUD_MODE] = CLOUD_MODE_MURMUR
-        model = fx.model(with_license=False)
-        self.assertEqual(model.license_line, "Not signed in")
+        self.assertEqual(format_license_line(None), "Not signed in")
 
     def test_the_licence_line_names_the_grace_period(self):
         fx = Fixture()
@@ -352,18 +368,57 @@ class CloudSectionTests(unittest.TestCase):
             model.license_line, "Pro · Cloud voice included · Grace period until 31 Jan 2027"
         )
 
-    def test_a_free_account_reads_as_free_without_cloud_voice(self):
-        """A config written while the plan was live, opened after it lapsed."""
+    def test_a_lapsed_plan_turns_murmur_cloud_off_rather_than_leaving_it_on(self):
+        """A config written while the plan was live, opened after it lapsed.
+
+        Trusting the file would keep audio going to Murmur Cloud under a radio
+        that is disabled but still selected — the setting says one thing and
+        the app does another. The mode is downgraded, said out loud, and
+        written back.
+        """
         fx = Fixture()
         fx.config[CONFIG_CLOUD_MODE] = CLOUD_MODE_MURMUR
         fx.license = FakeLicense(pro=False, cloud_voice=False, expires_at=None)
+
+        with self.assertLogs("ui.settings.engine_tab", level="INFO"):
+            model = fx.model()
+
+        self.assertEqual(model.cloud_mode, CLOUD_MODE_OFF)
+        self.assertEqual(model.downgrade_notice, CLOUD_DOWNGRADED_NOTICE)
+        self.assertEqual(model.apply(), {CONFIG_CLOUD_MODE: CLOUD_MODE_OFF})
+        options = {option.mode: option for option in model.cloud_options}
+        self.assertFalse(options[CLOUD_MODE_MURMUR].enabled)
+        self.assertFalse(options[CLOUD_MODE_MURMUR].selected)
+        self.assertTrue(options[CLOUD_MODE_OFF].selected)
+
+    def test_a_hand_edited_config_cannot_switch_cloud_on_either(self):
+        fx = Fixture()
+        fx.config[CONFIG_CLOUD_MODE] = CLOUD_MODE_MURMUR
+
+        with self.assertLogs("ui.settings.engine_tab", level="INFO"):
+            model = fx.model(with_license=False)  # no licence service, no gate
+
+        self.assertEqual(model.cloud_mode, CLOUD_MODE_OFF)
+        self.assertIsNone(model.cloud_engine_id)
+
+    def test_an_entitled_plan_keeps_the_configured_cloud_mode(self):
+        fx = Fixture()
+        fx.config[CONFIG_CLOUD_MODE] = CLOUD_MODE_MURMUR
         model = fx.model()
 
         self.assertEqual(model.cloud_mode, CLOUD_MODE_MURMUR)
-        self.assertEqual(model.license_line, "Free · Cloud voice not included")
-        options = {option.mode: option for option in model.cloud_options}
-        self.assertFalse(options[CLOUD_MODE_MURMUR].enabled)
-        self.assertTrue(options[CLOUD_MODE_MURMUR].selected)
+        self.assertIsNone(model.downgrade_notice)
+        self.assertEqual(model.apply(), {})
+
+    def test_own_key_is_never_downgraded(self):
+        fx = Fixture()
+        fx.config[CONFIG_CLOUD_MODE] = CLOUD_MODE_OWN_KEY
+        fx.license = FakeLicense(pro=False, cloud_voice=False)
+        model = fx.model()
+
+        self.assertEqual(model.cloud_mode, CLOUD_MODE_OWN_KEY)
+        self.assertIsNone(model.downgrade_notice)
+        self.assertEqual(model.apply(), {})
 
     def test_own_key_shows_the_provider_popup_and_points_at_the_account_tab(self):
         model = Fixture().model()
@@ -415,6 +470,63 @@ class CloudSectionTests(unittest.TestCase):
         self.assertEqual(model.cloud_mode, CLOUD_MODE_OWN_KEY)
         self.assertEqual(model.byok_provider, "openai")
         self.assertEqual(model.apply(), {})
+
+
+class ProGateTests(unittest.TestCase):
+    """Enablement is one question — ``is_pro_feature_enabled(feature)`` — asked
+    of the injected gate. The UI never reads an entitlements field to decide
+    what a user may click; a status line may still print one."""
+
+    def test_the_gate_decides_and_the_entitlements_object_does_not(self):
+        fx = Fixture()
+        fx.license = FakeLicense(pro=False, cloud_voice=False)
+        model = fx.model(pro_gate=lambda feature: True)
+
+        options = {option.mode: option for option in model.cloud_options}
+        self.assertTrue(options[CLOUD_MODE_MURMUR].enabled)
+        self.assertTrue(model.cloud_voice_entitled)
+        self.assertTrue(model.set_cloud_mode(CLOUD_MODE_MURMUR))
+
+    def test_a_closed_gate_disables_murmur_cloud_however_generous_the_licence(self):
+        fx = Fixture()
+        fx.license = FakeLicense(pro=True, cloud_voice=True)
+        model = fx.model(pro_gate=lambda feature: False)
+
+        options = {option.mode: option for option in model.cloud_options}
+        self.assertFalse(options[CLOUD_MODE_MURMUR].enabled)
+        self.assertFalse(model.set_cloud_mode(CLOUD_MODE_MURMUR))
+
+    def test_no_gate_at_all_means_every_pro_feature_is_off(self):
+        fx = Fixture()
+        fx.license = FakeLicense(pro=True, cloud_voice=True)
+        model = fx.model(pro_gate=False)
+
+        self.assertFalse(model.cloud_voice_entitled)
+        options = {option.mode: option for option in model.cloud_options}
+        self.assertFalse(options[CLOUD_MODE_MURMUR].enabled)
+
+    def test_the_gate_is_asked_about_cloud_voice_by_name(self):
+        fx = Fixture()
+        fx.model().cloud_options
+
+        self.assertIn(FEATURE_CLOUD_VOICE, fx.gate_asked)
+
+    def test_a_gate_that_raises_closes_rather_than_takes_the_tab_down(self):
+        def broken(feature):
+            raise RuntimeError("the licence service fell over")
+
+        fx = Fixture()
+        with self.assertLogs("ui.settings.engine_tab", level="WARNING"):
+            model = fx.model(pro_gate=broken)
+            self.assertFalse(model.cloud_voice_entitled)
+
+    def test_the_licence_line_still_prints_entitlement_fields(self):
+        """A status line is description, not enablement: it may read the lease."""
+        fx = Fixture()
+        model = fx.model(pro_gate=lambda feature: True)
+        model.set_cloud_mode(CLOUD_MODE_MURMUR)
+
+        self.assertEqual(model.license_line, "Pro · Cloud voice included · Renews 31 Jan 2027")
 
 
 class UsageBlockTests(unittest.TestCase):

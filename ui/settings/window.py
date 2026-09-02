@@ -12,6 +12,21 @@ remembered in ``settings_last_tab``.
 
 AppKit is imported inside the methods that need it, so the module — and
 ``initial_tab`` with it — stays importable headlessly.
+
+``services`` is the dict forwarded, unchanged, into every tab's
+:class:`~ui.settings.base.TabContext`. The keys a tab may look for:
+
+- ``usage``: usage/quota provider (Smart tab).
+- ``license``: the Wave 4 licence service (Account tab).
+- ``pro_gate``: ``is_pro_feature_enabled(feature) -> bool``, the one question
+  the UI asks about entitlement. Absent means every Pro feature is off.
+- ``keychain``: a ``SecretStore`` for own-key credentials (Account tab).
+- ``scheduler``: schedules a delayed callback, e.g. for device-link polling
+  (Account tab).
+- ``version``: the app version string (Account tab).
+- ``build_info``: the build metadata dict (Account tab).
+- ``persistence``: the ``PersistenceService`` (Privacy tab).
+- ``audio_dir``: where recorded audio is stored (Privacy tab).
 """
 
 from __future__ import annotations
@@ -129,6 +144,7 @@ class SettingsWindowController:
         self.window = None
         self.tab_view = None
         self._delegate = None
+        self._window_delegate = None
 
     # -- config ----------------------------------------------------------
 
@@ -259,12 +275,49 @@ class SettingsWindowController:
 
         self._delegate = _make_tab_delegate(self.remember_tab)
         self.tab_view.setDelegate_(self._delegate)
+        self._window_delegate = _make_window_delegate(self.window_will_close)
+        self.window.setDelegate_(self._window_delegate)
         content.addSubview_(self.tab_view)
         return self.window
 
-    def close(self) -> None:
-        """Remember the open tab and close the window; the object survives."""
+    # -- closing ---------------------------------------------------------
+
+    def close_tabs(self) -> None:
+        """Give back everything the tabs hold open.
+
+        The Account tab is polling Boske on a timer and the General tab may be
+        holding a keyboard event monitor; both outlive the view, and a timer
+        left armed keeps refreshing a window nobody can see. ``close`` is
+        optional to write — a tab holding nothing needs none — so it is asked
+        for rather than assumed, and a tab that fails to close is logged rather
+        than allowed to keep the window open.
+        """
+        for identifier, tab in self.tabs.items():
+            close = getattr(tab, "close", None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception as error:  # noqa: BLE001 - closing must always finish
+                logger.warning("Settings tab %r did not close cleanly: %s", identifier, error)
+
+    def window_will_close(self) -> None:
+        """The window is going away, by whatever route brought it here.
+
+        Called by the window's own delegate, so closing from the title bar —
+        or from anywhere that closes the ``NSWindow`` directly — tears the tabs
+        down exactly as :meth:`close` does.
+        """
         self.remember_tab(self.selected_tab)
+        self.close_tabs()
+
+    def close(self) -> None:
+        """Remember the open tab, tear the tabs down, close the window.
+
+        The object survives: reopening rebuilds nothing but re-shows the same
+        window, and the tabs come back in whatever state ``close`` left them.
+        """
+        self.window_will_close()
         if self.window is not None:
             self.window.close()
 
@@ -296,16 +349,55 @@ def _make_tab_delegate(on_select) -> Any:
     return delegate
 
 
+_WINDOW_DELEGATE_CLASS: Any = None
+
+
+def _make_window_delegate(on_will_close) -> Any:
+    """An ``NSWindow`` delegate that reports the window closing.
+
+    The red button in the title bar closes the window without going through
+    :meth:`SettingsWindowController.close`, and so does anything that calls
+    ``window.close()`` directly. Without this, a tab's timers and event
+    monitors would simply keep running.
+    """
+    global _WINDOW_DELEGATE_CLASS
+    if _WINDOW_DELEGATE_CLASS is None:
+        import objc
+        from Foundation import NSObject
+
+        class MurmurSettingsWindowDelegate(NSObject):
+            @objc.python_method
+            def setCallback_(self, callback):
+                self._callback = callback
+
+            def windowWillClose_(self, _notification):
+                self._callback()
+
+        _WINDOW_DELEGATE_CLASS = MurmurSettingsWindowDelegate
+
+    delegate = _WINDOW_DELEGATE_CLASS.alloc().init()
+    delegate.setCallback_(on_will_close)
+    return delegate
+
+
 #: The one open Settings window, so the menu item reuses it instead of
 #: stacking a second copy on top of the first.
 _CONTROLLER: SettingsWindowController | None = None
 
 
-def open_settings(app: Any = None, tab: str | None = None) -> SettingsWindowController:
-    """Open (or raise) the Settings window, optionally on a given tab."""
+def open_settings(
+    app: Any = None,
+    tab: str | None = None,
+    services: dict | None = None,
+) -> SettingsWindowController:
+    """Open (or raise) the Settings window, optionally on a given tab.
+
+    ``services`` reaches every tab's :class:`~ui.settings.base.TabContext`;
+    see the module docstring for the keys tabs look for.
+    """
     global _CONTROLLER
     if _CONTROLLER is None:
-        _CONTROLLER = SettingsWindowController(app=app)
+        _CONTROLLER = SettingsWindowController(app=app, services=services)
     elif app is not None:
         _CONTROLLER.app = app
     _CONTROLLER.show(tab)

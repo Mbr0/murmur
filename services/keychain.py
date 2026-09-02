@@ -10,16 +10,29 @@ item per secret, all under one service name.
 ``delete(name)`` — plus ``has(name)`` for a UI that wants to show "key stored"
 without reading the key back.
 
-Three rules the implementation exists to enforce:
+Four rules the implementation exists to enforce:
 
 1. **The framework, not the CLI.** ``security add-generic-password -w <secret>``
    puts the secret in the process list, where any other user process can read
    it. Everything here goes through ``SecItemAdd`` / ``SecItemCopyMatching`` /
    ``SecItemUpdate`` / ``SecItemDelete`` in ``Security.framework``.
-2. **No secret in an exception or a log line.** Failures carry an OSStatus and
+2. **The legacy login keychain, deliberately.** ``kSecAttrAccessible`` is set
+   on every write, but the legacy file-based keychain these calls reach ignores
+   it: only the data protection keychain honours an accessibility class.
+   Selecting that one means adding ``kSecUseDataProtectionKeychain: True`` to
+   every dictionary — and it is *not* set here on purpose. That keychain is
+   entitlement-gated: a process without ``keychain-access-groups`` (or app
+   groups) gets ``errSecMissingEntitlement`` (-34018) from every SecItem call,
+   which is every unsigned and internal build, and every run from source.
+   Measured, not assumed: with the flag, add and delete return -34018 here;
+   without it, the same round trip returns 0. Turning it on is a signing
+   change, not a code change, and it would strand every key already stored —
+   the two keychains do not see each other's items. Revisit it only together
+   with the entitlement and a migration.
+3. **No secret in an exception or a log line.** Failures carry an OSStatus and
    the *item name*; the value is never formatted, repr'd or logged. This module
    imports no logger on purpose.
-3. **The backend is a seam.** ``backend`` is any object with the four functions
+4. **The backend is a seam.** ``backend`` is any object with the four functions
    below, so tests drive a fake and never write to the real keychain. The
    default backend is resolved lazily, so importing this module on Linux CI —
    or anywhere without the framework — costs nothing and raises nothing.

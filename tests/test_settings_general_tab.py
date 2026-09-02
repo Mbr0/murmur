@@ -24,9 +24,12 @@ from ui.settings.general_tab import (
     CONFIG_LANGUAGE,
     CONFIG_LAUNCH_AT_LOGIN,
     FALLBACK_LANGUAGES,
+    LAUNCH_AT_LOGIN_UNSUPPORTED,
+    GeneralTab,
     GeneralTabModel,
     language_codes,
     needs_hotkey_reload,
+    supports_launch_at_login,
 )
 
 #: The config keys Murmur shipped before Wave 3. The redesign may add keys;
@@ -112,7 +115,7 @@ class ConfigRoundTripTests(unittest.TestCase):
         self.assertEqual(config, snapshot)
 
     def test_apply_never_reports_a_key_the_tab_does_not_own(self):
-        model = GeneralTabModel(dict(DEFAULT_CONFIG))
+        model = GeneralTabModel(dict(DEFAULT_CONFIG), launch_at_login_supported=True)
         model.set_binding(HotkeyBinding(keycode=8, command=True), label="C")
         model.set_hotkey_mode(HOTKEY_MODE_TOGGLE)
         model.set_language("de")
@@ -123,8 +126,11 @@ class ConfigRoundTripTests(unittest.TestCase):
 
 
 class ChangedKeyTests(unittest.TestCase):
-    def model(self, **overrides):
-        return GeneralTabModel({**DEFAULT_CONFIG, **overrides})
+    def model(self, *, launch_at_login_supported=False, **overrides):
+        return GeneralTabModel(
+            {**DEFAULT_CONFIG, **overrides},
+            launch_at_login_supported=launch_at_login_supported,
+        )
 
     def test_changing_the_language_reports_only_the_language(self):
         model = self.model()
@@ -148,7 +154,7 @@ class ChangedKeyTests(unittest.TestCase):
         self.assertEqual(model.apply(), {HOTKEY_MODE_CONFIG_KEY: HOTKEY_MODE_HOLD})
 
     def test_turning_launch_at_login_on_reports_only_that_key(self):
-        model = self.model()
+        model = self.model(launch_at_login_supported=True)
 
         model.set_launch_at_login(True)
 
@@ -276,11 +282,126 @@ class LanguageChoiceTests(unittest.TestCase):
         self.assertEqual(len(model.language_titles), len(model.language_choices))
 
 
+class LaunchAtLoginTests(unittest.TestCase):
+    """The checkbox may only be offered where something implements it.
+
+    Writing ``launch_at_login`` into the config when nothing registers a login
+    item is a switch that lies: it stays on across restarts and Murmur still
+    does not start itself.
+    """
+
+    def test_a_build_without_the_hook_cannot_be_switched_on(self):
+        model = GeneralTabModel(dict(DEFAULT_CONFIG))
+
+        self.assertFalse(model.launch_at_login_supported)
+        with self.assertLogs("ui.settings.general_tab", level="INFO"):
+            model.set_launch_at_login(True)
+
+        self.assertFalse(model.launch_at_login)
+        self.assertEqual(model.apply(), {})
+        self.assertNotIn(CONFIG_LAUNCH_AT_LOGIN, model.as_config())
+
+    def test_an_unsupported_build_never_writes_the_key_even_when_it_is_on_disk(self):
+        model = GeneralTabModel({**DEFAULT_CONFIG, CONFIG_LAUNCH_AT_LOGIN: True})
+
+        self.assertEqual(model.apply(), {})
+        self.assertNotIn(CONFIG_LAUNCH_AT_LOGIN, model.as_config())
+
+    def test_a_supported_build_owns_the_key(self):
+        model = GeneralTabModel(dict(DEFAULT_CONFIG), launch_at_login_supported=True)
+
+        self.assertTrue(model.launch_at_login_supported)
+        model.set_launch_at_login(True)
+
+        self.assertTrue(model.launch_at_login)
+        self.assertEqual(model.apply(), {CONFIG_LAUNCH_AT_LOGIN: True})
+
+    def test_the_hint_says_why_the_checkbox_is_dead(self):
+        unsupported = GeneralTabModel(dict(DEFAULT_CONFIG))
+        supported = GeneralTabModel(dict(DEFAULT_CONFIG), launch_at_login_supported=True)
+
+        self.assertEqual(unsupported.launch_at_login_hint, LAUNCH_AT_LOGIN_UNSUPPORTED)
+        self.assertIsNone(supported.launch_at_login_hint)
+
+    def test_support_follows_the_running_app(self):
+        class WithHook:
+            def set_launch_at_login(self, enabled):
+                return None
+
+        self.assertFalse(supports_launch_at_login(None))
+        self.assertFalse(supports_launch_at_login(object()))
+        self.assertTrue(supports_launch_at_login(WithHook()))
+
+
+class CaptureTeardownTests(unittest.TestCase):
+    """Closing Settings mid-capture must give the event monitor back.
+
+    A local monitor left installed keeps swallowing key events for the life of
+    the process, long after the window that asked for it is gone.
+    """
+
+    class RecordingTab(GeneralTab):
+        """A tab whose only AppKit call — removing the monitor — is recorded."""
+
+        def __init__(self):
+            super().__init__()
+            self.removed = []
+
+        def _remove_monitor(self, monitor):
+            self.removed.append(monitor)
+
+    def test_closing_removes_a_live_monitor(self):
+        tab = self.RecordingTab()
+        monitor = object()
+        tab._monitor = monitor
+        tab._capture_modifiers = 7
+
+        tab.close()
+
+        self.assertEqual(tab.removed, [monitor])
+        self.assertIsNone(tab._monitor)
+        self.assertEqual(tab._capture_modifiers, 0)
+
+    def test_closing_without_a_capture_touches_nothing(self):
+        tab = self.RecordingTab()
+
+        tab.close()
+
+        self.assertEqual(tab.removed, [])
+
+    def test_closing_twice_removes_the_monitor_once(self):
+        tab = self.RecordingTab()
+        tab._monitor = object()
+
+        tab.close()
+        tab.close()
+
+        self.assertEqual(len(tab.removed), 1)
+
+
 class AppearanceConstantTests(unittest.TestCase):
     def test_the_models_appearance_modes_match_the_themes(self):
         import ui_theme
 
         self.assertEqual(APPEARANCE_MODES, tuple(ui_theme.APPEARANCE_MODES))
+
+
+class PermissionStatusTests(unittest.TestCase):
+    """The Accessibility permission line ported from the old single-page window."""
+
+    def test_permission_status_uses_the_real_message_by_default(self):
+        from services.hotkey_service import permission_status_message
+
+        model = GeneralTabModel(dict(DEFAULT_CONFIG))
+
+        self.assertEqual(model.permission_status, permission_status_message())
+
+    def test_permission_status_uses_the_injected_provider(self):
+        model = GeneralTabModel(
+            dict(DEFAULT_CONFIG), permission_status=lambda: "custom status line"
+        )
+
+        self.assertEqual(model.permission_status, "custom status line")
 
 
 if __name__ == "__main__":

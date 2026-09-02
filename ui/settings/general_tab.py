@@ -20,7 +20,7 @@ Config keys owned here (see ``services/persistence_service.py``):
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from engines import LANGUAGE_AUTO
 from services.hotkey_service import (
@@ -35,6 +35,7 @@ from services.hotkey_service import (
     hotkey_from_config,
     hotkey_mode_from_config,
     hotkey_to_config,
+    permission_status_message,
 )
 from services.language_service import available_languages, language_display_name
 from ui.settings import register_tab
@@ -45,8 +46,13 @@ logger = logging.getLogger(__name__)
 CONFIG_LANGUAGE = "language"
 CONFIG_APPEARANCE = "appearance_mode"
 
-#: New in Wave 3. Whether Murmur starts itself when the user logs in.
+#: New in Wave 3. Whether Murmur starts itself when the user logs in. Only
+#: written where something actually registers the login item — see
+#: :func:`supports_launch_at_login`.
 CONFIG_LAUNCH_AT_LOGIN = "launch_at_login"
+
+#: Shown instead of a switch that would do nothing.
+LAUNCH_AT_LOGIN_UNSUPPORTED = "Not available in this build"
 
 #: Mirrors ``ui_theme.APPEARANCE_MODES``; kept here so the model needs no
 #: AppKit. ``tests/test_settings_general_tab.py`` fails if the two drift.
@@ -94,6 +100,18 @@ def language_codes(engine_info: Any | None) -> tuple[str, ...]:
         return FALLBACK_LANGUAGES
 
 
+def supports_launch_at_login(app: Any | None) -> bool:
+    """Whether the running app can actually register Murmur as a login item.
+
+    The switch is only honest where something implements it: without
+    ``set_launch_at_login`` the config key is written, kept across restarts,
+    and Murmur still does not start itself.
+    """
+    if app is None:
+        return False
+    return callable(getattr(app, "set_launch_at_login", None))
+
+
 def needs_hotkey_reload(changed: dict) -> bool:
     """Whether ``changed`` touches the shortcut, so the app must re-register."""
     assert changed is not None, "changed is required"
@@ -116,16 +134,32 @@ class GeneralTabModel:
     round-trip untouched.
     """
 
-    def __init__(self, config: dict, *, engine_info: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: dict,
+        *,
+        engine_info: Any | None = None,
+        permission_status: Callable[[], str] | None = None,
+        launch_at_login_supported: bool = False,
+    ) -> None:
         assert config is not None, "config is required"
         self.binding: HotkeyBinding = hotkey_from_config(config)
         self.hotkey_label: str | None = config.get("hotkey_label")
         self.hotkey_mode: str = hotkey_mode_from_config(config)
         self.language: str = config.get(CONFIG_LANGUAGE, LANGUAGE_AUTO)
         self.appearance: str = config.get(CONFIG_APPEARANCE, APPEARANCE_MODES[0])
+        # Off by default: a build that has not proved it can register a login
+        # item does not get to write a key claiming it did.
+        self.launch_at_login_supported: bool = bool(launch_at_login_supported)
         self.launch_at_login: bool = bool(config.get(CONFIG_LAUNCH_AT_LOGIN, False))
         self.engine_languages: tuple[str, ...] = language_codes(engine_info)
+        self._permission_status = permission_status or permission_status_message
         self._original = self.as_config()
+
+    @property
+    def permission_status(self) -> str:
+        """The Accessibility permission line shown under the shortcut section."""
+        return self._permission_status()
 
     # -- shortcut --------------------------------------------------------
 
@@ -197,19 +231,33 @@ class GeneralTabModel:
         )
         self.appearance = mode
 
+    @property
+    def launch_at_login_hint(self) -> str | None:
+        """Why the checkbox is dead, or None when it works."""
+        return None if self.launch_at_login_supported else LAUNCH_AT_LOGIN_UNSUPPORTED
+
     def set_launch_at_login(self, enabled: bool) -> None:
         assert isinstance(enabled, bool), f"expected a bool, got {enabled!r}"
+        if not self.launch_at_login_supported:
+            logger.info("Launch at login is not available in this build; ignoring the switch")
+            return
         self.launch_at_login = enabled
 
     # -- persistence -----------------------------------------------------
 
     def as_config(self) -> dict:
-        """Every key this tab owns, at its current value."""
+        """Every key this tab owns, at its current value.
+
+        ``launch_at_login`` is absent — and so never reported by :meth:`apply`,
+        never written — in a build that cannot act on it. A key on disk from a
+        build that could is left exactly as it is rather than rewritten.
+        """
         data = dict(hotkey_to_config(self.binding, label=self.hotkey_label))
         data[HOTKEY_MODE_CONFIG_KEY] = self.hotkey_mode
         data[CONFIG_LANGUAGE] = self.language
         data[CONFIG_APPEARANCE] = self.appearance
-        data[CONFIG_LAUNCH_AT_LOGIN] = self.launch_at_login
+        if self.launch_at_login_supported:
+            data[CONFIG_LAUNCH_AT_LOGIN] = self.launch_at_login
         return data
 
     def apply(self) -> dict:
@@ -243,6 +291,8 @@ class GeneralTab:
         self._language_popup = None
         self._appearance_popup = None
         self._launch_checkbox = None
+        self._launch_hint = None
+        self._permission_hint = None
         self._monitor = None
         self._capture_modifiers = 0
 
@@ -265,7 +315,7 @@ class GeneralTab:
         )
 
         self.context = context
-        self.model = GeneralTabModel(context.config, engine_info=context.engine_info)
+        self.model = self._make_model(context)
         theme = context.theme
 
         self._shortcut_button = make_button(
@@ -299,6 +349,16 @@ class GeneralTab:
             theme,
             self._launch_changed,
         )
+        self._launch_checkbox.setEnabled_(self.model.launch_at_login_supported)
+        self._launch_hint = (
+            make_hint(self.model.launch_at_login_hint, theme)
+            if self.model.launch_at_login_hint
+            else None
+        )
+        permissions_button = make_button(
+            "Open Privacy Settings", theme, self._open_privacy_settings
+        )
+        self._permission_hint = make_hint(self.model.permission_status, theme)
 
         rows = [
             make_section_title("Keyboard shortcut", theme),
@@ -311,6 +371,8 @@ class GeneralTab:
                 "how long you hold: a tap toggles, a hold talks.",
                 theme,
             ),
+            permissions_button,
+            self._permission_hint,
             make_section_title("Language", theme),
             self._language_popup,
             make_hint(
@@ -323,6 +385,7 @@ class GeneralTab:
             self._appearance_popup,
             make_section_title("Startup", theme),
             self._launch_checkbox,
+            self._launch_hint,
         ]
 
         container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 480, 520))
@@ -340,13 +403,19 @@ class GeneralTab:
         self._view = container
         return container
 
+    def _make_model(self, context: TabContext) -> GeneralTabModel:
+        """The model, told whether this build can register a login item."""
+        return GeneralTabModel(
+            context.config,
+            engine_info=context.engine_info,
+            launch_at_login_supported=supports_launch_at_login(context.app),
+        )
+
     def refresh(self) -> None:
         """Re-read config into the controls, e.g. after another tab wrote."""
         if self.context is None:
             return
-        self.model = GeneralTabModel(
-            self.context.config, engine_info=self.context.engine_info
-        )
+        self.model = self._make_model(self.context)
         if self._shortcut_button is not None:
             self._shortcut_button.setTitle_(self.model.shortcut_label)
         if self._mode_popup is not None:
@@ -361,6 +430,8 @@ class GeneralTab:
             self._launch_checkbox.setState_(
                 NSOnState if self.model.launch_at_login else NSOffState
             )
+        if self._permission_hint is not None:
+            self._permission_hint.setStringValue_(self.model.permission_status)
 
     # -- actions ---------------------------------------------------------
 
@@ -403,6 +474,22 @@ class GeneralTab:
             return
         self.context.app_call("set_launch_at_login", enabled)
 
+    def _open_privacy_settings(self, sender) -> None:
+        from services.hotkey_service import open_privacy_settings
+
+        open_privacy_settings()
+
+    # -- closing ---------------------------------------------------------
+
+    def close(self) -> None:
+        """Give back the shortcut recorder's event monitor.
+
+        Settings closed while "Press shortcut…" is showing would otherwise
+        leave a local monitor installed for the life of the process, still
+        swallowing keys for a window that is gone. Safe to call twice.
+        """
+        self._stop_capture()
+
     # -- shortcut recorder -----------------------------------------------
 
     def _reset_shortcut(self, sender) -> None:
@@ -423,12 +510,20 @@ class GeneralTab:
             self._capture_event,
         )
 
-    def _stop_capture(self) -> None:
+    def _remove_monitor(self, monitor: Any) -> None:
+        """Hand one local event monitor back to AppKit.
+
+        The single AppKit call in the teardown path, on its own so closing a
+        tab that never captured needs no window server at all.
+        """
         from Cocoa import NSEvent
 
+        NSEvent.removeMonitor_(monitor)
+
+    def _stop_capture(self) -> None:
         if self._monitor is not None:
-            NSEvent.removeMonitor_(self._monitor)
-            self._monitor = None
+            monitor, self._monitor = self._monitor, None
+            self._remove_monitor(monitor)
         self._capture_modifiers = 0
         if self._shortcut_button is not None and self.model is not None:
             self._shortcut_button.setTitle_(self.model.shortcut_label)

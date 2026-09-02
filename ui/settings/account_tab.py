@@ -42,7 +42,7 @@ import logging
 from datetime import date, datetime
 from typing import Any, Callable
 
-from services.keychain import BYOK_ITEMS
+from services.keychain import BYOK_ITEMS, KeychainError
 from ui.settings import register_tab
 from ui.settings.base import TAB_ACCOUNT, TabContext
 
@@ -75,6 +75,7 @@ LINK_PENDING = "pending"
 LINK_SUCCESS = "success"
 LINK_EXPIRED = "expired"
 LINK_CANCELLED = "cancelled"
+LINK_DENIED = "denied"
 LINK_FAILED = "failed"
 
 LINK_STATES: tuple[str, ...] = (
@@ -83,6 +84,7 @@ LINK_STATES: tuple[str, ...] = (
     LINK_SUCCESS,
     LINK_EXPIRED,
     LINK_CANCELLED,
+    LINK_DENIED,
     LINK_FAILED,
 )
 
@@ -100,11 +102,24 @@ STATUS_UNAVAILABLE = "Licence status unavailable"
 
 KEY_STORED = "Key stored"
 KEY_NOT_STORED = "No key stored"
+KEY_UNAVAILABLE = "Keychain unavailable"
+
+#: What one look-up can say about a provider's key, without reading it.
+KEY_STATE_STORED = "stored"
+KEY_STATE_ABSENT = "absent"
+KEY_STATE_UNAVAILABLE = "unavailable"
+
+KEY_STATE_LABELS: dict[str, str] = {
+    KEY_STATE_STORED: KEY_STORED,
+    KEY_STATE_ABSENT: KEY_NOT_STORED,
+    KEY_STATE_UNAVAILABLE: KEY_UNAVAILABLE,
+}
 
 LINK_INSTRUCTION = "Enter {code} at {url}"
 LINK_SIGNED_IN = "Signed in with your Boske ID"
 LINK_EXPIRED_TEXT = "That code expired. Start again when you are ready."
 LINK_CANCELLED_TEXT = "Sign-in cancelled."
+LINK_DENIED_TEXT = "Sign-in was declined"
 LINK_FAILED_TEXT = "Sign-in could not be completed. Check your connection and try again."
 
 INTERNAL_BUILD_MARKER = "internal build"
@@ -196,6 +211,22 @@ def _default_now() -> float:
     import time
 
     return time.time()
+
+
+def _poll_error_state(error: Exception) -> str:
+    """LINK_EXPIRED or LINK_DENIED for the poller's two named exceptions.
+
+    Classified by class name rather than ``isinstance``, so this module needs
+    no import of ``services/license_service.py`` (Wave 4): the real poller
+    raises ``LinkExpired`` and ``LinkDenied``, both subclasses of ``LinkError``
+    and, like every exception, of ``Exception``. Anything else is LINK_FAILED.
+    """
+    name = type(error).__name__
+    if name == "LinkExpired":
+        return LINK_EXPIRED
+    if name == "LinkDenied":
+        return LINK_DENIED
+    return LINK_FAILED
 
 
 def _start_timer(delay_s: float, callback: Callable[[], None]) -> Any:
@@ -346,6 +377,8 @@ class AccountTabModel:
             return LINK_EXPIRED_TEXT
         if self.link_state == LINK_CANCELLED:
             return LINK_CANCELLED_TEXT
+        if self.link_state == LINK_DENIED:
+            return LINK_DENIED_TEXT
         if self.link_state == LINK_FAILED:
             return LINK_FAILED_TEXT
         return ""
@@ -375,18 +408,24 @@ class AccountTabModel:
 
         Called by the scheduler and, in tests, directly. Polling when no code
         is live is a no-op, so a timer that fires after cancel changes nothing.
+        The poller returns the ``Entitlements`` object once the code is
+        claimed, or ``None`` while waiting — success is judged by ``is not
+        None``, not truthiness, so an entitlements object that happens to be
+        falsy is still a success.
         """
         if self.link_state != LINK_PENDING:
             return self.link_state
         try:
-            linked = bool(self._link_poller())
+            result = self._link_poller()
         except Exception as error:  # noqa: BLE001 - a poll failure ends the attempt
             self._cancel_timer()
-            self.link_state = LINK_FAILED
+            self.link_state = _poll_error_state(error)
+            if self.link_state != LINK_FAILED:
+                self.session = None
             logger.warning("Boske ID sign-in could not be polled: %s", error)
             return self.link_state
 
-        if linked:
+        if result is not None:
             self._cancel_timer()
             self.link_state = LINK_SUCCESS
             self.session = None
@@ -451,19 +490,52 @@ class AccountTabModel:
         )
         return BYOK_ITEMS[provider]
 
-    def key_stored(self, provider: str) -> bool:
-        """Whether a key exists, asked without reading the key itself."""
+    def key_state(self, provider: str) -> str:
+        """One look-up: stored, absent, or a Keychain that will not answer.
+
+        A locked keychain, a cancelled prompt, or an unsigned bundle without
+        the keychain entitlement all raise out of ``has``. Asking is part of
+        building the tab, so raising here means Settings never opens at all —
+        hence the refusal is caught, reported as a third state, and logged as
+        an OSStatus. The secret is never touched on any path.
+        """
         item = self.item_for(provider)
-        has = getattr(self.keychain, "has", None)
-        if callable(has):
-            return bool(has(item))
-        # A store with no ``has`` still must not leak: the value is compared
-        # against None and dropped, never returned or logged.
-        return self.keychain.get(item) is not None
+        try:
+            has = getattr(self.keychain, "has", None)
+            if callable(has):
+                stored = bool(has(item))
+            else:
+                # A store with no ``has`` still must not leak: the value is
+                # compared against None and dropped, never returned or logged.
+                stored = self.keychain.get(item) is not None
+        except KeychainError as error:
+            # KeychainUnavailable is a KeychainError, so both land here. The
+            # error carries an OSStatus and an item name, never the key.
+            logger.warning(
+                "The Keychain could not be read for %s (OSStatus %s)", provider, error.status
+            )
+            return KEY_STATE_UNAVAILABLE
+        return KEY_STATE_STORED if stored else KEY_STATE_ABSENT
+
+    def key_stored(self, provider: str) -> bool:
+        """Whether a key exists, asked without reading the key itself.
+
+        A Keychain that cannot answer reads as "no key" here; ask
+        :meth:`key_available` to tell that apart from an empty slot.
+        """
+        return self.key_state(provider) == KEY_STATE_STORED
+
+    def key_available(self, provider: str) -> bool:
+        """Whether the Keychain answered at all — the gate on Save and Remove.
+
+        Offering buttons that cannot work is worse than showing none: both
+        would fail in the same way the indicator has already explained.
+        """
+        return self.key_state(provider) != KEY_STATE_UNAVAILABLE
 
     def key_indicator(self, provider: str) -> str:
-        """"Key stored" or "No key stored". Never the key."""
-        return KEY_STORED if self.key_stored(provider) else KEY_NOT_STORED
+        """"Key stored", "No key stored", or "Keychain unavailable". Never the key."""
+        return KEY_STATE_LABELS[self.key_state(provider)]
 
     def save_key(self, provider: str, value: str) -> None:
         """Write an own key to the keychain. Never to the config file."""
@@ -516,7 +588,13 @@ class AccountTabModel:
         self._original_channel = self.update_channel
 
     def close(self) -> None:
-        """Stop any pending poll. The window calls this when it goes away."""
+        """Stop polling and drop the code. The window calls this on the way out.
+
+        A pending sign-in is cancelled rather than merely unscheduled: the tab
+        is gone, so a code nobody can read must not keep a timer alive polling
+        Boske into a window that no longer exists. Safe to call twice.
+        """
+        self.cancel_link()
         self._cancel_timer()
 
 
@@ -632,6 +710,7 @@ class AccountTab:
         self._channel_popup = None
         self._key_fields: dict[str, Any] = {}
         self._key_indicators: dict[str, Any] = {}
+        self._key_buttons: dict[str, tuple[Any, ...]] = {}
         self._dispatch: Callable[[Callable[[], None]], None] | None = None
 
     # -- building --------------------------------------------------------
@@ -732,21 +811,16 @@ class AccountTab:
 
         field = _make_secure_field(theme)
         indicator = make_label(self.model.key_indicator(provider), theme)
+        save = make_button(SAVE_KEY_BUTTON, theme, self._save_key_action(provider), width=80)
+        remove = make_button(
+            REMOVE_KEY_BUTTON, theme, self._remove_key_action(provider), width=90
+        )
         self._key_fields[provider] = field
         self._key_indicators[provider] = indicator
+        self._key_buttons[provider] = (save, remove)
         return [
             make_label(BYOK_PROVIDER_LABELS[provider], theme, bold=True),
-            stack_horizontal(
-                [
-                    field,
-                    make_button(
-                        SAVE_KEY_BUTTON, theme, self._save_key_action(provider), width=80
-                    ),
-                    make_button(
-                        REMOVE_KEY_BUTTON, theme, self._remove_key_action(provider), width=90
-                    ),
-                ]
-            ),
+            stack_horizontal([field, save, remove]),
             indicator,
         ]
 
@@ -765,7 +839,14 @@ class AccountTab:
         self._open_button.setEnabled_(model.is_linking and bool(model.verification_url))
         self._cancel_button.setEnabled_(model.is_linking)
         for provider, indicator in self._key_indicators.items():
-            indicator.setStringValue_(model.key_indicator(provider))
+            state = model.key_state(provider)
+            indicator.setStringValue_(KEY_STATE_LABELS[state])
+            usable = state != KEY_STATE_UNAVAILABLE
+            for button in self._key_buttons.get(provider, ()):
+                button.setEnabled_(usable)
+            field = self._key_fields.get(provider)
+            if field is not None:
+                field.setEnabled_(usable)
         if self._channel_popup is not None:
             self._channel_popup.selectItemAtIndex_(model.channel_index())
 
@@ -875,6 +956,17 @@ class AccountTab:
         """Ask the running app to check. ``check_updates`` is a rumps callback."""
         self.context.app_call("check_updates", None)
 
+    # -- closing ---------------------------------------------------------
+
+    def close(self) -> None:
+        """Stop the device-link poll when the window goes away.
+
+        Without this the model's timer re-arms itself forever, polling Boske
+        and refreshing controls belonging to a window that has closed.
+        """
+        if self.model is not None:
+            self.model.close()
+
 
 __all__ = [
     "BYOK_PROVIDERS",
@@ -886,8 +978,14 @@ __all__ = [
     "DEFAULT_POLL_INTERVAL_S",
     "DEFAULT_UPDATE_CHANNEL",
     "KEY_NOT_STORED",
+    "KEY_STATE_ABSENT",
+    "KEY_STATE_LABELS",
+    "KEY_STATE_STORED",
+    "KEY_STATE_UNAVAILABLE",
     "KEY_STORED",
+    "KEY_UNAVAILABLE",
     "LINK_CANCELLED",
+    "LINK_DENIED",
     "LINK_EXPIRED",
     "LINK_FAILED",
     "LINK_IDLE",

@@ -14,7 +14,15 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
-from services.keychain import ITEM_BYOK_MISTRAL, ITEM_BYOK_OPENAI, InMemorySecretStore
+from services.keychain import (
+    ERR_SEC_INTERACTION_NOT_ALLOWED,
+    ERR_SEC_MISSING_ENTITLEMENT,
+    ITEM_BYOK_MISTRAL,
+    ITEM_BYOK_OPENAI,
+    InMemorySecretStore,
+    KeychainError,
+    KeychainUnavailable,
+)
 from ui.settings.base import TAB_ACCOUNT
 from ui.settings.account_tab import (
     CHANNEL_BETA,
@@ -22,8 +30,11 @@ from ui.settings.account_tab import (
     CONFIG_UPDATE_CHANNEL,
     DEFAULT_POLL_INTERVAL_S,
     KEY_NOT_STORED,
+    KEY_STATE_UNAVAILABLE,
     KEY_STORED,
+    KEY_UNAVAILABLE,
     LINK_CANCELLED,
+    LINK_DENIED,
     LINK_EXPIRED,
     LINK_FAILED,
     LINK_IDLE,
@@ -62,6 +73,25 @@ class FakeLinkSession:
     verification_url: str = "https://boske.app/link"
     interval_s: float = 5.0
     expires_at: Any = 1_000.0
+
+
+class RefusingStore:
+    """A ``SecretStore`` whose every look-up hits a Keychain that will not answer."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def has(self, name: str) -> bool:
+        raise self.error
+
+    def get(self, name: str):
+        raise self.error
+
+    def set(self, name: str, value: str) -> None:
+        raise self.error
+
+    def delete(self, name: str) -> None:
+        raise self.error
 
 
 class FakeTimer:
@@ -106,7 +136,7 @@ class ModelHarness:
         self.config = dict(config or {})
         self.entitlements = entitlements
         self.session = FakeLinkSession()
-        self.linked = False
+        self.linked: Any = None
         self.sign_outs = 0
         self.poll_calls = 0
         self.start_error: Exception | None = None
@@ -139,7 +169,7 @@ class ModelHarness:
             raise self.start_error
         return self.session
 
-    def _poll(self) -> bool:
+    def _poll(self) -> Any:
         self.poll_calls += 1
         if self.poll_error is not None:
             raise self.poll_error
@@ -250,7 +280,8 @@ class LinkFlowTest(unittest.TestCase):
 
     def test_success_stops_polling_and_re_reads_the_licence(self):
         self.model.begin_link()
-        self.harness.linked = True
+        # The real poller returns the claimed Entitlements object, not a bool.
+        self.harness.linked = FakeEntitlements(pro=True, source="lease")
         self.harness.entitlements = FakeEntitlements(pro=True, source="lease")
         self.harness.scheduler.fire()
         self.assertEqual(LINK_SUCCESS, self.model.link_state)
@@ -258,6 +289,48 @@ class LinkFlowTest(unittest.TestCase):
         self.assertEqual("Signed in with your Boske ID", self.model.link_line())
         self.assertEqual([], self.harness.scheduler.delays)
         self.assertEqual(1, self.harness.scheduler.cancelled)
+
+    def test_success_is_judged_by_not_none_not_truthiness(self):
+        """A falsy-but-claimed result (e.g. an empty-but-real object) still succeeds."""
+        self.model.begin_link()
+        self.harness.linked = False
+        self.harness.entitlements = FakeEntitlements(pro=True, source="lease")
+        self.harness.scheduler.fire()
+        self.assertEqual(LINK_SUCCESS, self.model.link_state)
+
+    def test_a_poller_raising_link_expired_reports_expired(self):
+        class LinkExpired(Exception):
+            pass
+
+        self.model.begin_link()
+        self.harness.poll_error = LinkExpired("code expired")
+        with self.assertLogs("ui.settings.account_tab", level="WARNING"):
+            self.harness.scheduler.fire()
+        self.assertEqual(LINK_EXPIRED, self.model.link_state)
+        self.assertEqual("", self.model.user_code)
+        self.assertEqual(1, self.harness.scheduler.cancelled)
+
+    def test_a_poller_raising_link_denied_reports_declined(self):
+        class LinkDenied(Exception):
+            pass
+
+        self.model.begin_link()
+        self.harness.poll_error = LinkDenied("user declined")
+        with self.assertLogs("ui.settings.account_tab", level="WARNING"):
+            self.harness.scheduler.fire()
+        self.assertEqual(LINK_DENIED, self.model.link_state)
+        self.assertEqual("Sign-in was declined", self.model.link_line())
+        self.assertEqual(1, self.harness.scheduler.cancelled)
+
+    def test_an_unrelated_poller_exception_is_still_a_generic_failure(self):
+        class Boom(Exception):
+            pass
+
+        self.model.begin_link()
+        self.harness.poll_error = Boom("network down")
+        with self.assertLogs("ui.settings.account_tab", level="WARNING"):
+            self.harness.scheduler.fire()
+        self.assertEqual(LINK_FAILED, self.model.link_state)
 
     def test_expiry_ends_the_attempt(self):
         self.model.begin_link()
@@ -327,6 +400,30 @@ class LinkFlowTest(unittest.TestCase):
         self.model.begin_link()
         self.model.close()
         self.assertEqual(1, self.harness.scheduler.cancelled)
+
+    def test_close_marks_the_flow_cancelled_and_later_polls_do_nothing(self):
+        """Settings closed mid-sign-in: the code is dropped, not left pending,
+        so a timer that fires anyway cannot start polling Boske again."""
+        self.model.begin_link()
+
+        self.model.close()
+
+        self.assertEqual(LINK_CANCELLED, self.model.link_state)
+        self.assertEqual("", self.model.user_code)
+        self.harness.scheduler.fire()
+        self.assertEqual(0, self.harness.poll_calls)
+        self.assertEqual([], self.harness.scheduler.delays)
+
+    def test_closing_twice_is_harmless(self):
+        self.model.begin_link()
+        self.model.close()
+        self.model.close()
+        self.assertEqual(1, self.harness.scheduler.cancelled)
+        self.assertEqual(LINK_CANCELLED, self.model.link_state)
+
+    def test_closing_an_idle_tab_changes_nothing(self):
+        self.model.close()
+        self.assertEqual(LINK_IDLE, self.model.link_state)
 
 
 class OwnKeyTest(unittest.TestCase):
@@ -405,6 +502,49 @@ class OwnKeyTest(unittest.TestCase):
         self.model.save_key("mistral", SECRET)
         self.model.sign_out()
         self.assertTrue(self.model.key_stored("mistral"))
+
+
+class UnusableKeychainTest(unittest.TestCase):
+    """A locked keychain, or a build without the entitlement, must not stop
+    Settings from opening: the indicator says so and the two buttons go away."""
+
+    def harness(self, error):
+        harness = ModelHarness()
+        harness.model.keychain = RefusingStore(error)
+        return harness
+
+    def test_a_refusing_keychain_reads_as_unavailable_rather_than_raising(self):
+        harness = self.harness(KeychainError(ERR_SEC_INTERACTION_NOT_ALLOWED, "read", "byok-mistral"))
+
+        with self.assertLogs("ui.settings.account_tab", level="WARNING"):
+            self.assertEqual(KEY_UNAVAILABLE, harness.model.key_indicator("mistral"))
+            self.assertFalse(harness.model.key_available("mistral"))
+            self.assertFalse(harness.model.key_stored("mistral"))
+
+    def test_an_unavailable_keychain_reads_the_same_way(self):
+        harness = self.harness(KeychainUnavailable("Security.framework did not load"))
+
+        with self.assertLogs("ui.settings.account_tab", level="WARNING"):
+            self.assertEqual(KEY_STATE_UNAVAILABLE, harness.model.key_state("mistral"))
+
+    def test_the_log_line_carries_the_osstatus_and_no_secret(self):
+        harness = self.harness(KeychainError(ERR_SEC_MISSING_ENTITLEMENT, "read", "byok-openai"))
+        harness.keychain.set(ITEM_BYOK_OPENAI, SECRET)  # the real store still holds one
+
+        with self.assertLogs("ui.settings.account_tab", level="WARNING") as captured:
+            harness.model.key_indicator("openai")
+
+        written = " ".join(captured.output)
+        self.assertIn(str(ERR_SEC_MISSING_ENTITLEMENT), written)
+        self.assertNotIn(SECRET, written)
+
+    def test_a_working_keychain_keeps_both_buttons(self):
+        model = ModelHarness().model
+        self.assertTrue(model.key_available("mistral"))
+        self.assertEqual(KEY_NOT_STORED, model.key_indicator("mistral"))
+        model.save_key("mistral", SECRET)
+        self.assertEqual(KEY_STORED, model.key_indicator("mistral"))
+        self.assertTrue(model.key_available("mistral"))
 
 
 class VersionAndChannelTest(unittest.TestCase):
