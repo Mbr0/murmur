@@ -463,7 +463,7 @@ class PillWindow:
         )
         from Foundation import NSMakeRect
 
-        import ui_theme
+        from ui import theme as ui_theme
 
         width, height = self._size
         panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -572,7 +572,7 @@ class PillWindow:
     # -- internals ----------------------------------------------------------
 
     def _apply(self, state: PillState) -> None:
-        import ui_theme
+        from ui import theme as ui_theme
 
         if self._glyph_field is not None:
             self._glyph_field.setStringValue_(state.glyph)

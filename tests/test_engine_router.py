@@ -24,6 +24,7 @@ from services.engine_router import (
     NOTICE_ADD_KEY,
     NOTICE_CLIP_TOO_LONG,
     NOTICE_SIGN_IN,
+    REMOTE_ENGINE_IDS,
     Route,
     after_cloud_failure,
     effective_vocabulary_terms,
@@ -275,6 +276,29 @@ class VocabularyGate(unittest.TestCase):
 
     def test_the_result_is_always_a_tuple(self):
         self.assertIsInstance(effective_vocabulary_terms(["a"], lambda _f: True), tuple)
+
+
+class RemoteEngineTableTests(unittest.TestCase):
+    """Which engine ids send audio off this Mac, in one place.
+
+    The pipeline asked this three separate times, each as its own
+    ``in (ENGINE_CLOUD, ENGINE_BYOK)``. A fourth hosted engine would have had to
+    be found in all three, and the one that was missed would have quietly
+    counted as local — in the usage meter, in the history origin, and in what
+    the Privacy tab tells the user leaves their Mac.
+    """
+
+    def test_the_hosted_engines_are_the_two_that_leave_the_mac(self):
+        self.assertEqual(REMOTE_ENGINE_IDS, (ENGINE_CLOUD, ENGINE_BYOK))
+
+    def test_every_engine_the_router_can_choose_is_local_or_in_the_table(self):
+        for mode, engine_id in (
+            (CLOUD_MODE_OFF, "whispercpp"),
+            (CLOUD_MODE_MURMUR, ENGINE_CLOUD),
+            (CLOUD_MODE_OWN_KEY, ENGINE_BYOK),
+        ):
+            with self.subTest(mode=mode):
+                self.assertIn(engine_id, ("whispercpp", *REMOTE_ENGINE_IDS))
 
 
 if __name__ == "__main__":

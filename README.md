@@ -70,11 +70,14 @@ Open **Settings** from the menu bar. It has five tabs — General, Engine, Smart
 ## Free, Pro and the cloud
 
 Murmur is free and fully local: press the shortcut, speak, text appears. **Pro**
-unlocks the smart layer — AI cleanup, writing modes and tones, context awareness
-that picks a mode from the app you are typing into, vocabularies beyond 20 terms,
-snippets and spoken-code mode — and is enabled by a licence tied to your Boske
-ID, from **Settings → Account** or the menu bar's *Sign in with Boske ID…*. All
-of it still runs on your Mac.
+unlocks the smart layer — local AI cleanup with five modes (Dictation, Message,
+Mail, Notes, Code) and four tones (neutral, warm, formal, terse), context
+awareness that picks a mode from the app you are typing into, vocabularies
+beyond 20 terms, snippets and spoken-code mode — and is enabled by a licence
+tied to your Boske ID, from **Settings → Account** or the menu bar's *Sign in
+with Boske ID…*. All of it still runs on your Mac. A floating pill near the
+cursor shows recording and cleanup state, with live partial text where the
+engine streams.
 
 Two ways to send audio off the Mac, both off by default and both chosen in
 **Settings → Engine**:
@@ -137,7 +140,29 @@ Run tests:
 
 ```bash
 source venv/bin/activate
-python -m unittest discover -s tests -p "test_*.py"
+python -m unittest discover -s tests -p "test_*.py"       # unit
+bash scripts/tools/run_integration.sh                     # integration (macOS)
+```
+
+Vendored binaries used by the local engines are built from source, not downloaded prebuilt:
+
+```bash
+bash scripts/tools/fetch_whispercpp.sh   # builds vendor/whispercpp/whisper-server
+bash scripts/tools/fetch_llama.sh        # builds vendor/llamacpp/llama-server
+```
+
+`scripts/tools/bakeoff.py` re-runs the D1 engine bake-off (WER, latency, RAM) against the fixture clips in `tests/fixtures/audio/`.
+
+Project layout:
+
+```
+murmur.py     entry point: PATH for the bundled binaries, then app.lifecycle
+app/          config, decisions, services, pipeline, menu, windows, lifecycle
+engines/      whisper.cpp, Voxtral/MLX, Murmur Cloud, own key, model store
+cleanup/      llama-server, modes, tones, context, vocabulary, snippets, filters
+ui/           settings/, onboarding_window, pill_window, history_window, theme, alerts
+services/     audio capture, hotkey, text insertion, persistence, licence, usage
+tests/        unit tests, plus tests/integration/ for the end-to-end suite
 ```
 
 ## Acknowledgements

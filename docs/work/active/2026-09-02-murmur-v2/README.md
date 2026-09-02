@@ -1,6 +1,6 @@
 # Murmur v2
 
-**Status:** ✅ approved 2026-09-02 · Waves 0–3 merged (PRs #4–#7) · Wave 4 wiring in progress
+**Status:** ✅ approved 2026-09-02 · Waves 0–5 delivered (PRs #4–#9) · open items: real-recording bake-off, CI runner pass, clean-account wizard run, Boske-side D6
 **Plan:** [MASTER.md](./MASTER.md) · **Skill:** `@murmur-v2`
 **Study:** [`../2026-09-02-competitive-analysis/`](../2026-09-02-competitive-analysis/) (Part II is the source of this plan)
 

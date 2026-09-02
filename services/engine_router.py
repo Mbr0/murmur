@@ -64,6 +64,14 @@ CLOUD_MODES = (CLOUD_MODE_OFF, CLOUD_MODE_MURMUR, CLOUD_MODE_OWN_KEY)
 ENGINE_CLOUD = "cloud"
 ENGINE_BYOK = "byok"
 
+#: The engines that send audio off this Mac. One table rather than an
+#: ``in (ENGINE_CLOUD, ENGINE_BYOK)`` written out at each of the three places
+#: that asks: the usage meter, the history origin and what the pipeline tells
+#: the user is happening. A hosted engine missing from one of those would be
+#: counted, recorded and described as local, which is the one mistake this app
+#: must not make.
+REMOTE_ENGINE_IDS: tuple[str, ...] = (ENGINE_CLOUD, ENGINE_BYOK)
+
 #: Longest clip Murmur Cloud accepts, in seconds. Mirrors
 #: :data:`engines.cloud.MAX_MINUTES`; a longer recording is transcribed here.
 MAX_CLIP_SECONDS = 3600.0
@@ -201,6 +209,7 @@ __all__ = [
     "NOTICE_ADD_KEY",
     "NOTICE_CLIP_TOO_LONG",
     "NOTICE_SIGN_IN",
+    "REMOTE_ENGINE_IDS",
     "Route",
     "after_cloud_failure",
     "effective_vocabulary_terms",

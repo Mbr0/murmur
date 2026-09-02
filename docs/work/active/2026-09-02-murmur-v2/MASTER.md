@@ -1,6 +1,6 @@
 # MASTER: Murmur v2
 
-**Status:** ✅ approved 2026-09-02 · Waves 0–3 merged (PRs #4–#7) · Wave 4 wiring in progress
+**Status:** ✅ approved 2026-09-02 · Waves 0–5 delivered (PRs #4–#9) · open items: real-recording bake-off, CI runner pass, clean-account wizard run, Boske-side D6
 **Base branch:** `main` (after PR #2)
 **Source:** study in `../2026-09-02-competitive-analysis/`, Part II "What should change"
 
@@ -84,7 +84,7 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 - [x] Language and vocabulary hints reach both local engines; CSV round-trips (Voxtral reports hints_applied=False; whisper.cpp applies them)
 - [x] Model switch without restart; download progress visible; sha256 verified (also verified before every activation)
 - [x] CI produces a signed, notarized DMG when secrets exist; updater installs a signed build; bundle no longer contains torch (local build 220 MB DMG; CI path not yet exercised with real secrets)
-- [ ] Wizard completes on a clean macOS user account (state machine tested; needs a manual run on a clean account)
+- [ ] Wizard completes on a clean macOS user account (state machine tested; all five steps build headlessly; needs a manual run on a clean account)
 - [x] Suite green (536 tests, 2026-09-02)
 
 ## Wave 2 — Smart layer, what Pro sells (PARALLEL, then serial wiring)
@@ -133,10 +133,10 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 | E4e (serial) | `murmur.py` | Engine routing: Cloud when entitled and under allowance, else local. Pro gate on cleanup, modes, context, vocabulary beyond 20 terms, snippets, coding mode. Free tier one-time 60-minute cloud trial counter. |
 
 **Done when**
-- [ ] License verification passes test vectors and rejects tampered, expired and wrong-audience tokens
-- [ ] Cloud engine works against a recorded fixture of the proxy; fallback triggers at 95% in tests
-- [ ] Pro gate is a single function, tested, with no feature check scattered in UI code
-- [ ] Suite green
+- [x] License verification passes test vectors and rejects tampered, expired, wrong-audience, wrong-alg, future-iat and wrong-device tokens (throwaway Ed25519 key in tests)
+- [x] Cloud engine works against a fake proxy (loopback server); fallback triggers at 95% in tests; contract proposed to Boske (D6)
+- [x] Pro gate is a single function (`is_pro_feature_enabled`), tested; UI only receives a `pro_gate` callable; a guard test forbids licence imports under ui/
+- [x] Suite green (1700 tests, 2026-09-02)
 
 ## Wave 5 — Split and harden (SERIAL)
 
@@ -145,9 +145,9 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 | E5 | `murmur.py`, `app/**`, `ui/**`, `services/**`, `tests/**` | Move the state machine, menu and lifecycle out of `murmur.py` into `app/`. `git mv` old UI files into `ui/`. Integration tests: fixture audio through each local engine end to end (skipped when the runtime is absent), paste flow with a fake pasteboard. CI runs unit on Linux and integration on macOS. |
 
 **Done when**
-- [ ] `murmur.py` under 100 lines
-- [ ] Integration suite green on the macOS runner
-- [ ] `pip-audit` clean
+- [x] `murmur.py` under 100 lines (43; `app/` holds config, decisions, services, pipeline, menu, windows, lifecycle)
+- [ ] Integration suite green on the macOS runner (green locally: 11 tests, whisper.cpp ×4 languages, Voxtral batch + streaming, llama-server cleanup, paste flow; CI job added, not yet observed on a runner)
+- [x] `pip-audit` clean (2026-09-02, local; also a CI step)
 
 ---
 

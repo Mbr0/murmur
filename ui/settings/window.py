@@ -93,15 +93,17 @@ def initial_tab(
 
 
 def murmur_app_instance() -> Any | None:
-    """The running menu bar app, or ``None`` when Settings runs standalone."""
-    for module_name in ("murmur", "__main__"):
-        module = sys.modules.get(module_name)
-        if module is None:
-            continue
-        app = getattr(module, "APP_INSTANCE", None)
-        if app is not None:
-            return app
-    return None
+    """The running menu bar app, or ``None`` when Settings runs standalone.
+
+    ``APP_INSTANCE`` is published by :mod:`app.config` and set by
+    :meth:`app.lifecycle.MurmurApp.__init__`. Read out of ``sys.modules`` rather
+    than imported, so this module stays importable — and testable — without the
+    app package being loaded at all.
+    """
+    module = sys.modules.get("app.config")
+    if module is None:
+        return None
+    return getattr(module, "APP_INSTANCE", None)
 
 
 def engine_info_for(app: Any | None) -> Any | None:
@@ -210,9 +212,9 @@ class SettingsWindowController:
 
     @property
     def theme(self) -> Any:
-        """``ui_theme``, imported on first use so the module stays headless."""
+        """``ui.theme``, imported on first use so the module stays headless."""
         if self._theme is None:
-            import ui_theme
+            from ui import theme as ui_theme
 
             self._theme = ui_theme
         return self._theme

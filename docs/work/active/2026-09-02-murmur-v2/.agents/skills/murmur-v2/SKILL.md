@@ -10,12 +10,13 @@ paths:
   - murmur.py
   - Murmur.spec
   - requirements.txt
-  - settings_window.py
-  - history_window.py
   - app/**
   - engines/**
   - cleanup/**
   - ui/**
+  - ui/history_window.py
+  - ui/alerts.py
+  - ui/theme.py
   - services/**
   - scripts/**
   - .github/workflows/release.yml
@@ -35,7 +36,9 @@ Six waves, each its own PR. Wave 0 must confirm decision D1 with bake-off data b
 
 ## Hot files (never parallel-edit)
 
-- `murmur.py`
+- `app/lifecycle.py`
+- `app/pipeline.py`
+- `app/services.py`
 - `Murmur.spec`
 - `requirements.txt`
 - `services/hotkey_service.py`

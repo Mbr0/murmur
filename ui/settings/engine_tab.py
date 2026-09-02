@@ -998,11 +998,19 @@ class EngineTab:
             window.beginSheet_completionHandler_(sheet, None)
 
     def _download_changed(self, state: Any) -> None:
-        """Called on the main thread after every state change."""
-        if self._sheet_status is not None:
-            self._sheet_status.setStringValue_(state.status_line())
-        if self._sheet_bar is not None:
-            self._sheet_bar.setDoubleValue_(state.percent)
+        """Called on the main thread after every state change.
+
+        The sheet may already be gone: Settings can be closed mid-download and
+        the controller deliberately keeps running (see :meth:`close`). So
+        everything that *draws* is guarded and everything that records the
+        outcome is not — a model that finished downloading is installed and put
+        to work whether or not anyone was watching.
+        """
+        if self._sheet is not None:
+            if self._sheet_status is not None:
+                self._sheet_status.setStringValue_(state.status_line())
+            if self._sheet_bar is not None:
+                self._sheet_bar.setDoubleValue_(state.percent)
         if state.phase not in (PHASE_DONE, PHASE_FAILED, PHASE_CANCELLED):
             return
         if state.phase == PHASE_DONE and self._downloading_id is not None:
@@ -1012,6 +1020,28 @@ class EngineTab:
         self._downloading_id = None
         self._end_sheet()
         self.refresh()
+
+    # -- closing ---------------------------------------------------------
+
+    def close(self) -> None:
+        """Take the sheet down when Settings goes away. The download carries on.
+
+        Asked for by :meth:`ui.settings.window.SettingsWindowController.close_tabs`
+        however the window was closed. What has to go is the *sheet*: the worker
+        thread was pushing progress into views whose window had gone.
+
+        The download itself is not the window's to cancel. A 1.6 GB model takes
+        minutes and the user who asked for it wants it whether or not Settings
+        is still up — closing the window to get on with something else must not
+        throw those minutes away. Only the sheet's own Cancel button cancels.
+
+        So the controller runs to completion against a tab with no sheet, which
+        is why every one of its callbacks checks before it draws
+        (:meth:`_download_changed`, :meth:`_end_sheet`, :meth:`refresh`) — and
+        why ``_downloading_id`` is deliberately *kept*: it is what tells the
+        finished download which model to put to work when it lands.
+        """
+        self._end_sheet()
 
     def _end_sheet(self) -> None:
         if self._sheet is None:
@@ -1025,7 +1055,7 @@ class EngineTab:
         self._sheet_bar = None
 
     def _alert(self, message: str) -> None:
-        import ui_alerts
+        from ui import alerts as ui_alerts
 
         ui_alerts.show_alert("Murmur", message)
 

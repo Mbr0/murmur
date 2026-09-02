@@ -38,3 +38,8 @@ _To be filled by `scripts/tools/bakeoff.py` once real EN/FR/NL/DE clips exist (h
 - **One store, two catalogs.** The app composes `ModelStore(catalog=CATALOG + (CLEANUP_MODEL_SPEC,))` (`murmur.app_model_store`), so the cleanup GGUF gets the same resume, sha256 and delete code as a speech model, while `engines.model_store.CATALOG` stays speech-only and `EngineSectionModel` filters to `engines.ENGINE_IDS`.
 - **Pro gate placeholder.** `murmur.pro_enabled(feature, config)` reads the hidden `pro_override_for_dev` key and is the single call site the whole smart layer gates on. Wave 4e replaces its body with `is_pro_feature_enabled`; no other file learns what "Pro" means.
 - **E2f smoke, 2026-09-02, M-series 24 GB:** 174-char filler-heavy sentence, mode `message`, tone `neutral` through `cleanup_plan` → `run_cleanup` → `CleanupRuntime`: 15.15 s for the first call including the cold server start, 0.29 s warm; both `ran=True`, no skip; server stopped cleanly afterwards.
+
+## Wave 5 build (2026-09-02)
+
+- Local PyInstaller bundle from the split tree: whisper-server and llama-server bundled, cleanup prompts bundled, no torch; compressed DMG 163 MB (gate 400 MB). Largest contributors: MLX runtime ~200 MB, transformers 43 MB, scipy 36 MB.
+- Unit suite 1759 tests; integration 11 tests green locally; pip-audit clean; launch smoke clean with the key-up warning once.

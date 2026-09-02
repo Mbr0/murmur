@@ -26,8 +26,8 @@ from Cocoa import (
 )
 from Quartz import CGColorCreateGenericRGB
 from PyObjCTools import AppHelper
-import ui_alerts
-import ui_theme
+from ui import alerts as ui_alerts
+from ui import theme as ui_theme
 
 # History file path
 HISTORY_FILE = os.path.expanduser("~/.murmur_history.json")
@@ -69,11 +69,10 @@ def format_duration(seconds):
 
 def load_history():
     """Load history from the running app or local disk."""
-    for module_name in ("murmur", "__main__"):
-        module = sys.modules.get(module_name)
-        app = getattr(module, "APP_INSTANCE", None) if module is not None else None
-        if app is not None and getattr(app, "history", None) is not None:
-            return list(app.history)
+    module = sys.modules.get("app.config")
+    app = getattr(module, "APP_INSTANCE", None) if module is not None else None
+    if app is not None and getattr(app, "history", None) is not None:
+        return list(app.history)
 
     try:
         if os.path.exists(HISTORY_FILE):
@@ -626,10 +625,11 @@ class HistoryWindowController(NSObject):
         except OSError:
             return
 
-        murmur_module = sys.modules.get("murmur")
-        if murmur_module is not None and getattr(murmur_module, "APP_INSTANCE", None) is not None:
-            murmur_module.APP_INSTANCE.history = []
-            murmur_module.APP_INSTANCE.save_history()
+        app_config = sys.modules.get("app.config")
+        running = getattr(app_config, "APP_INSTANCE", None) if app_config is not None else None
+        if running is not None:
+            running.history = []
+            running.save_history()
 
         self._reload_history_list()
 

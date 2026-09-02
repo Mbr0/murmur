@@ -7,18 +7,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from murmur import (
+import numpy as np
+
+from app.config import (
     APP_CATALOG,
     APP_VERSION,
     AUDIO_DIR,
-    HISTORY_ORIGIN_BY_ENGINE,
-    SM_STATUS_ENABLED,
-    LaunchAtLoginUnavailable,
-    MurmurApp,
-    apply_launch_at_login,
-    history_origin_for,
-    launch_at_login_enabled,
-    login_item_service,
+)
+from app.decisions import (
+    ACCOUNT_STATUS_FREE,
+    ACCOUNT_STATUS_NOT_SAVED,
+    ACCOUNT_STATUS_PRO,
+    ACCOUNT_STATUS_PRO_GRACE,
     CLEANUP_DOWNLOAD_MENU_TITLE,
     CLEANUP_MODEL_MISSING_REASON,
     CLEANUP_NOTICE_NOTIFY,
@@ -32,90 +32,105 @@ from murmur import (
     CLEANUP_START_FAILED_REASON,
     CLEANUP_STOPPING_REASON,
     CLEANUP_UNSTABLE_REASON,
-    MODE_MENU_AUTOMATIC,
-    ACCOUNT_STATUS_FREE,
-    ACCOUNT_STATUS_NOT_SAVED,
-    ACCOUNT_STATUS_PRO,
-    ACCOUNT_STATUS_PRO_GRACE,
+    CleanupPlan,
     ENTITLEMENT_REFRESH_INTERVAL_S,
     ENTITLEMENT_RETRY_BASE_S,
     ENTITLEMENT_RETRY_MAX_S,
     FREE_MODE_ID,
+    HISTORY_ORIGIN_BY_ENGINE,
+    LaunchAtLoginUnavailable,
+    MISSING_MODEL_ONBOARDING,
+    MISSING_MODEL_SETTINGS,
+    MODE_MENU_AUTOMATIC,
     NOTICE_KEY_FAILED,
     NOTICE_KEY_RATE_LIMITED,
     NOTICE_KEY_REJECTED,
-    SIGN_IN_MENU_TITLE,
-    CleanupPlan,
-    CleanupRuntime,
+    NO_MODEL_STATUS,
+    QUIT_BUDGET_S,
+    QUIT_STEPS,
+    RELOAD_BUSY,
+    RELOAD_RECORDING,
+    RELOAD_START,
+    RELOAD_UNCHANGED,
     RemoteEngineKey,
-    UsageConfigStore,
+    SIGN_IN_MENU_TITLE,
+    SM_STATUS_ENABLED,
+    about_menu_title,
     account_menu_title,
     after_byok_failure,
+    apply_launch_at_login,
     byok_provider_name,
-    next_refresh_delay,
-    pinned_cloud_config,
-    configured_mode_id,
-    expand_gated_snippets,
-    gated_vocabulary,
-    lease_is_present,
-    notice_to_show,
-    own_key_present,
-    publish_entitlements,
-    remote_engine_key,
-    resolve_plan_mode,
-    should_consume_trial,
-    should_refresh_allowance,
-    should_refresh_entitlements,
     cleanup_download_menu_enabled,
     cleanup_model_missing_message,
     cleanup_notice_kind,
     cleanup_plan,
     cleanup_skipped_message,
     code_transform_language,
-    language_is_auto,
-    mode_menu_state,
-    paste_and_settle,
-    prompt_language,
-    reapply_replacements,
-    run_cleanup,
-    should_offer_cleanup_download,
-    should_prewarm_cleanup,
-    stream_text_for_token,
-    tone_menu_state,
-    MISSING_MODEL_ONBOARDING,
-    MISSING_MODEL_SETTINGS,
-    NO_MODEL_STATUS,
-    RELOAD_BUSY,
-    RELOAD_RECORDING,
-    RELOAD_START,
-    RELOAD_UNCHANGED,
-    about_menu_title,
-    clear_mic_device_selection,
+    configured_mode_id,
     download_progress_status,
     engine_is_ready,
+    expand_gated_snippets,
     finalize_transcript,
+    gated_vocabulary,
+    hints_notice_changes,
     hints_notice_message,
+    history_origin_for,
+    hotkey_registration_key,
+    language_is_auto,
+    launch_at_login_enabled,
+    lease_is_present,
+    login_item_service,
+    mic_selection_changes,
     missing_model_action,
+    mode_menu_state,
     model_integrity_message,
     model_status_title,
     model_unavailable_message,
+    next_refresh_delay,
+    notice_to_show,
+    own_key_present,
+    paste_and_settle,
+    pinned_cloud_config,
+    prompt_language,
+    publish_entitlements,
     push_to_talk_degraded_message,
+    quit_time_remaining,
+    reapply_replacements,
     reload_engine_decision,
-    remember_hints_notice,
+    remote_engine_key,
     resolve_engine_selection,
     resolve_mic_device,
     resolve_mic_device_index,
+    resolve_plan_mode,
+    run_cleanup,
     should_apply_ready_on_reset,
+    should_consume_trial,
+    should_offer_cleanup_download,
+    should_prewarm_cleanup,
+    should_refresh_allowance,
+    should_refresh_entitlements,
     should_reject_toggle,
     should_reject_upload,
     should_relaunch_after_install,
+    should_reregister_hotkey,
     should_show_hints_notice,
-    skip_audio_user_message,
     should_toggle_for_press_action,
+    skip_audio_user_message,
+    stream_text_for_token,
+    tone_menu_state,
     update_available_message,
     update_installed_message,
     update_relaunch_failed_message,
     verify_model_before_load,
+)
+from app.services import (
+    UsageConfigStore,
+)
+from app.pipeline import (
+    CleanupRuntime,
+)
+from app.lifecycle import (
+    MurmurApp,
 )
 from cleanup.context import AppContext
 from cleanup.llama_server import CLEANUP_MODEL_SPEC, CleanupResult, LlamaServerError
@@ -159,6 +174,8 @@ from services.hotkey_service import (
     HOTKEY_MODE_AUTO,
     HOTKEY_MODE_HOLD,
     HOTKEY_MODE_TOGGLE,
+    SPACE_KEYCODE,
+    HotkeyBinding,
 )
 from ui.onboarding_window import CONFIG_KEY_COMPLETED, CONFIG_KEY_VERSION, ONBOARDING_VERSION
 
@@ -265,13 +282,19 @@ class MicDeviceConfigTests(unittest.TestCase):
         devices = {0: "Built-in Mic", 1: "USB Mic"}
         self.assertEqual(resolve_mic_device(1, None, devices), 1)
 
-    def test_clear_mic_device_selection(self):
-        cleared = clear_mic_device_selection(
-            {"mic_device_index": 2, "mic_device_name": "USB Mic", "model": "base"}
+    def test_mic_selection_changes_carry_only_the_two_mic_keys(self):
+        # A changes dict for update_config, not a config: writing a whole
+        # config here reverted whatever the app saved while the menu was open.
+        self.assertEqual(
+            mic_selection_changes(2, "USB Mic"),
+            {"mic_device_index": 2, "mic_device_name": "USB Mic"},
         )
-        self.assertIsNone(cleared["mic_device_index"])
-        self.assertIsNone(cleared["mic_device_name"])
-        self.assertEqual(cleared["model"], "base")
+
+    def test_mic_selection_changes_clear_a_device_that_is_gone(self):
+        self.assertEqual(
+            mic_selection_changes(None, None),
+            {"mic_device_index": None, "mic_device_name": None},
+        )
 
 
 class SkipAudioMessageTests(unittest.TestCase):
@@ -455,24 +478,562 @@ class HintsNoticeTests(unittest.TestCase):
         )
 
     def test_remembering_it_stops_the_second_showing(self):
-        config = remember_hints_notice({}, "voxtral_mlx")
+        changes = hints_notice_changes({}, "voxtral_mlx")
         self.assertFalse(
-            should_show_hints_notice(config, "voxtral_mlx", hints_applied=False, has_terms=True)
+            should_show_hints_notice(changes, "voxtral_mlx", hints_applied=False, has_terms=True)
         )
 
-    def test_remembering_is_per_engine_and_does_not_mutate(self):
+    def test_remembering_writes_one_key_and_does_not_mutate(self):
+        # Only ``hints_notice_shown`` comes back: this is handed to
+        # update_config, and a whole config here would revert the engine the
+        # app swapped to during the dictation that raised the notice.
         original = {"vocabulary_terms": ["Boske"]}
-        config = remember_hints_notice(original, "voxtral_mlx")
+        changes = hints_notice_changes(original, "voxtral_mlx")
+        self.assertEqual(changes, {"hints_notice_shown": {"voxtral_mlx": True}})
         self.assertNotIn("hints_notice_shown", original)
-        self.assertEqual(config["vocabulary_terms"], ["Boske"])
+
+    def test_remembering_is_per_engine_and_keeps_the_other_answers(self):
+        changes = hints_notice_changes({"hints_notice_shown": {"whispercpp": True}}, "voxtral_mlx")
+        self.assertEqual(
+            changes["hints_notice_shown"], {"whispercpp": True, "voxtral_mlx": True}
+        )
         self.assertTrue(
-            should_show_hints_notice(config, "whispercpp", hints_applied=False, has_terms=True)
+            should_show_hints_notice(
+                {"hints_notice_shown": {"voxtral_mlx": True}},
+                "whispercpp",
+                hints_applied=False,
+                has_terms=True,
+            )
         )
 
     def test_notice_names_the_engine_and_nothing_else(self):
         message = hints_notice_message("whisper.cpp")
         self.assertIn("whisper.cpp", message)
         self.assertIn("Vocabulary hints", message)
+
+
+class HotkeyRegistrationIdempotenceTests(unittest.TestCase):
+    """Registering the same shortcut twice is a bug, not a refresh.
+
+    Launch used to do it every single time: the 0.3 s startup timer and
+    ``applicationDidBecomeActive`` both reach ``reload_hotkey``, so whichever
+    landed second tore down a working Carbon registration and made the very
+    same one again — two registrations, the "cannot deliver key-up" warning
+    twice in every log, and the press controller's state dropped underneath a
+    key that might already be down.
+    """
+
+    HOLD = HotkeyBinding(keycode=SPACE_KEYCODE, option=True)
+    OTHER = HotkeyBinding(keycode=SPACE_KEYCODE, control=True)
+
+    def test_nothing_registered_yet_always_registers(self):
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO)
+        self.assertTrue(should_reregister_hotkey(None, desired, registered=False))
+
+    def test_a_live_registration_of_the_same_binding_and_mode_is_left_alone(self):
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO, key_up_available=True)
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO)
+        self.assertFalse(should_reregister_hotkey(active, desired, registered=True))
+
+    def test_a_changed_binding_registers_again(self):
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO, key_up_available=True)
+        desired = hotkey_registration_key(self.OTHER, HOTKEY_MODE_AUTO)
+        self.assertTrue(should_reregister_hotkey(active, desired, registered=True))
+
+    def test_a_changed_mode_registers_again(self):
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_TOGGLE, key_up_available=True)
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_HOLD)
+        self.assertTrue(should_reregister_hotkey(active, desired, registered=True))
+
+    def test_a_degraded_registration_is_retried(self):
+        """Enable Shortcut Permission… grants Accessibility and reloads. The
+        binding has not moved, but the registration is missing the key-up the
+        mode needs, so this is the one unchanged binding worth registering
+        again."""
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_HOLD, key_up_available=False)
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_HOLD)
+        self.assertTrue(should_reregister_hotkey(active, desired, registered=True))
+
+    def test_toggle_never_counts_as_degraded(self):
+        # ``toggle`` never asked for key-up, so its absence changes nothing.
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_TOGGLE, key_up_available=False)
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_TOGGLE)
+        self.assertFalse(should_reregister_hotkey(active, desired, registered=True))
+
+    def test_a_registration_the_app_lost_track_of_registers_again(self):
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO)
+        self.assertTrue(should_reregister_hotkey(None, desired, registered=True))
+
+    def test_a_registration_that_went_away_registers_again(self):
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO, key_up_available=True)
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO)
+        self.assertTrue(should_reregister_hotkey(active, desired, registered=False))
+
+
+class QuitOrderTests(unittest.TestCase):
+    """Quitting is bounded, and the order is the whole of it.
+
+    Every step frees something that outlives the process if it is skipped — a
+    2 GB child, a Carbon hotkey, a floating panel — and one of them can block.
+    So the order is a table and the waiting has a ceiling.
+    """
+
+    def test_the_order_is_the_one_the_teardown_needs(self):
+        self.assertEqual(
+            QUIT_STEPS,
+            (
+                "cancel_stream_workers",
+                "stop_cleanup_runtime",
+                "close_pill",
+                "unload_engine",
+                "unregister_hotkey",
+            ),
+        )
+
+    def test_the_stream_workers_are_told_to_stop_before_the_engine_is_unloaded(self):
+        # A live decoder is inside engine.stream(). Unloading under it is a
+        # crash in native code, not an exception.
+        steps = list(QUIT_STEPS)
+        self.assertLess(steps.index("cancel_stream_workers"), steps.index("unload_engine"))
+
+    def test_the_whole_quit_is_bounded(self):
+        self.assertLessEqual(QUIT_BUDGET_S, 3.0)
+
+    def test_the_budget_is_what_is_left_of_it(self):
+        self.assertAlmostEqual(quit_time_remaining(0.0), QUIT_BUDGET_S)
+        self.assertAlmostEqual(quit_time_remaining(1.0), QUIT_BUDGET_S - 1.0)
+
+    def test_a_spent_budget_never_waits_again(self):
+        self.assertEqual(quit_time_remaining(QUIT_BUDGET_S), 0.0)
+        self.assertEqual(quit_time_remaining(600.0), 0.0)
+
+
+class ReloadHotkeyTests(unittest.TestCase):
+    """``reload_hotkey`` wired to the decision, not just the decision.
+
+    Both launch callers reach it within the first second, so the skip has to
+    happen in the method itself; the log cannot show it, because the line that
+    would say so is below the level a release build records.
+    """
+
+    def _app(self, config=None):
+        app = SimpleNamespace(
+            _hotkey_registration=None,
+            _registered_hotkey=None,
+            _press_controller=None,
+            _hotkey_permission_notified=False,
+            _push_to_talk_degraded_notified=False,
+            runtime_config=lambda: dict(config or {"hotkey_mode": HOTKEY_MODE_AUTO}),
+            run_on_main_thread=lambda func: func(),
+            _stop_hotkey_retry=lambda: None,
+        )
+        app._live_hotkey_key = lambda binding, mode: MurmurApp._live_hotkey_key(
+            app, binding, mode
+        )
+        app._apply_key_up_availability = lambda mode: MurmurApp._apply_key_up_availability(
+            app, mode
+        )
+        app.reload_hotkey = lambda **kwargs: MurmurApp.reload_hotkey(app, **kwargs)
+        app._on_application_active = lambda: MurmurApp._on_application_active(app)
+        return app
+
+    def _registration(self, *, key_up_available=True):
+        from services.hotkey_service import HotkeyRegistration
+
+        return HotkeyRegistration(
+            unregister_fn=lambda: None, key_up_available=key_up_available
+        )
+
+    def test_the_second_launch_caller_does_not_register_the_same_shortcut_again(self):
+        app = self._app()
+        with patch(
+            "app.lifecycle.register_global_hotkey", return_value=self._registration()
+        ) as register:
+            with patch("app.lifecycle.unregister_global_hotkey") as unregister:
+                app.reload_hotkey(prompt=True)  # the 0.3 s startup timer
+                app.reload_hotkey(prompt=False)  # applicationDidBecomeActive
+        self.assertEqual(register.call_count, 1)
+        # And the working registration was never torn down to be remade.
+        self.assertEqual(
+            [call for call in unregister.call_args_list if call.args[0] is not None], []
+        )
+
+    def test_a_changed_shortcut_still_replaces_the_old_one(self):
+        app = self._app()
+        with patch(
+            "app.lifecycle.register_global_hotkey", return_value=self._registration()
+        ) as register:
+            with patch("app.lifecycle.unregister_global_hotkey") as unregister:
+                app.reload_hotkey()
+                app.runtime_config = lambda: {
+                    "hotkey_mode": HOTKEY_MODE_AUTO,
+                    "hotkey_keycode": 11,
+                }
+                app.reload_hotkey()
+        self.assertEqual(register.call_count, 2)
+        self.assertTrue(unregister.called)
+
+    def test_a_degraded_shortcut_is_registered_again_once_accessibility_lands(self):
+        """What Enable Shortcut Permission… is for: the binding has not moved,
+        but the registration is missing the key-up that ``auto`` needs.
+
+        The upgrade has to arrive through the production trigger — the user
+        granting Accessibility and coming back to Murmur — and not through a
+        hand-called ``reload_hotkey``. ``_on_application_active`` used to skip
+        every registration it already had, so a Carbon-only shortcut stayed
+        stuck on toggle until the next launch.
+        """
+        app = self._app()
+        registrations = [
+            self._registration(key_up_available=False),
+            self._registration(key_up_available=True),
+        ]
+        with patch(
+            "app.lifecycle.register_global_hotkey", side_effect=registrations
+        ) as register:
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                with patch("app.lifecycle.rumps.notification"):
+                    with patch("app.lifecycle.hotkey_permissions_ok", return_value=True):
+                        app.reload_hotkey()  # launch: Carbon, no key-up
+                        app._on_application_active()  # the grant lands
+        self.assertEqual(register.call_count, 2)
+
+    def test_returning_to_murmur_leaves_a_working_shortcut_alone(self):
+        """The other half of the same guard: activation happens constantly, and
+        re-registering a healthy shortcut costs a duplicate Carbon hotkey and a
+        press controller reset under a key that may be held down."""
+        app = self._app()
+        with patch(
+            "app.lifecycle.register_global_hotkey", return_value=self._registration()
+        ) as register:
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                with patch("app.lifecycle.hotkey_permissions_ok", return_value=True):
+                    app.reload_hotkey()
+                    app._on_application_active()
+                    app._on_application_active()
+        self.assertEqual(register.call_count, 1)
+
+    def test_returning_without_the_permission_registers_nothing(self):
+        app = self._app()
+        with patch("app.lifecycle.register_global_hotkey") as register:
+            with patch("app.lifecycle.hotkey_permissions_ok", return_value=False):
+                app._on_application_active()
+        self.assertFalse(register.called)
+
+
+class WizardCaptureInterlockTests(unittest.TestCase):
+    """The wizard and the pipeline cannot both hold the microphone.
+
+    ``_record_test_sentence`` is the onboarding wizard's own five seconds. It
+    runs the same microphone and the same engine as a dictation, so the two
+    are kept apart by the flags the rest of the app already reads: it refuses
+    to start while one is in flight, and it marks the app busy for its whole
+    duration so a hotkey press during the wizard is refused rather than opening
+    a second input stream — or unloading the engine mid-transcription.
+    """
+
+    def _app(self, *, is_recording=False, is_processing=False, transcribe=None):
+        engine = SimpleNamespace(
+            is_loaded=True,
+            transcribe=transcribe or (lambda path, language=None: SimpleNamespace(text="hi")),
+        )
+        return SimpleNamespace(
+            is_recording=is_recording,
+            is_processing=is_processing,
+            engine=engine,
+            _engine_lock=threading.Lock(),
+        )
+
+    def _capture(self, chunks, *, on_start=None):
+        class FakeCapture:
+            def __init__(self, sample_rate=None, logger=None):
+                self.chunks = chunks
+
+            def start(self):
+                if on_start is not None:
+                    on_start()
+
+            def stop(self):
+                pass
+
+        return FakeCapture
+
+    def test_it_refuses_while_a_dictation_is_recording(self):
+        app = self._app(is_recording=True)
+        with patch("app.lifecycle.AudioCaptureService") as capture:
+            with self.assertRaises(RuntimeError):
+                MurmurApp._record_test_sentence(app)
+        self.assertFalse(capture.called)  # the second stream is never opened
+
+    def test_it_refuses_while_a_transcription_is_running(self):
+        app = self._app(is_processing=True)
+        with patch("app.lifecycle.AudioCaptureService") as capture:
+            with self.assertRaises(RuntimeError):
+                MurmurApp._record_test_sentence(app)
+        self.assertFalse(capture.called)
+
+    def test_it_marks_the_app_busy_for_its_whole_duration(self):
+        app = self._app()
+        busy_while_capturing = []
+        capture = self._capture(
+            [np.zeros(16, dtype=np.float32)],
+            on_start=lambda: busy_while_capturing.append(app.is_processing),
+        )
+        with patch("app.lifecycle.AudioCaptureService", capture):
+            with patch("app.lifecycle.time.sleep", lambda _s: None):
+                self.assertEqual(MurmurApp._record_test_sentence(app), "hi")
+        # A hotkey press landing here is refused by the flag the wizard set.
+        self.assertEqual(busy_while_capturing, [True])
+        self.assertTrue(
+            should_reject_toggle(loading=False, is_processing=True, model_ready=True)
+        )
+        self.assertFalse(app.is_processing)  # and released afterwards
+
+    def test_the_busy_flag_is_released_when_the_engine_raises(self):
+        def boom(_path, language=None):
+            raise EngineError("no")
+
+        app = self._app(transcribe=boom)
+        capture = self._capture([np.zeros(16, dtype=np.float32)])
+        with patch("app.lifecycle.AudioCaptureService", capture):
+            with patch("app.lifecycle.time.sleep", lambda _s: None):
+                with self.assertRaises(EngineError):
+                    MurmurApp._record_test_sentence(app)
+        self.assertFalse(app.is_processing)
+
+    def test_an_unloaded_engine_is_refused_before_the_microphone_opens(self):
+        app = self._app()
+        app.engine = None
+        with patch("app.lifecycle.AudioCaptureService") as capture:
+            with self.assertRaises(RuntimeError):
+                MurmurApp._record_test_sentence(app)
+        self.assertFalse(capture.called)
+        self.assertFalse(app.is_processing)
+
+
+class QuitTeardownTests(unittest.TestCase):
+    """``quit_app`` walks the table, and one broken step does not stop it."""
+
+    def _app(self, *, seen, engine=None, breaks=()):
+        cancelled = threading.Event()
+        app = SimpleNamespace(
+            engine=engine,
+            _engine_lock=threading.Lock(),
+            _stream_lock=threading.Lock(),
+            _stream_cancelled=cancelled,
+            _stream_workers=[],
+            _stream_thread=None,
+            _stream_token=None,
+            _hotkey_registration=object(),
+            _registered_hotkey=("binding", "auto", True),
+        )
+
+        def step(name):
+            def run():
+                seen.append(name)
+                if name in breaks:
+                    raise RuntimeError(f"{name} failed")
+
+            return run
+
+        app.cleanup_runtime = SimpleNamespace(stop=step("stop_cleanup_runtime"))
+        app.pill = SimpleNamespace(close=step("close_pill"))
+        app._stream_worker_alive = lambda: MurmurApp._stream_worker_alive(app)
+        app._cancel_stream_workers_for_quit = lambda budget_s: (
+            seen.append("cancel_stream_workers"),
+            MurmurApp._cancel_stream_workers_for_quit(app, budget_s),
+        )
+        app._unload_engine_for_quit = lambda: (
+            seen.append("unload_engine"),
+            MurmurApp._unload_engine_for_quit(app),
+        )
+        app._unregister_hotkey_for_quit = lambda: (
+            seen.append("unregister_hotkey"),
+            MurmurApp._unregister_hotkey_for_quit(app),
+        )
+        return app, cancelled
+
+    def test_every_step_runs_in_the_table_order(self):
+        seen = []
+        app, cancelled = self._app(seen=seen)
+        with patch("app.lifecycle.rumps.quit_application") as quit_application:
+            with patch("app.lifecycle.unregister_global_hotkey") as unregister:
+                MurmurApp.quit_app(app, None)
+        self.assertEqual(seen, list(QUIT_STEPS))
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(unregister.called)
+        self.assertTrue(quit_application.called)
+
+    def test_a_step_that_raises_does_not_strand_the_ones_after_it(self):
+        seen = []
+        app, _ = self._app(seen=seen, breaks=("stop_cleanup_runtime", "close_pill"))
+        with patch("app.lifecycle.rumps.quit_application") as quit_application:
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                MurmurApp.quit_app(app, None)
+        self.assertEqual(seen, list(QUIT_STEPS))
+        self.assertTrue(quit_application.called)
+
+    def test_the_model_is_given_back(self):
+        unloaded = []
+        engine = SimpleNamespace(unload=lambda: unloaded.append(True))
+        app, _ = self._app(seen=[], engine=engine)
+        with patch("app.lifecycle.rumps.quit_application"):
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                MurmurApp.quit_app(app, None)
+        self.assertEqual(unloaded, [True])
+        self.assertIsNone(app.engine)
+
+    def test_a_busy_engine_is_left_to_the_exiting_process(self):
+        """The engine lock is held for a whole transcription. Waiting for it
+        here is what a user reads as "Quit did nothing"."""
+        unloaded = []
+        engine = SimpleNamespace(unload=lambda: unloaded.append(True))
+        app, _ = self._app(seen=[], engine=engine)
+        app._engine_lock.acquire()
+        try:
+            with patch("app.lifecycle.rumps.quit_application"):
+                with patch("app.lifecycle.unregister_global_hotkey"):
+                    MurmurApp.quit_app(app, None)
+        finally:
+            app._engine_lock.release()
+        self.assertEqual(unloaded, [])
+
+    def test_a_decoder_that_will_not_stop_is_abandoned_inside_the_budget(self):
+        forever = threading.Event()
+        worker = threading.Thread(target=forever.wait, daemon=True)
+        worker.start()
+        try:
+            app, _ = self._app(seen=[])
+            app._stream_workers = [worker]
+            started = time.monotonic()
+            with patch("app.lifecycle.rumps.quit_application"):
+                with patch("app.lifecycle.unregister_global_hotkey"):
+                    MurmurApp.quit_app(app, None)
+            self.assertLess(time.monotonic() - started, QUIT_BUDGET_S + 1.0)
+        finally:
+            forever.set()
+            worker.join(1.0)
+
+    def test_an_abandoned_decoder_stays_on_the_books(self):
+        """The cancel step used to empty ``_stream_workers`` whether or not the
+        workers had stopped, so the unload step that follows it could no longer
+        tell that one was still inside ``engine.stream()``."""
+        forever = threading.Event()
+        worker = threading.Thread(target=forever.wait, daemon=True)
+        worker.start()
+        try:
+            app, _ = self._app(seen=[])
+            app._stream_workers = [worker]
+            # Budget already spent: nothing is joined, everything is abandoned.
+            MurmurApp._cancel_stream_workers_for_quit(app, 0.0)
+            self.assertTrue(app._stream_worker_alive())
+        finally:
+            forever.set()
+            worker.join(1.0)
+
+    def test_the_model_is_not_unloaded_under_an_abandoned_decoder(self):
+        """Past the budget a decoder is abandoned, not stopped — it is still
+        reading the model. ``unload()`` there is a crash in native code;
+        leaking a model the exiting process is about to free is not."""
+        unloaded = []
+        engine = SimpleNamespace(unload=lambda: unloaded.append(True))
+        app, _ = self._app(seen=[], engine=engine)
+        app._stream_worker_alive = lambda: True
+        MurmurApp._unload_engine_for_quit(app)
+        self.assertEqual(unloaded, [])
+        self.assertIsNone(app.engine)
+
+    def test_an_idle_engine_is_still_unloaded(self):
+        unloaded = []
+        engine = SimpleNamespace(unload=lambda: unloaded.append(True))
+        app, _ = self._app(seen=[], engine=engine)
+        app._stream_worker_alive = lambda: False
+        MurmurApp._unload_engine_for_quit(app)
+        self.assertEqual(unloaded, [True])
+
+    def test_a_quit_before_the_app_finished_starting_still_quits(self):
+        """The steps table bound ``self.cleanup_runtime.stop`` and
+        ``self.pill.close`` eagerly, so a quit before ``__init__`` had made
+        either of them raised ``AttributeError`` while the table was being
+        built — before ``rumps.quit_application()``. The menu's Quit did
+        nothing at all."""
+        seen = []
+        app, _ = self._app(seen=seen)
+        del app.cleanup_runtime
+        del app.pill
+        with patch("app.lifecycle.rumps.quit_application") as quit_application:
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                MurmurApp.quit_app(app, None)
+        self.assertTrue(quit_application.called)
+        # The steps that could run, ran.
+        self.assertIn("cancel_stream_workers", seen)
+        self.assertIn("unregister_hotkey", seen)
+
+    def test_the_blocking_step_is_handed_what_is_left_of_the_budget(self):
+        budgets = []
+        app, _ = self._app(seen=[])
+        app._cancel_stream_workers_for_quit = lambda budget_s: budgets.append(budget_s)
+        with patch("app.lifecycle.rumps.quit_application"):
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                MurmurApp.quit_app(app, None)
+        self.assertEqual(len(budgets), 1)
+        self.assertGreater(budgets[0], 0.0)
+        self.assertLessEqual(budgets[0], QUIT_BUDGET_S)
+
+
+class StreamingCapabilityTests(unittest.TestCase):
+    """``start_recording`` asks the engine whether it can stream — defensively.
+
+    The capability is read off the engine object rather than its id, and the
+    read has to survive an engine that predates the attribute: raising here
+    happens *before* the microphone is opened, so it costs the whole recording
+    rather than just the live pill.
+    """
+
+    def _app(self, engine, *, pill_enabled=True):
+        opened = []
+        pill = SimpleNamespace(listening=lambda: opened.append("listening"))
+        app = SimpleNamespace(
+            engine=engine,
+            pill=pill,
+            is_recording=False,
+            recording_start_time=0.0,
+            _stream_thread=object(),
+            runtime_config=lambda: {"pill_enabled": pill_enabled},
+            _set_menu_bar_state=lambda state: opened.append(f"state:{state}"),
+            start_stop_item=SimpleNamespace(title=""),
+            upload_item=SimpleNamespace(set_callback=lambda callback: None),
+            audio_capture=SimpleNamespace(
+                enable_streaming=lambda enabled: opened.append(f"streaming:{enabled}"),
+                start=lambda: opened.append("start"),
+            ),
+        )
+        app._active_pill = lambda config=None: MurmurApp._active_pill(app, config)
+        app._start_stream_worker = lambda pill_, language=None, hints=None: opened.append(
+            "worker"
+        )
+        return app, opened
+
+    def test_an_engine_without_the_attribute_still_opens_the_microphone(self):
+        app, opened = self._app(SimpleNamespace(is_loaded=True))
+        MurmurApp.start_recording(app)
+        self.assertIn("streaming:False", opened)
+        self.assertIn("start", opened)
+        self.assertNotIn("worker", opened)
+        self.assertTrue(app.is_recording)
+
+    def test_an_engine_that_says_no_gets_no_live_decode(self):
+        app, opened = self._app(SimpleNamespace(is_loaded=True, supports_streaming=False))
+        MurmurApp.start_recording(app)
+        self.assertIn("streaming:False", opened)
+        self.assertNotIn("worker", opened)
+
+    def test_an_engine_that_says_yes_gets_one(self):
+        app, opened = self._app(SimpleNamespace(is_loaded=True, supports_streaming=True))
+        with patch("app.pipeline.front_app_bundle_id", return_value=None):
+            MurmurApp.start_recording(app)
+        self.assertIn("streaming:True", opened)
+        self.assertIn("worker", opened)
 
 
 class AboutAndUpdateCopyTests(unittest.TestCase):
@@ -719,7 +1280,7 @@ class FreeTierTestCase(GateTestCase):
 
 
 class ProGateCallSiteTests(GateTestCase):
-    """One gate, and every place in ``murmur.py`` that asks it something.
+    """One gate, and every place in ``app/`` that asks it something.
 
     The gate itself is :mod:`services.license_service`'s and is tested there.
     What is tested here is that each gated feature is actually asked about at
@@ -730,8 +1291,14 @@ class ProGateCallSiteTests(GateTestCase):
     def test_the_gate_is_the_licensed_one(self):
         # Not a config key, not a local copy: a second opinion about what "Pro"
         # means is exactly the bug the single gate exists to prevent.
-        source = (Path(__file__).resolve().parent.parent / "murmur.py").read_text(
-            encoding="utf-8"
+        #
+        # Read over the whole app package since Wave 5: the gate used to live in
+        # one file, and a second opinion introduced in any of the six that
+        # replaced it would be the same bug.
+        root = Path(__file__).resolve().parent.parent
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [root / "murmur.py", *sorted((root / "app").glob("*.py"))]
         )
         self.assertNotIn("pro_override_for_dev", source)
         self.assertNotIn("def pro_enabled", source)
@@ -748,7 +1315,7 @@ class ProGateCallSiteTests(GateTestCase):
 
     def test_without_context_the_configured_mode_applies_everywhere(self):
         self.publish(pro=True)
-        with patch("murmur.is_pro_feature_enabled", lambda f: f != "context"):
+        with patch("app.decisions.is_pro_feature_enabled", lambda f: f != "context"):
             mode = resolve_plan_mode(
                 _config(cleanup_mode="notes", context_awareness=True),
                 _context("com.apple.mail"),
@@ -873,7 +1440,7 @@ class UserDataInLogsTests(GateTestCase):
     SECRET = "my-private-snippet-body"
 
     def test_an_unreadable_cleanup_mode_logs_the_type_only(self):
-        with patch("murmur.mode_from_config", side_effect=ValueError(self.SECRET)):
+        with patch("app.decisions.mode_from_config", side_effect=ValueError(self.SECRET)):
             with self.assertLogs("murmur", level="WARNING") as caught:
                 self.assertEqual(configured_mode_id(_config()), FREE_MODE_ID)
 
@@ -1908,7 +2475,7 @@ class SettingsServicesTests(GateTestCase):
         app = SimpleNamespace(
             persistence=object(), _keychain_probed=False, _keychain_store=None
         )
-        with patch("murmur.KeychainStore", Unavailable):
+        with patch("app.services.KeychainStore", Unavailable):
             services = MurmurApp._settings_services(
                 SimpleNamespace(
                     persistence=app.persistence,
@@ -1930,7 +2497,7 @@ class KeychainProbeTests(unittest.TestCase):
                 raise KeychainUnavailable("no Security framework")
 
         app = SimpleNamespace(_keychain_probed=False, _keychain_store=None)
-        with patch("murmur.KeychainStore", Unavailable):
+        with patch("app.services.KeychainStore", Unavailable):
             store = MurmurApp._keychain(app)
 
         self.assertIsNone(store)
@@ -1949,7 +2516,7 @@ class KeychainProbeTests(unittest.TestCase):
                         raise _error
 
                 app = SimpleNamespace(_keychain_probed=False, _keychain_store=None)
-                with patch("murmur.KeychainStore", Exploding):
+                with patch("app.services.KeychainStore", Exploding):
                     with self.assertLogs("murmur", level="WARNING") as captured:
                         store = MurmurApp._keychain(app)
 
@@ -1966,7 +2533,7 @@ class KeychainProbeTests(unittest.TestCase):
                 made.append(self)
 
         app = SimpleNamespace(_keychain_probed=False, _keychain_store=None)
-        with patch("murmur.KeychainStore", Fine):
+        with patch("app.services.KeychainStore", Fine):
             first = MurmurApp._keychain(app)
             second = MurmurApp._keychain(app)
 
@@ -2208,7 +2775,7 @@ class SetLaunchAtLoginTests(unittest.TestCase):
         service = _BridgedAppService(ok=False)
         app = SimpleNamespace(_login_item_service=service)
 
-        with patch("murmur.ui_alerts.show_alert") as alert:
+        with patch("ui.alerts.show_alert") as alert:
             state = MurmurApp.set_launch_at_login(app, True)
 
         self.assertFalse(state)
@@ -2774,7 +3341,7 @@ class SessionNoticeTests(GateTestCase):
         app = self._app()
         shown = []
 
-        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+        with patch("app.pipeline.rumps.notification", lambda *a: shown.append(a[-1])):
             MurmurApp._announce_route(app, "Your Mistral key was rejected", once_key="k")
             MurmurApp._announce_route(app, "Your Mistral key was rejected", once_key="k")
 
@@ -2784,7 +3351,7 @@ class SessionNoticeTests(GateTestCase):
         app = self._app()
         shown = []
 
-        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+        with patch("app.pipeline.rumps.notification", lambda *a: shown.append(a[-1])):
             MurmurApp._announce_route(app, "rejected", once_key="byok key rejected")
             MurmurApp._announce_route(app, "rate limited", once_key="byok rate limited")
 
@@ -2794,7 +3361,7 @@ class SessionNoticeTests(GateTestCase):
         app = self._app()
         shown = []
 
-        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+        with patch("app.pipeline.rumps.notification", lambda *a: shown.append(a[-1])):
             MurmurApp._announce_route(app, NOTICE_SIGN_IN)
             MurmurApp._announce_route(app, NOTICE_SIGN_IN)
 
@@ -2827,7 +3394,7 @@ class RouteNoticeTests(GateTestCase):
         shown = []
         app = SimpleNamespace(usage=usage)
 
-        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+        with patch("app.pipeline.rumps.notification", lambda *a: shown.append(a[-1])):
             MurmurApp._announce_route(app, ALLOWANCE_MESSAGE)
             MurmurApp._announce_route(app, ALLOWANCE_MESSAGE)
 
@@ -3052,7 +3619,7 @@ class CloudCleanupSelectionTests(GateTestCase):
         pill = SimpleNamespace(working=lambda label=None: labels.append(label))
         config = _config(cleanup_mode="message")
 
-        with patch("murmur.capture_context", lambda include_selection=False: _context()):
+        with patch("app.pipeline.capture_context", lambda include_selection=False: _context()):
             MurmurApp._clean_up_transcript(
                 app, "hello", config, "en", vocabulary_from_config(config), pill
             )
@@ -3125,7 +3692,7 @@ class RemoteEngineCacheTests(unittest.TestCase):
 
         app = self._app()
         config = _config()
-        with patch("murmur.build_engine", build):
+        with patch("app.pipeline.build_engine", build):
             first = MurmurApp._remote_engine_for(app, ENGINE_CLOUD, config)
             second = MurmurApp._remote_engine_for(app, ENGINE_CLOUD, config)
 
@@ -3140,7 +3707,7 @@ class RemoteEngineCacheTests(unittest.TestCase):
             return _FakeEngine(engine_id)
 
         app = self._app()
-        with patch("murmur.build_engine", build):
+        with patch("app.pipeline.build_engine", build):
             MurmurApp._remote_engine_for(app, ENGINE_BYOK, _config(byok_provider="mistral"))
             MurmurApp._remote_engine_for(app, ENGINE_BYOK, _config(byok_provider="openai"))
 
@@ -3202,7 +3769,7 @@ class PinnedProxyOriginTests(unittest.TestCase):
             seen.append(kwargs["config"].get(CONFIG_CLOUD_BASE_URL))
             return _FakeEngine(engine_id)
 
-        with patch("murmur.build_engine", build):
+        with patch("app.pipeline.build_engine", build):
             MurmurApp._remote_engine_for(
                 app, ENGINE_CLOUD, _config(cloud_base_url=self.ELSEWHERE)
             )
@@ -3218,7 +3785,7 @@ class PinnedProxyOriginTests(unittest.TestCase):
             def __init__(self, base_url, lease_provider):
                 seen.append(base_url)
 
-        with patch("murmur.CloudCleanupClient", Client):
+        with patch("app.pipeline.CloudCleanupClient", Client):
             MurmurApp._cleanup_client(app, _config(cloud_base_url=self.ELSEWHERE))
 
         self.assertEqual(seen, [self.PINNED])
@@ -3237,7 +3804,7 @@ class PinnedProxyOriginTests(unittest.TestCase):
     def test_an_unchanged_origin_says_nothing_at_all(self):
         app = self._app()
 
-        with patch("murmur.logger") as log:
+        with patch("app.services.logger") as log:
             MurmurApp._hosted_config(app, _config())
 
         log.warning.assert_not_called()
@@ -3268,7 +3835,7 @@ class RemoteEngineBuildFailureTests(unittest.TestCase):
         def build(engine_id, **kwargs):
             raise ValueError("engine 'byok' needs config['byok_provider']")
 
-        with patch("murmur.build_engine", build):
+        with patch("app.pipeline.build_engine", build):
             with self.assertRaises(EngineError) as caught:
                 MurmurApp._remote_engine_for(self._app(), ENGINE_BYOK, _config())
 
@@ -3279,7 +3846,7 @@ class RemoteEngineBuildFailureTests(unittest.TestCase):
             def load(self):
                 raise ValueError("base_url must be https")
 
-        with patch("murmur.build_engine", lambda engine_id, **kw: Failing(engine_id)):
+        with patch("app.pipeline.build_engine", lambda engine_id, **kw: Failing(engine_id)):
             with self.assertRaises(EngineError):
                 MurmurApp._remote_engine_for(self._app(), ENGINE_CLOUD, _config())
 
@@ -3287,7 +3854,7 @@ class RemoteEngineBuildFailureTests(unittest.TestCase):
         def build(engine_id, **kwargs):
             raise ValueError("cloud_base_url=https://user:sekrit@host is not https")
 
-        with patch("murmur.build_engine", build):
+        with patch("app.pipeline.build_engine", build):
             with self.assertRaises(EngineError) as caught:
                 MurmurApp._remote_engine_for(self._app(), ENGINE_CLOUD, _config())
 
@@ -3300,13 +3867,13 @@ class RemoteEngineBuildFailureTests(unittest.TestCase):
             def load(self):
                 raise ByokAuthError("401")
 
-        with patch("murmur.build_engine", lambda engine_id, **kw: Failing(engine_id)):
+        with patch("app.pipeline.build_engine", lambda engine_id, **kw: Failing(engine_id)):
             with self.assertRaises(ByokAuthError):
                 MurmurApp._remote_engine_for(self._app(), ENGINE_BYOK, _config())
 
     def test_a_failed_build_is_not_cached_as_the_engine(self):
         app = self._app()
-        with patch("murmur.build_engine", lambda *a, **k: (_ for _ in ()).throw(ValueError())):
+        with patch("app.pipeline.build_engine", lambda *a, **k: (_ for _ in ()).throw(ValueError())):
             with self.assertRaises(EngineError):
                 MurmurApp._remote_engine_for(app, ENGINE_CLOUD, _config())
 

@@ -14,8 +14,8 @@ Wave 1d changes:
   for it at ``<sys._MEIPASS>/bin/whisper-server`` when frozen.
 - MLX wheels are collected on Apple Silicon only (decision D7: Intel Macs run
   whisper.cpp).
-- First-party packages (``services``, ``engines``, ``ui``, ``cleanup``) are
-  enumerated from disk, so a package another Wave 1 agent lands does not need a
+- First-party packages (``app``, ``services``, ``engines``, ``ui``, ``cleanup``)
+  are enumerated from disk, so a package another agent lands does not need a
   spec edit, and one that does not exist yet costs nothing.
 
 Wave 2 changes:
@@ -30,6 +30,20 @@ Wave 2 changes:
   and a frozen module's ``__file__`` is ``<sys._MEIPASS>/cleanup/modes.py`` — so
   the destination has to be ``cleanup/prompts`` exactly, or every mode raises
   ``PromptFileMissingError`` in the bundle and nowhere else.
+
+Wave 5 changes:
+
+- ``murmur.py`` is a 40-line entry point; the app lives in the ``app`` package,
+  which is added to the first-party sweep below. Nothing about the analysis
+  changes: ``Analysis(["murmur.py"])`` still starts there, and the sweep is what
+  guarantees a module reached only through a mixin is collected.
+- ``history_window.py``, ``ui_theme.py``, ``ui_alerts.py`` and
+  ``transcription_filters.py`` moved into ``ui/`` and ``cleanup/``. They were
+  listed twice here — once as data files, because the history window was loaded
+  by path, and once as hidden imports, because a root module is invisible to the
+  package sweep. Both lists lose them: the sweep collects them as ordinary
+  submodules now, and ``app.windows._get_history_module`` imports rather than
+  reads them.
 
 Wave 4 changes:
 
@@ -100,10 +114,6 @@ datas = [
     ("assets/icons/icon_recording.png", "assets/icons"),
     ("assets/icons/icon_processing.png", "assets/icons"),
     ("assets/icons/icon_error.png", "assets/icons"),
-    ("history_window.py", "."),
-    ("ui_theme.py", "."),
-    ("ui_alerts.py", "."),
-    ("transcription_filters.py", "."),
 ]
 
 # Destination "bin" puts them at <sys._MEIPASS>/bin/<name>, which is where both
@@ -132,14 +142,11 @@ hiddenimports = [
     "Foundation",
     "Quartz",
     "ApplicationServices",
-    # Launch at login. ``murmur.login_item_service`` imports SMAppService inside
+    # Launch at login. ``app.decisions.login_item_service`` imports SMAppService inside
     # a function — it does not exist before macOS 13 — and PyInstaller cannot
     # see an import made there, so the framework has to be named here or the
     # checkbox reads "Not available in this build" in the bundle only.
     "ServiceManagement",
-    "ui_theme",
-    "ui_alerts",
-    "transcription_filters",
     # Wave 4: the Keychain store's PyObjC backend. Named unconditionally on
     # purpose — a "hidden import not found" warning here is the signal that the
     # build machine skipped `pip install -r requirements.txt` and the bundle is
@@ -156,15 +163,16 @@ def local_package(name):
     """Hidden imports for a first-party package that may not exist yet.
 
     ``engines`` and ``services`` import their members dynamically, so every
-    submodule has to be named. ``ui`` and ``cleanup`` arrive later in Wave 1
-    and Wave 2; until then this returns nothing instead of a build warning.
+    submodule has to be named. ``ui`` and ``cleanup`` arrived in Wave 1 and
+    Wave 2 and ``app`` in Wave 5; a package that does not exist yet returns
+    nothing instead of a build warning.
     """
     if not os.path.isfile(os.path.join(ROOT, name, "__init__.py")):
         return []
     return [name, *collect_submodules(name)]
 
 
-for package in ("services", "engines", "ui", "cleanup"):
+for package in ("app", "services", "engines", "ui", "cleanup"):
     hiddenimports += local_package(package)
 
 # --- MLX, Apple Silicon only (decisions D1 and D7) --------------------------

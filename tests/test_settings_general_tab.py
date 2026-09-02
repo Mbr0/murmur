@@ -525,7 +525,7 @@ class CaptureTeardownTests(unittest.TestCase):
 
 class AppearanceConstantTests(unittest.TestCase):
     def test_the_models_appearance_modes_match_the_themes(self):
-        import ui_theme
+        from ui import theme as ui_theme
 
         self.assertEqual(APPEARANCE_MODES, tuple(ui_theme.APPEARANCE_MODES))
 

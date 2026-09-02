@@ -22,6 +22,7 @@ from engines import (
     register_engine,
     unregister_engine,
 )
+from engines.base import WHISPER_LANGUAGES, normalize_language_code
 
 
 class FakeEngine(Engine):
@@ -282,6 +283,59 @@ class EngineContractTests(unittest.TestCase):
         self.assertTrue(info.supports_streaming)
         self.assertTrue(info.supports_hints)
         self.assertEqual(info.languages, (LANGUAGE_AUTO,))
+
+
+class NormalizeLanguageCodeTests(unittest.TestCase):
+    def test_none_and_blank_and_auto_return_none(self):
+        self.assertIsNone(normalize_language_code(None))
+        self.assertIsNone(normalize_language_code(""))
+        self.assertIsNone(normalize_language_code("auto"))
+        self.assertIsNone(normalize_language_code("AUTO"))
+
+    def test_iso_codes_pass_through_lowercased(self):
+        self.assertEqual(normalize_language_code("en"), "en")
+        self.assertEqual(normalize_language_code("FR"), "fr")
+
+    def test_whisper_names_map_to_the_code_for_every_whisper_language(self):
+        table = {
+            "english": "en",
+            "french": "fr",
+            "dutch": "nl",
+            "german": "de",
+            "spanish": "es",
+            "italian": "it",
+            "portuguese": "pt",
+            "polish": "pl",
+            "russian": "ru",
+            "ukrainian": "uk",
+            "turkish": "tr",
+            "swedish": "sv",
+            "danish": "da",
+            "norwegian": "no",
+            "finnish": "fi",
+            "czech": "cs",
+            "romanian": "ro",
+            "hungarian": "hu",
+            "greek": "el",
+            "japanese": "ja",
+            "chinese": "zh",
+            "korean": "ko",
+            "arabic": "ar",
+            "hindi": "hi",
+            "indonesian": "id",
+            "vietnamese": "vi",
+        }
+        codes = [code for code in WHISPER_LANGUAGES if code != LANGUAGE_AUTO]
+        self.assertEqual(set(table.values()), set(codes))
+        for name, code in table.items():
+            self.assertEqual(normalize_language_code(name), code, name)
+            self.assertEqual(normalize_language_code(name.upper()), code, name)
+
+    def test_unknown_name_passes_through_lowercased_unchanged(self):
+        self.assertEqual(normalize_language_code("Klingon"), "klingon")
+
+    def test_never_raises_on_odd_input(self):
+        self.assertEqual(normalize_language_code("  english  "), "en")
 
 
 class ExceptionHierarchyTests(unittest.TestCase):

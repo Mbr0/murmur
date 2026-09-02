@@ -49,6 +49,7 @@ from engines.base import (
     Hints,
     Segment,
     Transcript,
+    normalize_language_code,
 )
 
 #: Upstream tag the bundled binary is built from. Kept in step with
@@ -469,7 +470,7 @@ class WhisperCppEngine(Engine):
         language = data.get("language")
         return Transcript(
             text=str(data.get("text", "")).strip(),
-            language=str(language) if language else None,
+            language=normalize_language_code(str(language) if language else None),
             duration_s=float(duration) if duration is not None else None,
             segments=tuple(segments),
             engine_id=ENGINE_ID,

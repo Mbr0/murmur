@@ -163,10 +163,10 @@ class PrivacyTabModel:
 
 
 def _resolved_theme(theme: Any) -> Any:
-    """The context's theme, or ``ui_theme`` imported on demand."""
+    """The context's theme, or ``ui.theme`` imported on demand."""
     if theme is not None:
         return theme
-    import ui_theme
+    from ui import theme as ui_theme
 
     return ui_theme
 
@@ -336,7 +336,7 @@ class PrivacyTab:
 
     def _delete_clicked(self, sender) -> None:
         """Confirm, erase, tell the user exactly what went."""
-        import ui_alerts
+        from ui import alerts as ui_alerts
 
         if not ui_alerts.show_confirm(
             DELETE_TITLE, DELETE_BODY, ok=DELETE_CONFIRM, cancel=DELETE_CANCEL
