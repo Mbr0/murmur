@@ -61,6 +61,13 @@ def _resolve_fp16_arg(device: str | None, fp16: bool | None) -> bool:
     return resolve_fp16(device)
 
 
+def _prompt_kwargs(initial_prompt: str | None) -> dict[str, Any]:
+    """Only forward ``initial_prompt`` when the caller actually supplied one."""
+    if initial_prompt is None:
+        return {}
+    return {"initial_prompt": initial_prompt}
+
+
 def transcribe_audio(
     model: Any,
     audio_path: str,
@@ -69,6 +76,8 @@ def transcribe_audio(
     no_speech_threshold: float = 0.6,
     device: str | None = None,
     fp16: bool | None = None,
+    language: str | None = None,
+    initial_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Run a local Whisper transcription pass on an audio file path."""
     assert audio_path, "audio_path is required"
@@ -76,9 +85,10 @@ def transcribe_audio(
     return model.transcribe(
         audio_path,
         fp16=use_fp16,
-        language=None,
+        language=language,
         condition_on_previous_text=condition_on_previous_text,
         no_speech_threshold=no_speech_threshold,
+        **_prompt_kwargs(initial_prompt),
     )
 
 
@@ -88,11 +98,22 @@ def transcribe_audio_file(
     *,
     device: str | None = None,
     fp16: bool | None = None,
+    language: str | None = None,
+    initial_prompt: str | None = None,
 ) -> dict[str, Any]:
-    """Transcribe an uploaded file with default Whisper settings."""
+    """Transcribe an uploaded file with default Whisper settings.
+
+    Unused in the app: the production file-import path is the engine adapter, which
+    calls :func:`transcribe_audio` with ``condition_on_previous_text=long_form``.
+    """
     assert audio_path, "audio_path is required"
     use_fp16 = _resolve_fp16_arg(device, fp16)
-    return model.transcribe(audio_path, fp16=use_fp16, language=None)
+    return model.transcribe(
+        audio_path,
+        fp16=use_fp16,
+        language=language,
+        **_prompt_kwargs(initial_prompt),
+    )
 
 
 def extract_text(result: dict[str, Any]) -> str:
