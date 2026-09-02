@@ -11,7 +11,10 @@ import types
 import unittest
 from pathlib import Path
 
+from engines.model_store import human_size
 from ui.onboarding_window import (
+    CONFIG_KEY_ENGINE_ID,
+    CONFIG_KEY_MODEL_ID,
     ONBOARDING_VERSION,
     STATUS_DENIED,
     STATUS_DOWNLOADING,
@@ -253,16 +256,73 @@ class DownloadTests(unittest.TestCase):
         state.start_download()
         self.assertTrue(seen["cancel"].is_set())
 
+    def test_progress_sums_every_file_of_a_multi_file_model(self):
+        """A Voxtral model is several files; the bar must not restart per file."""
+        observed = []
+
+        def fake_download(model_id, progress, cancel):
+            progress(_tick(50, 100, name="config.json"))
+            progress(_tick(100, 100, name="config.json"))
+            progress(_tick(150, 300, name="weights.bin"))
+            progress(_tick(300, 300, name="weights.bin", done=True))
+            return "/models/" + model_id
+
+        state = _state(download=fake_download)
+        state.on_download_progress = lambda tick: observed.append(
+            (state.download_bytes_done, state.download_bytes_total)
+        )
+        self.assertTrue(state.start_download())
+
+        self.assertEqual(observed[-1], (400, 400))
+        self.assertEqual(state.download_fraction, 1.0)
+        # The second file starting must not shrink the total back to one file.
+        self.assertEqual([total for _, total in observed], [100, 100, 400, 400])
+        self.assertEqual([done for done, _ in observed], [50, 100, 250, 400])
+
     def test_engine_summary_uses_the_injected_choice(self):
         state = _state()
         self.assertEqual(state.engine_choice, ENGINE)
         self.assertIn(ENGINE.display_name, state.engine_summary)
-        self.assertIn("547", state.engine_summary)
+        self.assertIn(human_size(ENGINE.size_bytes), state.engine_summary)
 
-    def test_format_size(self):
+    def test_format_size_agrees_with_the_model_store(self):
+        """Two formatters over the same bytes printed two different sizes."""
         self.assertEqual(format_size(0), "unknown size")
-        self.assertEqual(format_size(1024 * 1024), "1 MB")
-        self.assertEqual(format_size(3 * 1024**3), "3.0 GB")
+        for size in (1_000, 574_041_195, 3_000_000_000, 1024**3):
+            with self.subTest(size=size):
+                self.assertEqual(format_size(size), human_size(size))
+
+
+class EngineSelectionRecordedTests(unittest.TestCase):
+    def test_a_ready_engine_step_records_the_engine_and_model(self):
+        state = OnboardingState(engine_choice=ENGINE, is_installed=lambda _id: True)
+        self.assertEqual(state.status(STEP_ENGINE), STATUS_READY)
+
+        updates = state.to_config()
+
+        self.assertEqual(updates[CONFIG_KEY_ENGINE_ID], ENGINE.engine_id)
+        self.assertEqual(updates[CONFIG_KEY_MODEL_ID], ENGINE.model_id)
+
+    def test_a_completed_download_records_the_engine_and_model(self):
+        state = _state(download=lambda model_id, progress, cancel: "/models/x")
+        self.assertTrue(state.start_download())
+
+        updates = state.to_config()
+
+        self.assertEqual(updates[CONFIG_KEY_ENGINE_ID], ENGINE.engine_id)
+        self.assertEqual(updates[CONFIG_KEY_MODEL_ID], ENGINE.model_id)
+
+    def test_a_skipped_engine_step_records_nothing_about_the_engine(self):
+        state = _state()
+        state.advance()  # welcome
+        state.advance()  # microphone
+        state.advance()  # accessibility
+        state.skip()  # engine
+
+        updates = state.to_config()
+
+        self.assertNotIn(CONFIG_KEY_ENGINE_ID, updates)
+        self.assertNotIn(CONFIG_KEY_MODEL_ID, updates)
 
 
 class TestStepTests(unittest.TestCase):

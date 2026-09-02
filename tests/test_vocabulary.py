@@ -92,6 +92,43 @@ class ApplyReplacementsTests(unittest.TestCase):
         )
         self.assertEqual(apply_replacements("a", reversed_vocabulary), "b")
 
+    def test_matches_terms_that_end_in_punctuation(self):
+        """``\\b`` sits between a word and a non-word char, so it can never fire
+        beside the ``+`` in "C++": the term was simply never findable."""
+        vocabulary = Vocabulary(
+            replacements=(Replacement(from_text="C++", to_text="C plus plus", match_case=True),)
+        )
+        self.assertEqual(
+            apply_replacements("I write C++ daily", vocabulary), "I write C plus plus daily"
+        )
+
+    def test_matches_terms_that_start_with_punctuation(self):
+        vocabulary = Vocabulary(
+            replacements=(Replacement(from_text=".NET", to_text="dotnet", match_case=True),)
+        )
+        self.assertEqual(apply_replacements("built on .NET here", vocabulary), "built on dotnet here")
+
+    def test_matches_hash_tag_terms(self):
+        vocabulary = Vocabulary(
+            replacements=(Replacement(from_text="#tag", to_text="hashtag", match_case=False),)
+        )
+        self.assertEqual(apply_replacements("post a #tag now", vocabulary), "post a hashtag now")
+
+    def test_word_edge_still_guarded_next_to_word_characters(self):
+        """Dropping the boundary entirely would be the opposite bug."""
+        vocabulary = Vocabulary(
+            replacements=(
+                Replacement(from_text="cat", to_text="dog", match_case=True),
+                Replacement(from_text="C++", to_text="C plus plus", match_case=True),
+                Replacement(from_text=".NET", to_text="dotnet", match_case=True),
+                Replacement(from_text="#tag", to_text="hashtag", match_case=False),
+            )
+        )
+        self.assertEqual(
+            apply_replacements("concatenate ABC++ .NETWORK #tagging", vocabulary),
+            "concatenate ABC++ .NETWORK #tagging",
+        )
+
     def test_no_replacements_returns_text_unchanged(self):
         self.assertEqual(apply_replacements("hello world", Vocabulary()), "hello world")
 

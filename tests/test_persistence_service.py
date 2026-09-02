@@ -228,6 +228,61 @@ class PersistenceServiceTests(unittest.TestCase):
         self.assertIsNone(DEFAULT_CONFIG["mic_device_index"])
         self.assertIsNone(DEFAULT_CONFIG["mic_device_name"])
 
+    def test_default_config_declares_every_key_the_app_writes(self):
+        """A key written but never declared has no default, so a fresh install
+        reads None where the code expects a value."""
+        self.assertIsNone(DEFAULT_CONFIG["hotkey_label"])
+        self.assertEqual(DEFAULT_CONFIG["hints_notice_shown"], {})
+        self.assertFalse(DEFAULT_CONFIG["onboarding_completed"])
+        self.assertIsNone(DEFAULT_CONFIG["onboarding_version"])
+
+    def _service(self, tmp_dir):
+        return PersistenceService(
+            PersistencePaths(
+                str(Path(tmp_dir) / "config.json"),
+                str(Path(tmp_dir) / "history.json"),
+            ),
+            logger=TestLogger(),
+        )
+
+    def test_update_config_writes_only_the_given_keys(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self._service(tmp_dir)
+            service.save_config({**DEFAULT_CONFIG, "language": "fr", "engine_id": "whispercpp"})
+
+            merged = service.update_config({"language": "nl"})
+
+            self.assertEqual(merged["language"], "nl")
+            self.assertEqual(merged["engine_id"], "whispercpp")
+            self.assertEqual(service.load_config(dict(DEFAULT_CONFIG))["engine_id"], "whispercpp")
+
+    def test_update_config_keeps_a_write_that_landed_after_the_caller_loaded(self):
+        """The Settings-window bug: a snapshot taken at open time and saved on
+        Save reverted whatever the app wrote while the window was up."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self._service(tmp_dir)
+            service.save_config({**DEFAULT_CONFIG, "engine_id": None, "model_id": None})
+
+            snapshot = service.load_config(dict(DEFAULT_CONFIG))  # window opens
+            service.update_config({"engine_id": "whispercpp", "model_id": "turbo"})  # app writes
+
+            self.assertIsNone(snapshot["engine_id"])  # the stale view
+            merged = service.update_config({"language": "de"})  # window saves its own key
+
+            self.assertEqual(merged["engine_id"], "whispercpp")
+            self.assertEqual(merged["model_id"], "turbo")
+            self.assertEqual(merged["language"], "de")
+
+    def test_update_config_fills_missing_keys_from_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self._service(tmp_dir)
+
+            merged = service.update_config({"onboarding_completed": True})
+
+            self.assertTrue(merged["onboarding_completed"])
+            self.assertEqual(merged["language"], DEFAULT_CONFIG["language"])
+            self.assertEqual(set(merged), set(DEFAULT_CONFIG))
+
     def test_add_history_entry_keeps_latest_100(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Path(tmp_dir) / "config.json"
@@ -280,6 +335,10 @@ class PersistenceServiceTests(unittest.TestCase):
                 ],
                 "engine_id": "voxtral_mlx",
                 "model_id": "voxtral-mini-4b-realtime-4bit",
+                "hotkey_label": "Space",
+                "hints_notice_shown": {"voxtral_mlx": True},
+                "onboarding_completed": True,
+                "onboarding_version": 1,
             }
             # Fails loudly if DEFAULT_CONFIG gains a key this fixture forgot.
             self.assertEqual(set(full_config.keys()), set(DEFAULT_CONFIG.keys()))

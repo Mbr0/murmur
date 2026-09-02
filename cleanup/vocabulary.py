@@ -53,17 +53,36 @@ class Vocabulary:
     replacements: tuple[Replacement, ...] = ()
 
 
+#: One word character, as ``\b`` and ``\w`` define it. Used to decide which end
+#: of a term can carry a word boundary at all.
+_WORD_CHAR = re.compile(r"\w")
+
+
 def _replacement_pattern(replacement: Replacement) -> re.Pattern[str]:
+    """Compile a term into a pattern guarded only where a guard can match.
+
+    ``\\b`` asserts a word/non-word transition, so wrapping a term in ``\\b``
+    breaks every term whose own edge is not a word character: "C++", ".NET" and
+    "#tag" could never match anything, because the boundary was asserted on the
+    wrong side of the punctuation. Each edge is therefore guarded with a
+    lookaround only when that edge is a word character — "cat" still refuses
+    "concatenate", while "C++" matches as written.
+    """
     flags = 0 if replacement.match_case else re.IGNORECASE
-    return re.compile(rf"\b{re.escape(replacement.from_text)}\b", flags)
+    term = replacement.from_text
+    prefix = r"(?<!\w)" if _WORD_CHAR.match(term[:1]) else ""
+    suffix = r"(?!\w)" if _WORD_CHAR.match(term[-1:]) else ""
+    return re.compile(rf"{prefix}{re.escape(term)}{suffix}", flags)
 
 
 def apply_replacements(text: str, vocabulary: Vocabulary) -> str:
     """Apply every replacement in ``vocabulary`` to ``text``.
 
-    Whole-word only: a match must sit on a word boundary, so a replacement
-    for "cat" never touches "category". Replacement text is inserted exactly
-    as given, regardless of the case the match was found in.
+    Whole-word where the term has word edges: a replacement for "cat" never
+    touches "category". A term that starts or ends in punctuation — "C++",
+    ".NET", "#tag" — is guarded only on the end that is a word character, so
+    it matches at all. Replacement text is inserted exactly as given,
+    regardless of the case the match was found in.
 
     Order is deterministic: replacements with a longer ``from_text`` run
     first (so a specific phrase wins over a shorter word it contains), and

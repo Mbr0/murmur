@@ -116,6 +116,67 @@ REPLACEMENT_COLUMN_TITLES = {
 
 VOCABULARY_CSV_NAME = "murmur-vocabulary.csv"
 
+#: The one config key the Language popup owns.
+CONFIG_LANGUAGE = "language"
+
+
+class LanguageSectionModel:
+    """Rows of the Language popup and the single key it may write.
+
+    The rows come from the running engine, but the value already in config
+    always gets a row of its own, even when the engine does not list it. Two
+    bugs live in the gap: an engine that reported only ``auto`` gave the popup
+    one row, so every Save wrote ``language="auto"`` over whatever the user had
+    chosen; and a language chosen for a previous engine would silently vanish
+    on the next Save after a live engine switch.
+
+    Save is by code, never by row index, and only when the popup actually moved
+    off the value the window opened with. An untouched popup writes nothing.
+    """
+
+    def __init__(self, config: dict, codes) -> None:
+        assert config is not None, "config is required"
+        codes = tuple(codes)
+        assert codes, "at least one language code is required"
+        current = config.get(CONFIG_LANGUAGE) or LANGUAGE_AUTO
+        self.codes = codes if current in codes else (*codes, current)
+        #: The value the window opened with; what "unchanged" means.
+        self.initial = current
+
+    @property
+    def titles(self) -> tuple:
+        """Popup titles, in row order."""
+        return tuple(
+            "Automatic" if code == LANGUAGE_AUTO else language_display_name(code)
+            for code in self.codes
+        )
+
+    @property
+    def selected_index(self) -> int:
+        """Row to highlight when the popup is built."""
+        return self.codes.index(self.initial)
+
+    def code_at(self, index: int) -> str:
+        assert 0 <= index < len(self.codes), f"row {index} is out of range"
+        return self.codes[index]
+
+    def changes_for_index(self, index: int) -> dict:
+        """``{"language": code}`` when the popup moved, else nothing to write."""
+        code = self.code_at(index)
+        if code == self.initial:
+            return {}
+        return {CONFIG_LANGUAGE: code}
+
+    def rebuilt(self, codes, selected_index: int) -> "LanguageSectionModel":
+        """A model over a new engine's ``codes``, keeping the current choice.
+
+        Called when the engine is swapped while Settings is open, so the popup
+        stops describing the engine that is no longer running. The selected code
+        carries over as the new baseline: switching engines is not the user
+        changing their language.
+        """
+        return LanguageSectionModel({CONFIG_LANGUAGE: self.code_at(selected_index)}, codes)
+
 
 class VocabularySectionModel:
     """Editing state for the Settings "Vocabulary" group.
@@ -303,9 +364,15 @@ def load_config():
     return PERSISTENCE.load_config(dict(DEFAULT_CONFIG))
 
 
-def save_config(config):
-    """Save configuration"""
-    PERSISTENCE.save_config(config)
+def update_config(changes):
+    """Merge only ``changes`` into the stored config and return the result.
+
+    Settings never writes a whole config: the window is open for as long as the
+    user leaves it there, and the app keeps writing while it is — the engine a
+    finished download activated, ``onboarding_completed``, the one-shot
+    notices. Saving the snapshot taken at open time put all of that back.
+    """
+    return PERSISTENCE.update_config(changes)
 
 
 class SettingsWindowController(NSObject):
@@ -331,7 +398,7 @@ class SettingsWindowController(NSObject):
             self.config,
             self.model_store,
             on_engine_change=self._engine_changed,
-            save=save_config,
+            save_changes=update_config,
         )
         self.download_controller = DownloadController(
             self.model_store, on_change=self._download_state_changed
@@ -346,7 +413,7 @@ class SettingsWindowController(NSObject):
 
         self.hotkey_mode = hotkey_mode_from_config(self.config)
         self.hotkey_mode_popup = None
-        self.language_codes = self._language_codes()
+        self.language_section = LanguageSectionModel(self.config, self._language_codes())
         self.language_popup = None
         self.vocabulary_section = VocabularySectionModel(self.config)
         self.terms_view = None
@@ -522,14 +589,7 @@ class SettingsWindowController(NSObject):
         self.language_popup = NSPopUpButton.alloc().initWithFrame_(
             NSMakeRect(ui_theme.MARGIN, y, 220, 26)
         )
-        for code in self.language_codes:
-            self.language_popup.addItemWithTitle_(
-                "Automatic" if code == LANGUAGE_AUTO else language_display_name(code)
-            )
-        current_language = self.config.get("language", LANGUAGE_AUTO)
-        if current_language not in self.language_codes:
-            current_language = LANGUAGE_AUTO
-        self.language_popup.selectItemAtIndex_(self.language_codes.index(current_language))
+        self._fill_language_popup()
         ui_theme.style_popup_on_dark(self.language_popup)
         content_view.addSubview_(self.language_popup)
         y += 34
@@ -910,8 +970,43 @@ class SettingsWindowController(NSObject):
             )
 
     @objc.python_method
+    def _fill_language_popup(self):
+        """Rebuild the popup rows from the language model and select its row."""
+        if self.language_popup is None:
+            return
+        self.language_popup.removeAllItems()
+        for title in self.language_section.titles:
+            self.language_popup.addItemWithTitle_(title)
+        self.language_popup.selectItemAtIndex_(self.language_section.selected_index)
+
+    @objc.python_method
+    def engine_reloaded(self, info):
+        """The app finished swapping engines: re-offer that engine's languages.
+
+        Without this the popup still lists the previous engine's languages, and
+        the user picks from a menu the running model cannot honour.
+        """
+        try:
+            codes = available_languages(info)
+        except Exception as error:
+            logger.warning("Could not read languages from the new engine: %s", error)
+            return
+        index = (
+            self.language_popup.indexOfSelectedItem()
+            if self.language_popup is not None
+            else self.language_section.selected_index
+        )
+        self.language_section = self.language_section.rebuilt(codes, index)
+        self._fill_language_popup()
+
+    @objc.python_method
     def _engine_changed(self, engine_id, model_id):
-        """Ask the running app to swap engines in the background. No restart."""
+        """Ask the running app to swap engines in the background. No restart.
+
+        Returns None when the app accepted, or the refusal message when it did
+        not — the section uses that to leave config alone and put the highlight
+        back on the engine that is really running.
+        """
         app = _murmur_app_instance()
         reload_engine = getattr(app, "reload_engine", None) if app is not None else None
         if reload_engine is None:
@@ -920,13 +1015,18 @@ class SettingsWindowController(NSObject):
                 engine_id,
                 model_id,
             )
-            return
-        reload_engine(engine_id, model_id)
+            return None
+        return reload_engine(engine_id, model_id)
 
     def engineChanged_(self, sender):
         """Popup selection changed: activate the model when it is installed."""
         self.engine_section.select_index(self.engine_popup.indexOfSelectedItem())
         self._refresh_engine_controls()
+        refusal = self.engine_section.refusal
+        if refusal:
+            ui_alerts.show_alert(
+                "Speech engine unchanged", refusal, style=NSWarningAlertStyle
+            )
 
     def downloadModelClicked_(self, sender):
         """Fetch the highlighted model, showing a progress sheet."""
@@ -1037,6 +1137,14 @@ class SettingsWindowController(NSObject):
                 style=NSWarningAlertStyle,
             )
         self._refresh_engine_controls()
+        # A model can finish downloading while the app is mid-recording, and the
+        # swap is then refused. Say so rather than leaving the popup looking
+        # like the new model took over.
+        refusal = self.engine_section.refusal
+        if refusal:
+            ui_alerts.show_alert(
+                "Speech engine unchanged", refusal, style=NSWarningAlertStyle
+            )
 
     @objc.python_method
     def _stop_hotkey_capture(self):
@@ -1111,27 +1219,39 @@ class SettingsWindowController(NSObject):
     def saveClicked_(self, sender):
         """Save settings.
 
-        The speech engine is not saved here: choosing a model applies at once
-        and reloads the engine in the background, so there is nothing to defer
-        and no restart to ask for.
+        Only the keys this window owns are written, merged into whatever is on
+        disk right now. Writing back the whole config the window loaded when it
+        opened reverted everything the app had written in the meantime — the
+        engine a finished download activated, ``onboarding_completed`` (so the
+        wizard reopened forever), the one-shot notices.
+
+        The speech engine is not saved here either: choosing a model applies at
+        once and reloads the engine in the background, so there is nothing to
+        defer and no restart to ask for.
         """
         save_audio = self.save_audio_switch.state() == NSOnState
         save_history = self.save_history_switch.state() == NSOnState
-        self.config["save_audio"] = save_audio
-        self.config["save_history"] = save_history
-        self.config["privacy_mode"] = not (save_audio or save_history)
         appearance_idx = self.appearance_popup.indexOfSelectedItem()
-        self.config["appearance_mode"] = ui_theme.APPEARANCE_MODES[appearance_idx]
-        self.config.update(hotkey_to_config(self.hotkey_binding, label=self.hotkey_label))
-        self.config[HOTKEY_MODE_CONFIG_KEY] = HOTKEY_MODES[
-            self.hotkey_mode_popup.indexOfSelectedItem()
-        ]
-        self.config["language"] = self.language_codes[
-            self.language_popup.indexOfSelectedItem()
-        ]
         self.vocabulary_section.set_terms_text(str(self.terms_view.string()))
-        self.config.update(self.vocabulary_section.to_config())
-        save_config(self.config)
+
+        changes = {
+            "save_audio": save_audio,
+            "save_history": save_history,
+            "privacy_mode": not (save_audio or save_history),
+            "appearance_mode": ui_theme.APPEARANCE_MODES[appearance_idx],
+            HOTKEY_MODE_CONFIG_KEY: HOTKEY_MODES[
+                self.hotkey_mode_popup.indexOfSelectedItem()
+            ],
+            **hotkey_to_config(self.hotkey_binding, label=self.hotkey_label),
+            # Empty when the popup never moved: a language is only ever written
+            # because the user picked one.
+            **self.language_section.changes_for_index(
+                self.language_popup.indexOfSelectedItem()
+            ),
+            **self.vocabulary_section.to_config(),
+        }
+        # Mutated in place: EngineSectionModel holds this same dict.
+        self.config.update(update_config(changes))
         ui_theme.set_appearance_mode(self.config["appearance_mode"])
 
         app = _murmur_app_instance()

@@ -13,10 +13,13 @@ from murmur import (
     clear_mic_device_selection,
     download_progress_status,
     engine_is_ready,
+    finalize_transcript,
     hints_notice_message,
     missing_model_action,
+    model_integrity_message,
     model_status_title,
     model_unavailable_message,
+    push_to_talk_degraded_message,
     reload_engine_decision,
     remember_hints_notice,
     resolve_engine_selection,
@@ -25,12 +28,23 @@ from murmur import (
     should_apply_ready_on_reset,
     should_reject_toggle,
     should_reject_upload,
+    should_relaunch_after_install,
     should_show_hints_notice,
     skip_audio_user_message,
     should_toggle_for_press_action,
     update_available_message,
+    update_installed_message,
+    update_relaunch_failed_message,
+    verify_model_before_load,
 )
-from services.hotkey_service import ACTION_START, ACTION_STOP
+from engines.model_store import ModelIntegrityError
+from services.hotkey_service import (
+    ACTION_START,
+    ACTION_STOP,
+    HOTKEY_MODE_AUTO,
+    HOTKEY_MODE_HOLD,
+    HOTKEY_MODE_TOGGLE,
+)
 from ui.onboarding_window import CONFIG_KEY_COMPLETED, CONFIG_KEY_VERSION, ONBOARDING_VERSION
 
 
@@ -358,6 +372,37 @@ class AboutAndUpdateCopyTests(unittest.TestCase):
     def test_download_status_falls_back_to_megabytes(self):
         self.assertIn("MB", download_progress_status(3_000_000, None))
 
+    def test_the_app_relaunches_itself_when_the_installer_did_not(self):
+        """install_update leaves the new bundle unstarted on purpose: only the
+        running app can shut itself down cleanly first."""
+        result = SimpleNamespace(
+            app_path="/Applications/Murmur.app",
+            previous_path=None,
+            relaunch_cmd=("open", "-n", "/Applications/Murmur.app"),
+            relaunched=False,
+        )
+        self.assertTrue(should_relaunch_after_install(result))
+
+    def test_no_second_launch_when_the_installer_already_started_it(self):
+        result = SimpleNamespace(
+            app_path="/Applications/Murmur.app",
+            previous_path=None,
+            relaunch_cmd=("open", "-n", "/Applications/Murmur.app"),
+            relaunched=True,
+        )
+        self.assertFalse(should_relaunch_after_install(result))
+
+    def test_the_handover_copy_says_it_is_restarting(self):
+        message = update_installed_message("1.1.0")
+        self.assertIn("1.1.0", message)
+        self.assertIn("Restarting", message)
+        self.assertNotIn("reopen", message.lower())
+
+    def test_a_failed_relaunch_tells_the_user_to_reopen(self):
+        message = update_relaunch_failed_message("1.1.0")
+        self.assertIn("1.1.0", message)
+        self.assertIn("open it again", message)
+
 
 class PressActionRoutingTests(unittest.TestCase):
     """The pure seam between PressController output and toggle_recording."""
@@ -377,6 +422,112 @@ class PressActionRoutingTests(unittest.TestCase):
     def test_unknown_action_fails_fast(self):
         with self.assertRaises(ValueError):
             should_toggle_for_press_action("pause", is_recording=False)
+
+
+class PushToTalkDegradedMessageTests(unittest.TestCase):
+    def test_hold_and_auto_explain_the_fallback(self):
+        for mode in (HOTKEY_MODE_HOLD, HOTKEY_MODE_AUTO):
+            with self.subTest(mode=mode):
+                message = push_to_talk_degraded_message(mode)
+                self.assertIn(mode, message)
+                self.assertIn("Accessibility", message)
+                self.assertIn("toggle", message)
+
+    def test_toggle_has_nothing_to_explain(self):
+        self.assertIsNone(push_to_talk_degraded_message(HOTKEY_MODE_TOGGLE))
+
+
+class FinalizeTranscriptTests(unittest.TestCase):
+    """The filter must see the engine's words, not the user's rewrite of them."""
+
+    def test_hallucination_is_detected_on_the_raw_transcript(self):
+        seen = []
+
+        def detect(value):
+            seen.append(value)
+            return value == "Thank you."
+
+        text, hallucination = finalize_transcript(
+            "Thank you.",
+            object(),
+            detect_hallucination=detect,
+            replace=lambda raw, _vocab: "Dank u wel.",
+        )
+
+        self.assertEqual(seen, ["Thank you."])
+        self.assertTrue(hallucination)
+        self.assertEqual(text, "Dank u wel.")
+
+    def test_a_replacement_cannot_invent_a_hallucination(self):
+        text, hallucination = finalize_transcript(
+            "ship the build",
+            object(),
+            detect_hallucination=lambda value: value == "Thank you.",
+            replace=lambda _raw, _vocab: "Thank you.",
+        )
+
+        self.assertEqual(text, "Thank you.")
+        self.assertFalse(hallucination)
+
+    def test_replacements_still_run_on_a_clean_transcript(self):
+        text, hallucination = finalize_transcript(
+            "teh build",
+            object(),
+            detect_hallucination=lambda _value: False,
+            replace=lambda raw, _vocab: raw.replace("teh", "the"),
+        )
+        self.assertEqual(text, "the build")
+        self.assertFalse(hallucination)
+
+
+class FakeStore:
+    """Minimal ModelStore stand-in: records verify calls, optionally fails."""
+
+    def __init__(self, error=None):
+        self.error = error
+        self.verified = []
+
+    def verify(self, model_id):
+        self.verified.append(model_id)
+        if self.error is not None:
+            raise self.error
+
+
+class VerifyModelBeforeLoadTests(unittest.TestCase):
+    def test_a_good_model_is_hashed_once_per_process(self):
+        store = FakeStore()
+        seen = set()
+
+        verify_model_before_load(store, "turbo", seen)
+        verify_model_before_load(store, "turbo", seen)
+
+        self.assertEqual(store.verified, ["turbo"])
+        self.assertIn("turbo", seen)
+
+    def test_each_model_is_verified_on_its_own(self):
+        store = FakeStore()
+        seen = set()
+
+        verify_model_before_load(store, "turbo", seen)
+        verify_model_before_load(store, "voxtral", seen)
+
+        self.assertEqual(store.verified, ["turbo", "voxtral"])
+
+    def test_a_corrupt_model_is_refused_with_a_re_download_instruction(self):
+        store = FakeStore(error=ModelIntegrityError("sha256 mismatch"))
+        seen = set()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            verify_model_before_load(store, "turbo", seen)
+
+        self.assertIn("re-download", str(ctx.exception).lower())
+        self.assertIn("turbo", str(ctx.exception))
+        self.assertNotIn("turbo", seen)  # never cached as good
+
+    def test_the_message_names_the_model_and_the_way_out(self):
+        message = model_integrity_message("Whisper large-v3-turbo")
+        self.assertIn("Whisper large-v3-turbo", message)
+        self.assertIn("Settings", message)
 
 
 if __name__ == "__main__":

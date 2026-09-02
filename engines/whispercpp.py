@@ -41,6 +41,7 @@ from pathlib import Path
 
 from engines.base import (
     LANGUAGE_AUTO,
+    WHISPER_LANGUAGES,
     Engine,
     EngineError,
     EngineInfo,
@@ -367,7 +368,13 @@ class WhisperCppEngine(Engine):
         self._stop(process, drain)
 
     def info(self) -> EngineInfo:
-        """Static description; the model id is the GGUF file stem."""
+        """Static description; the model id is the GGUF file stem.
+
+        ``languages`` is the shared :data:`~engines.base.WHISPER_LANGUAGES` list,
+        not ``("auto",)``: the server detects the language when asked to, but it
+        also accepts an explicit ISO code, and a one-row list would leave the
+        Settings picker with nothing to pick.
+        """
         try:
             size_bytes = self._model_path.stat().st_size
         except OSError:
@@ -377,7 +384,7 @@ class WhisperCppEngine(Engine):
             name="whisper.cpp",
             model_id=self._model_path.stem,
             size_bytes=size_bytes,
-            languages=(LANGUAGE_AUTO,),
+            languages=WHISPER_LANGUAGES,
             supports_streaming=self.supports_streaming,
             supports_hints=self.supports_hints,
             requires_apple_silicon=False,

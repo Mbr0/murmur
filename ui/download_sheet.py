@@ -276,10 +276,14 @@ class EngineSectionModel:
     until then the popup merely highlights this machine's default, so a config
     file never claims an engine that cannot run.
 
-    Selecting an installed model is a live change: the keys are written, the
-    config is saved, and ``on_engine_change(engine_id, model_id)`` fires so the
-    app can reload the engine in the background. Nothing here asks for a
-    restart.
+    Selecting an installed model is a live change: ``on_engine_change`` fires so
+    the app can reload the engine in the background, and only if it accepts are
+    the two keys written. Nothing here asks for a restart.
+
+    ``on_engine_change(engine_id, model_id)`` returns None when the swap starts
+    (or was already in place) and a user-facing refusal message when it cannot —
+    the app is recording, transcribing, or already swapping. ``save_changes``
+    receives only the keys this section owns, never a whole config.
     """
 
     def __init__(
@@ -290,13 +294,15 @@ class EngineSectionModel:
         chip: str | None = None,
         ram_gb: int | None = None,
         default_engine: str | None = None,
-        on_engine_change: Callable[[str, str], None] | None = None,
-        save: Callable[[dict], None] | None = None,
+        on_engine_change: Callable[[str, str], str | None] | None = None,
+        save_changes: Callable[[dict], None] | None = None,
     ) -> None:
         assert config is not None, "config is required"
         assert store is not None, "store is required"
         self._config = config
         self._store = store
+        #: Why the last selection did not take, or None. Read by the view.
+        self.refusal: str | None = None
         self._chip = chip if chip is not None else detect_chip()
         self._ram_gb = ram_gb if ram_gb is not None else detect_ram_gb()
         self._default_engine = (
@@ -309,7 +315,7 @@ class EngineSectionModel:
         )
         assert self._specs, f"no speech model can run on chip {self._chip!r}"
         self._on_engine_change = on_engine_change
-        self._save = save
+        self._save_changes = save_changes
         self._selected = self._initial_selection()
         self._choices = self._build_choices()
 
@@ -461,19 +467,34 @@ class EngineSectionModel:
         )
 
     def _activate(self, model_id: str) -> bool:
-        """Write the config keys and ask the app to reload, unless nothing moved."""
+        """Ask the app to swap engines, and record the choice only if it agreed.
+
+        The order is the point. Writing the keys first left config naming an
+        engine the app had just refused to load, so the app went on running the
+        old model while the file — and the next launch — claimed the new one. A
+        refusal instead puts the highlight back on the model actually running
+        and is reported through :attr:`refusal`.
+        """
         spec = self.spec(model_id)
+        self.refusal = None
         if (
             self._config.get(CONFIG_ENGINE_ID) == spec.engine
             and self._config.get(CONFIG_MODEL_ID) == spec.id
         ):
             return False
+        if self._on_engine_change is not None:
+            refusal = self._on_engine_change(spec.engine, spec.id)
+            if refusal:
+                self.refusal = str(refusal)
+                self._selected = self._initial_selection()
+                self.refresh()
+                return False
         self._config[CONFIG_ENGINE_ID] = spec.engine
         self._config[CONFIG_MODEL_ID] = spec.id
-        if self._save is not None:
-            self._save(self._config)
-        if self._on_engine_change is not None:
-            self._on_engine_change(spec.engine, spec.id)
+        if self._save_changes is not None:
+            self._save_changes(
+                {CONFIG_ENGINE_ID: spec.engine, CONFIG_MODEL_ID: spec.id}
+            )
         return True
 
 

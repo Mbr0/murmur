@@ -168,6 +168,12 @@ class PressController:
 
     Key repeat (further key-down events while the key is already down) is ignored,
     and a key-up with no matching key-down is a no-op.
+
+    ``key_up_available`` says whether key-up will actually be delivered. When it
+    is False — the Carbon path without Accessibility, where Carbon reports only
+    presses — ``hold`` and ``auto`` run as ``toggle``: without a release the
+    controller would hold ``_key_down`` forever, read every later press as key
+    repeat, and leave recording running with no way to stop it.
     """
 
     def __init__(
@@ -175,6 +181,7 @@ class PressController:
         mode: str = DEFAULT_HOTKEY_MODE,
         *,
         hold_threshold_s: float = HOLD_THRESHOLD_S,
+        key_up_available: bool = True,
     ) -> None:
         if mode not in HOTKEY_MODES:
             raise ValueError(
@@ -184,6 +191,7 @@ class PressController:
             raise ValueError(f"hold_threshold_s must be positive, got {hold_threshold_s!r}")
         self.mode = mode
         self.hold_threshold_s = float(hold_threshold_s)
+        self._key_up_available = bool(key_up_available)
         self._recording = False
         self._key_down = False
         self._pressed_at: float | None = None
@@ -192,6 +200,33 @@ class PressController:
     @property
     def is_recording(self) -> bool:
         return self._recording
+
+    @property
+    def key_up_available(self) -> bool:
+        """Whether key-up events reach this controller at all."""
+        return self._key_up_available
+
+    @property
+    def effective_mode(self) -> str:
+        """The mode actually in force, which is ``toggle`` when key-up is missing."""
+        if self._key_up_available:
+            return self.mode
+        return HOTKEY_MODE_TOGGLE
+
+    def set_key_up_available(self, available: bool) -> None:
+        """Record whether key-up will be delivered, e.g. after registering.
+
+        Changing it changes the mode in force, so the half-finished press the
+        old mode was tracking is dropped. Recording itself is left alone; the
+        caller reconciles that with :meth:`sync`.
+        """
+        available = bool(available)
+        if available == self._key_up_available:
+            return
+        self._key_up_available = available
+        self._key_down = False
+        self._pressed_at = None
+        self._latched = False
 
     @property
     def is_latched(self) -> bool:
@@ -212,14 +247,18 @@ class PressController:
             self._latched = False
 
     def on_key_down(self, now: float) -> str | None:
-        if self._key_down:
-            return None  # key repeat
-        self._key_down = True
-        self._pressed_at = now
+        mode = self.effective_mode
+        if self._key_up_available:
+            # Only a key-up can clear this, so it is never set when none is coming:
+            # otherwise the second press would look like key repeat forever.
+            if self._key_down:
+                return None  # key repeat
+            self._key_down = True
+            self._pressed_at = now
 
-        if self.mode == HOTKEY_MODE_TOGGLE:
+        if mode == HOTKEY_MODE_TOGGLE:
             return self._flip()
-        if self.mode == HOTKEY_MODE_HOLD:
+        if mode == HOTKEY_MODE_HOLD:
             if self._recording:
                 return None
             self._recording = True
@@ -236,17 +275,18 @@ class PressController:
         return ACTION_START
 
     def on_key_up(self, now: float) -> str | None:
+        mode = self.effective_mode
         if not self._key_down:
             return None  # release with no press we saw
         pressed_at = self._pressed_at
         self._key_down = False
         self._pressed_at = None
 
-        if self.mode == HOTKEY_MODE_TOGGLE:
+        if mode == HOTKEY_MODE_TOGGLE:
             return None
         if not self._recording:
             return None
-        if self.mode == HOTKEY_MODE_HOLD:
+        if mode == HOTKEY_MODE_HOLD:
             self._recording = False
             return ACTION_STOP
 
@@ -268,6 +308,14 @@ class PressController:
 
 @dataclass
 class HotkeyRegistration:
+    """Everything one registration owns, so ``unregister`` can undo all of it.
+
+    Every monitor is recorded on this object as soon as it exists, including on
+    the paths that go on to fail: an abandoned NSEvent monitor stays installed
+    for the life of the process, and the hotkey retry timer would stack a fresh
+    set on every attempt.
+    """
+
     unregister_fn: Callable[[], None] | None = None
     global_monitor: Any = None
     local_monitor: Any = None
@@ -276,6 +324,9 @@ class HotkeyRegistration:
     global_key_up_monitor: Any = None
     local_key_up_monitor: Any = None
     handlers: list[Any] | None = None
+    #: True only when key-up really reaches the app. False here means ``hold``
+    #: and ``auto`` cannot work and must fall back to ``toggle``.
+    key_up_available: bool = False
 
 
 def hotkey_registration_active(registration: HotkeyRegistration | None) -> bool:
@@ -770,6 +821,7 @@ def _attach_carbon_key_up_fallback(
                 format_hotkey(binding),
             )
         return False
+    registration.key_up_available = True
     return True
 
 
@@ -852,6 +904,8 @@ def register_global_hotkey(
             registration = HotkeyRegistration(
                 unregister_fn=registerable_handler.unregister,
             )
+            # key_up_available stays False unless the NSEvent fallback below
+            # really attaches: Carbon itself wires no released handler here.
             if wants_key_up and not carbon_supports_key_up():
                 # Never let a key-up problem undo a working key-down registration.
                 try:
@@ -940,48 +994,56 @@ def register_global_hotkey(
         local_flags_handler,
     ]
 
-    global_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-        NSEventMaskKeyDown,
-        global_key_handler,
-    )
-    local_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
-        NSEventMaskKeyDown,
-        local_key_handler,
-    )
-    global_flags_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-        NSEventMaskFlagsChanged,
-        global_flags_handler,
-    )
-    local_flags_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
-        NSEventMaskFlagsChanged,
-        local_flags_handler,
-    )
-
-    global_key_up_monitor = None
-    local_key_up_monitor = None
-    if wants_key_up:
-        (
-            global_key_up_monitor,
-            local_key_up_monitor,
-            key_up_handlers,
-        ) = _add_key_up_monitors(binding, on_key_up, on_error)
-        handlers.extend(key_up_handlers)
-        if global_key_up_monitor is None and logger is not None:
-            logger.warning(
-                "macOS refused the key-up monitor for %s; hold and auto behave "
-                "like toggle.",
-                format_hotkey(binding),
-            )
-
-    if global_monitor is None:
-        diagnostics = hotkey_diagnostics()
-        raise RuntimeError(
-            "Failed to register the global shortcut. "
-            "Enable Accessibility for the current Murmur.app in "
-            "System Settings → Privacy & Security. "
-            "After a DMG reinstall, remove old Murmur entries and grant access again. "
-            f"CDHash={diagnostics['cdhash']} ax_trusted={diagnostics['ax_trusted']}"
+    # Every monitor is recorded on the registration as it is created, and the
+    # registration is torn down on any failure: an NSEvent monitor that nobody
+    # holds a reference to stays installed for the life of the process, and the
+    # retry timer would add another set of them on every attempt.
+    registration = HotkeyRegistration(handlers=handlers)
+    try:
+        registration.global_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSEventMaskKeyDown,
+            global_key_handler,
         )
+        registration.local_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+            NSEventMaskKeyDown,
+            local_key_handler,
+        )
+        registration.global_flags_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSEventMaskFlagsChanged,
+            global_flags_handler,
+        )
+        registration.local_flags_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+            NSEventMaskFlagsChanged,
+            local_flags_handler,
+        )
+
+        if wants_key_up:
+            (
+                registration.global_key_up_monitor,
+                registration.local_key_up_monitor,
+                key_up_handlers,
+            ) = _add_key_up_monitors(binding, on_key_up, on_error)
+            handlers.extend(key_up_handlers)
+            registration.key_up_available = registration.global_key_up_monitor is not None
+            if not registration.key_up_available and logger is not None:
+                logger.warning(
+                    "macOS refused the key-up monitor for %s; hold and auto behave "
+                    "like toggle.",
+                    format_hotkey(binding),
+                )
+
+        if registration.global_monitor is None:
+            diagnostics = hotkey_diagnostics()
+            raise RuntimeError(
+                "Failed to register the global shortcut. "
+                "Enable Accessibility for the current Murmur.app in "
+                "System Settings → Privacy & Security. "
+                "After a DMG reinstall, remove old Murmur entries and grant access again. "
+                f"CDHash={diagnostics['cdhash']} ax_trusted={diagnostics['ax_trusted']}"
+            )
+    except BaseException:
+        unregister_global_hotkey(registration)
+        raise
 
     if is_bundled_app():
         log_hotkey_diagnostics(logger, event=f"Global hotkey registered: {format_hotkey(binding)}")
@@ -992,15 +1054,7 @@ def register_global_hotkey(
             sys.executable,
             hotkey_permissions_ok(),
         )
-    return HotkeyRegistration(
-        global_monitor=global_monitor,
-        local_monitor=local_monitor,
-        global_flags_monitor=global_flags_monitor,
-        local_flags_monitor=local_flags_monitor,
-        global_key_up_monitor=global_key_up_monitor,
-        local_key_up_monitor=local_key_up_monitor,
-        handlers=handlers,
-    )
+    return registration
 
 
 def register_option_space_hotkey(

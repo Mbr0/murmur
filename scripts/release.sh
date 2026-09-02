@@ -15,13 +15,33 @@ if [ -z "${CODE_SIGN_IDENTITY:-}" ]; then
     exit 1
 fi
 
-for var in APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD; do
-    if [ "${NOTARIZE}" = "true" ] && [ -z "${!var:-}" ]; then
-        echo "ERROR: ${var} is required when NOTARIZE=true."
-        echo "See RELEASE_SIGNING.md"
-        exit 1
-    fi
-done
+# Credentials for notarytool. A stored keychain profile is the better path —
+# nothing sensitive reaches the process table — and is what NOTARY_KEYCHAIN_PROFILE
+# selects (create it once with `xcrun notarytool store-credentials`). Otherwise
+# the app-specific password is handed over as "@env:VAR", which notarytool reads
+# from the environment rather than from argv, where `ps` would show it.
+NOTARY_KEYCHAIN_PROFILE="${NOTARY_KEYCHAIN_PROFILE:-}"
+if [ "${NOTARIZE}" = "true" ] && [ -z "${NOTARY_KEYCHAIN_PROFILE}" ]; then
+    for var in APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD; do
+        if [ -z "${!var:-}" ]; then
+            echo "ERROR: ${var} is required when NOTARIZE=true."
+            echo "       (or set NOTARY_KEYCHAIN_PROFILE — see RELEASE_SIGNING.md)"
+            exit 1
+        fi
+    done
+fi
+
+if [ -n "${NOTARY_KEYCHAIN_PROFILE}" ]; then
+    NOTARY_ARGS=(--keychain-profile "${NOTARY_KEYCHAIN_PROFILE}")
+else
+    NOTARY_ARGS=(
+        --apple-id "${APPLE_ID:-}"
+        --team-id "${APPLE_TEAM_ID:-}"
+        --password "@env:APPLE_APP_SPECIFIC_PASSWORD"
+    )
+    export APPLE_APP_SPECIFIC_PASSWORD
+fi
+export NOTARY_KEYCHAIN_PROFILE
 
 if [ ! -f "${ROOT}/vendor/whispercpp/whisper-server" ]; then
     echo "Building the bundled whisper.cpp server..."
@@ -42,11 +62,7 @@ DMG_PATH="dist/Murmur-${APP_VERSION}.dmg"
 # updater's `spctl --assess --type open` check passes offline.
 if [ "${NOTARIZE}" = "true" ]; then
     echo "Notarizing the DMG..."
-    xcrun notarytool submit "${DMG_PATH}" \
-        --apple-id "${APPLE_ID}" \
-        --team-id "${APPLE_TEAM_ID}" \
-        --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
-        --wait
+    xcrun notarytool submit "${DMG_PATH}" "${NOTARY_ARGS[@]}" --wait
     xcrun stapler staple "${DMG_PATH}"
     xcrun stapler validate "${DMG_PATH}"
 fi

@@ -325,6 +325,72 @@ class PressControllerTableTests(unittest.TestCase):
                         actions.append(controller.on_key_up(now))
                 self.assertEqual(tuple(actions), expected, name)
 
+    NO_KEY_UP_CASES = (
+        (
+            "auto without key-up: every press toggles, none is read as key repeat",
+            HOTKEY_MODE_AUTO,
+            ((DOWN, 0.0), (DOWN, 1.0), (DOWN, 2.0), (DOWN, 3.0)),
+            (ACTION_START, ACTION_STOP, ACTION_START, ACTION_STOP),
+        ),
+        (
+            "hold without key-up: every press toggles",
+            HOTKEY_MODE_HOLD,
+            ((DOWN, 0.0), (DOWN, 1.0), (DOWN, 2.0)),
+            (ACTION_START, ACTION_STOP, ACTION_START),
+        ),
+        (
+            "toggle without key-up is unchanged",
+            HOTKEY_MODE_TOGGLE,
+            ((DOWN, 0.0), (DOWN, 1.0)),
+            (ACTION_START, ACTION_STOP),
+        ),
+        (
+            "a stray key-up cannot wedge the next press",
+            HOTKEY_MODE_AUTO,
+            ((DOWN, 0.0), (UP, 0.1), (DOWN, 1.0)),
+            (ACTION_START, None, ACTION_STOP),
+        ),
+    )
+
+    def test_table_without_a_key_up_source(self):
+        """On the Carbon path with no Accessibility, key-up never arrives. Every
+        later press used to look like key repeat, so recording never stopped."""
+        for name, mode, events, expected in self.NO_KEY_UP_CASES:
+            with self.subTest(name):
+                controller = PressController(mode, key_up_available=False)
+                actions = []
+                for kind, now in events:
+                    if kind == DOWN:
+                        actions.append(controller.on_key_down(now))
+                    else:
+                        actions.append(controller.on_key_up(now))
+                self.assertEqual(tuple(actions), expected, name)
+
+    def test_effective_mode_collapses_to_toggle_without_key_up(self):
+        for mode in HOTKEY_MODES:
+            with self.subTest(mode=mode):
+                controller = PressController(mode, key_up_available=False)
+                self.assertEqual(controller.mode, mode)
+                self.assertEqual(controller.effective_mode, HOTKEY_MODE_TOGGLE)
+                self.assertFalse(controller.key_up_available)
+
+    def test_effective_mode_is_the_requested_mode_when_key_up_works(self):
+        for mode in HOTKEY_MODES:
+            with self.subTest(mode=mode):
+                controller = PressController(mode)
+                self.assertTrue(controller.key_up_available)
+                self.assertEqual(controller.effective_mode, mode)
+
+    def test_set_key_up_available_switches_behaviour_and_clears_the_press(self):
+        controller = PressController(HOTKEY_MODE_AUTO)
+        self.assertEqual(controller.on_key_down(0.0), ACTION_START)
+
+        controller.set_key_up_available(False)
+
+        self.assertEqual(controller.effective_mode, HOTKEY_MODE_TOGGLE)
+        self.assertFalse(controller.is_latched)
+        self.assertEqual(controller.on_key_down(1.0), ACTION_STOP)
+
     def test_default_mode_is_auto(self):
         self.assertEqual(PressController().mode, HOTKEY_MODE_AUTO)
 
@@ -476,6 +542,84 @@ class KeyUpDeliveryTests(unittest.TestCase):
                     self.assertIsNotNone(registration.local_key_up_monitor)
                 finally:
                     unregister_global_hotkey(registration)
+
+    def test_ns_event_failure_removes_every_monitor_it_added(self):
+        """A refused key-down monitor used to leak the key-up and flags monitors,
+        so a retry loop stacked another handler set on every attempt."""
+        binding = HotkeyBinding(keycode=SPACE_KEYCODE, option=True, fn=True)
+        added = []
+        removed = []
+
+        def add_global(mask, handler):
+            from AppKit import NSEventMaskKeyDown
+
+            if int(mask) == int(NSEventMaskKeyDown):
+                return None  # macOS refuses the one monitor that matters
+            monitor = object()
+            added.append(monitor)
+            return monitor
+
+        def add_local(mask, handler):
+            monitor = object()
+            added.append(monitor)
+            return monitor
+
+        mock_ns = MagicMock()
+        mock_ns.addGlobalMonitorForEventsMatchingMask_handler_.side_effect = add_global
+        mock_ns.addLocalMonitorForEventsMatchingMask_handler_.side_effect = add_local
+        mock_ns.removeMonitor_.side_effect = removed.append
+
+        with patch("services.hotkey_service.hotkey_permissions_ok", return_value=True):
+            with patch("services.hotkey_service.NSEvent", mock_ns):
+                with self.assertRaises(RuntimeError):
+                    register_global_hotkey(
+                        binding,
+                        lambda: None,
+                        lambda _e: None,
+                        MagicMock(),
+                        on_key_up=lambda: None,
+                        mode=HOTKEY_MODE_AUTO,
+                    )
+
+        self.assertTrue(added)
+        self.assertCountEqual(removed, added)
+
+    def test_registration_reports_whether_key_up_will_be_delivered(self):
+        binding = HotkeyBinding(keycode=SPACE_KEYCODE, option=True, fn=True)
+        mock_ns = MagicMock()
+        mock_ns.addGlobalMonitorForEventsMatchingMask_handler_.return_value = object()
+        mock_ns.addLocalMonitorForEventsMatchingMask_handler_.return_value = object()
+
+        with patch("services.hotkey_service.hotkey_permissions_ok", return_value=True):
+            with patch("services.hotkey_service.NSEvent", mock_ns):
+                registration = register_global_hotkey(
+                    binding,
+                    lambda: None,
+                    lambda _e: None,
+                    MagicMock(),
+                    on_key_up=lambda: None,
+                    mode=HOTKEY_MODE_AUTO,
+                )
+                try:
+                    self.assertTrue(registration.key_up_available)
+                finally:
+                    unregister_global_hotkey(registration)
+
+    def test_registration_reports_no_key_up_when_accessibility_is_missing(self):
+        with patch("services.hotkey_service.hotkey_permissions_ok", return_value=False):
+            registration = register_global_hotkey(
+                DEFAULT_HOTKEY,
+                lambda: None,
+                lambda _e: None,
+                MagicMock(),
+                on_key_up=lambda: None,
+                mode=HOTKEY_MODE_AUTO,
+            )
+            try:
+                self.assertIsNotNone(registration.unregister_fn)  # Carbon key-down works
+                self.assertFalse(registration.key_up_available)
+            finally:
+                unregister_global_hotkey(registration)
 
     def test_ns_event_key_up_handler_calls_back_on_matching_keycode(self):
         binding = HotkeyBinding(keycode=SPACE_KEYCODE, option=True, fn=True)

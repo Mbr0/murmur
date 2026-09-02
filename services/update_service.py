@@ -13,13 +13,21 @@ The chain, in order, is:
    default) and turns it into an :class:`UpdateInfo`.
 2. :func:`check_for_update` compares the feed version with the running version
    using semantic-version precedence.
-3. :func:`download_dmg` streams the disk image to disk with progress.
-4. :func:`verify_signature` runs ``codesign --verify --deep --strict``,
-   ``spctl --assess --type open --context context:primary-signature`` and
-   ``codesign -dv --verbose=4`` on the DMG, and refuses anything whose
-   ``TeamIdentifier`` is not the expected one.
+3. :func:`download_dmg` streams the disk image to disk with progress, from an
+   allow-listed https host only (:func:`check_download_url`), redirects
+   included.
+4. :func:`verify_signature` runs ``codesign --verify --deep --strict`` with a
+   ``-R`` requirement that pins the Developer ID team, then
+   ``spctl --assess --type open --context context:primary-signature``, then
+   ``codesign -dv --verbose=4`` as a diagnostic. The team is enforced by
+   ``codesign`` itself, not by parsing its free text.
 5. :func:`install_update` mounts the DMG, copies the app next to the running
-   one, swaps by rename and relaunches.
+   one, verifies the *staged* copy, and swaps by rename. The bundle it replaced
+   is renamed aside, never deleted while the app that lives in it is still
+   running. It hands back the ``open -n`` argv for the new build rather than
+   relaunching: only the caller knows how to quit itself.
+6. :func:`cleanup_previous_bundles` deletes those set-aside bundles. Call it at
+   startup, from the new build, when nothing is loading out of them any more.
 
 Nothing installs before step 4 has passed: :meth:`UpdateService.download_and_install`
 calls the verification and lets :class:`UpdateVerificationError` propagate.
@@ -35,21 +43,39 @@ bundle it is replacing is broken.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 #: Release feed. GitHub's "latest release" JSON; injectable for tests and for a
 #: future self-hosted appcast.
 DEFAULT_FEED_URL = "https://api.github.com/repos/Mbr0/murmur/releases/latest"
+
+#: Hosts a build may be downloaded from. The feed names the URL, so without
+#: this an attacker who can influence the feed picks the server we fetch from.
+#: GitHub serves release assets from ``objects.`` and ``release-assets.``
+#: subdomains after a redirect from ``github.com``.
+ALLOWED_DOWNLOAD_HOSTS = frozenset(
+    {
+        "github.com",
+        "api.github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+    }
+)
 
 #: Developer ID team the updater accepts. Empty on purpose in the repository:
 #: a release build supplies it (see "Updater Team ID" in RELEASE_SIGNING.md),
@@ -75,10 +101,20 @@ _VERSION_RE = re.compile(
     r"^\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.\-]+))?(?:\+[0-9A-Za-z.\-]+)?\s*$"
 )
 _NUMERIC_RE = re.compile(r"^\d+$")
-_TEAM_ID_RE = re.compile(r"^TeamIdentifier=(.+)$", re.MULTILINE)
+#: Only ever a diagnostic now (the ``-R`` requirement below is the real gate),
+#: so it accepts nothing that is not a Team ID or the ad-hoc marker.
+_TEAM_ID_RE = re.compile(r"^TeamIdentifier=(not set|[A-Za-z0-9]{2,20})[ \t]*$", re.MULTILINE)
+#: An Apple Team ID is ten alphanumerics. Checked before it is spliced into a
+#: code-requirement string, which has its own quoting rules.
+_TEAM_ID_FORMAT_RE = re.compile(r"^[A-Za-z0-9]{2,20}$")
 
 #: ``codesign -dv`` prints this for an ad-hoc signature.
 _TEAM_ID_ABSENT = "not set"
+
+#: A replaced bundle is renamed to ``.<name>.previous-<version>`` beside the
+#: new one. Hidden, so it does not clutter /Applications, and matched by
+#: :func:`cleanup_previous_bundles` on the next launch.
+PREVIOUS_SUFFIX = ".previous-"
 
 
 class UpdateError(Exception):
@@ -165,9 +201,50 @@ def is_newer(candidate: str, current: str) -> bool:
 # --------------------------------------------------------------------------
 
 
+def check_download_url(url: str) -> str:
+    """Return ``url`` when it is an https URL on an allow-listed host.
+
+    The release feed decides where the build is fetched from, so a tampered
+    feed would otherwise choose the server. ``urlsplit().hostname`` is the real
+    host: ``https://github.com@evil.test/x`` has hostname ``evil.test``.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url or "")
+    except ValueError as error:
+        raise UpdateVerificationError(f"not a usable download URL: {url!r} ({error})") from error
+
+    if parts.scheme.lower() != "https":
+        raise UpdateVerificationError(
+            f"refusing to download over {parts.scheme or 'no'} scheme: {url!r} (https only)."
+        )
+    host = (parts.hostname or "").lower()
+    if host not in ALLOWED_DOWNLOAD_HOSTS:
+        raise UpdateVerificationError(
+            f"refusing to download a build from {host or '(no host)'}: "
+            f"only {', '.join(sorted(ALLOWED_DOWNLOAD_HOSTS))} are release hosts."
+        )
+    if parts.port not in (None, 443):
+        raise UpdateVerificationError(f"refusing to download from {host}:{parts.port}; port 443 only.")
+    return url
+
+
+class AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-checks :func:`check_download_url` on every redirect hop.
+
+    GitHub answers an asset URL with a redirect to its object store, so
+    redirects cannot simply be disabled — but each hop has to land on a host
+    the allowlist names.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - urllib API
+        check_download_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _urlopen(url: str) -> Any:
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    return urllib.request.urlopen(request, timeout=_NETWORK_TIMEOUT_S)  # noqa: S310 - https feed URL
+    opener = urllib.request.build_opener(AllowlistRedirectHandler)
+    return opener.open(request, timeout=_NETWORK_TIMEOUT_S)  # noqa: S310 - https, allow-listed host
 
 
 class UpdateFeed:
@@ -269,9 +346,10 @@ def download_dmg(
     """Stream ``url`` into ``dest``, reporting progress, and return ``dest``.
 
     Writes to ``<dest>.part`` and renames, so a torn download never looks like
-    a finished one.
+    a finished one. ``url`` has to pass :func:`check_download_url` first.
     """
     assert url, "url is required"
+    check_download_url(url)
     opener = opener or _urlopen
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -357,14 +435,41 @@ def read_build_info() -> dict:
 
 
 def expected_team_id() -> str:
-    """Team ID this build will accept: env var, then build_info.json, then constant."""
-    from_env = os.environ.get(TEAM_ID_ENV_VAR, "").strip()
-    if from_env:
-        return from_env
+    """Team ID this build will accept: build_info.json, then constant, then env.
+
+    ``build_info.json`` lives inside the bundle and is covered by its signature;
+    the environment is not, and anything that can set a variable in the app's
+    process could otherwise redirect the trust anchor to its own team. So the
+    bundle wins, and :data:`TEAM_ID_ENV_VAR` only applies from source, where a
+    developer is testing the flow against their own signing identity.
+    """
     from_bundle = str(read_build_info().get("team_id") or "").strip()
+    from_env = os.environ.get(TEAM_ID_ENV_VAR, "").strip()
+
     if from_bundle:
+        if from_env and from_env != from_bundle:
+            logger.warning(
+                "%s=%s ignored: this build is pinned to team %s by build_info.json",
+                TEAM_ID_ENV_VAR,
+                from_env,
+                from_bundle,
+            )
         return from_bundle
-    return EXPECTED_TEAM_ID.strip()
+
+    constant = EXPECTED_TEAM_ID.strip()
+    if constant:
+        return constant
+
+    if from_env:
+        if getattr(sys, "frozen", False):
+            logger.warning(
+                "%s is set but this is a packaged build with no team_id in build_info.json; "
+                "ignoring it and refusing to install anything.",
+                TEAM_ID_ENV_VAR,
+            )
+            return ""
+        return from_env
+    return ""
 
 
 def _require_ok(result: subprocess.CompletedProcess[str], what: str) -> None:
@@ -383,30 +488,64 @@ def parse_team_identifier(result: subprocess.CompletedProcess[str]) -> str | Non
     return None if value == _TEAM_ID_ABSENT else value
 
 
+def team_requirement(team_id: str) -> str:
+    """The ``codesign -R`` requirement that pins a Developer ID team.
+
+    ``=`` tells ``codesign`` the argument is requirement source rather than a
+    file. The team is validated first: the requirement language quotes strings,
+    and a Team ID carrying a quote would rewrite the expression.
+    """
+    team_id = (team_id or "").strip()
+    if not _TEAM_ID_FORMAT_RE.match(team_id):
+        raise UpdateVerificationError(
+            f"{team_id!r} is not a usable Apple Team ID (ten alphanumeric characters)."
+        )
+    return f'=anchor apple generic and certificate leaf[subject.OU] = "{team_id}"'
+
+
 def verify_signature(
     dmg_or_app_path: str | Path,
     runner: Runner | None = None,
     expected_team: str | None = None,
+    assess_gatekeeper: bool = True,
 ) -> None:
     """Raise :class:`UpdateVerificationError` unless the build is one we trust.
 
-    Three gates: the signature is intact and strict, Gatekeeper assesses it as
-    openable on its primary signature, and the Team ID matches. An ad-hoc build
-    (``TeamIdentifier=not set``) is never acceptable, and a Developer ID build
-    is refused outright when no expected Team ID is configured — silently
-    trusting an unknown team would defeat the point of the check.
+    The team check *is* the ``codesign`` call: ``-R`` makes ``codesign``
+    evaluate the certificate chain against a requirement naming the team, so a
+    crafted ``Identifier`` string cannot forge a ``TeamIdentifier=`` line the
+    way a text parse could. Gatekeeper's assessment follows, and
+    ``codesign -dv`` last, as a diagnostic that also catches an ad-hoc build.
+
+    A build is refused outright when no expected Team ID is configured —
+    silently trusting an unknown team would defeat the point of the check.
+
+    ``assess_gatekeeper=False`` skips ``spctl`` for the ``.app`` staged out of
+    a DMG that has already been assessed; ``--type open`` is a claim about the
+    image, not about the bundle inside it.
     """
     runner = runner or _run
     target = str(dmg_or_app_path)
 
+    expected = expected_team_id() if expected_team is None else expected_team.strip()
+    if not expected:
+        raise UpdateVerificationError(
+            f"refusing to verify {target}: no expected Team ID is configured. "
+            f"Set {TEAM_ID_ENV_VAR} or the build_info.json team_id (see RELEASE_SIGNING.md)."
+        )
+    requirement = team_requirement(expected)
+
     _require_ok(
-        runner(["codesign", "--verify", "--deep", "--strict", target]),
-        f"codesign rejected {target}",
+        runner(["codesign", "--verify", "--deep", "--strict", "-R", requirement, target]),
+        f"codesign rejected {target} (not signed by team {expected})",
     )
-    _require_ok(
-        runner(["spctl", "--assess", "--type", "open", "--context", "context:primary-signature", target]),
-        f"Gatekeeper rejected {target}",
-    )
+    if assess_gatekeeper:
+        _require_ok(
+            runner(
+                ["spctl", "--assess", "--type", "open", "--context", "context:primary-signature", target]
+            ),
+            f"Gatekeeper rejected {target}",
+        )
 
     details = runner(["codesign", "-dv", "--verbose=4", target])
     _require_ok(details, f"could not read the signature of {target}")
@@ -415,13 +554,6 @@ def verify_signature(
     if team is None:
         raise UpdateVerificationError(
             f"{target} carries no Developer ID Team ID (ad-hoc or unsigned); refusing to install it."
-        )
-
-    expected = expected_team_id() if expected_team is None else expected_team.strip()
-    if not expected:
-        raise UpdateVerificationError(
-            f"{target} is signed by team {team!r} but no expected Team ID is configured. "
-            f"Set {TEAM_ID_ENV_VAR} or the build_info.json team_id (see RELEASE_SIGNING.md)."
         )
     if team != expected:
         raise UpdateVerificationError(
@@ -451,13 +583,71 @@ def _remove_tree(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+@dataclass(frozen=True)
+class InstallResult:
+    """What an install left behind, and how to start what it installed."""
+
+    #: Where the new bundle now lives.
+    app_path: Path
+    #: The replaced bundle, renamed aside. ``None`` when there was none.
+    #: Still on disk on purpose — see :func:`install_update`.
+    previous_path: Path | None
+    #: ``open -n`` argv for the new bundle; run it, then quit.
+    relaunch_cmd: tuple[str, ...]
+    #: True when :func:`install_update` already ran ``relaunch_cmd``.
+    relaunched: bool = False
+
+
+def _previous_bundle_path(app_path: Path, version: str | None) -> Path:
+    tag = re.sub(r"[^0-9A-Za-z._-]", "_", (version or "").strip()) or time.strftime("%Y%m%d%H%M%S")
+    return app_path.parent / f".{app_path.name}{PREVIOUS_SUFFIX}{tag}"
+
+
+def cleanup_previous_bundles(app_path: str | Path | None = None) -> list[Path]:
+    """Delete the bundles a past :func:`install_update` set aside. Call at startup.
+
+    Nothing is loading out of them by then: the process that was running from
+    one is gone, and the new bundle is what launched. Accepts the ``.app`` or
+    the directory that holds it; defaults to the running bundle. Only siblings
+    whose name carries :data:`PREVIOUS_SUFFIX` are touched, so the live app and
+    anything else beside it are never candidates.
+
+    Returns what it removed. Never raises: a leftover bundle is clutter, not a
+    reason to fail a launch.
+    """
+    target = Path(app_path) if app_path else default_app_path()
+    if target is None:
+        return []
+    if target.suffix == ".app":
+        directory, pattern = target.parent, f".{target.name}{PREVIOUS_SUFFIX}*"
+    else:
+        directory, pattern = target, f".*.app{PREVIOUS_SUFFIX}*"
+
+    removed: list[Path] = []
+    try:
+        candidates = sorted(directory.glob(pattern))
+    except OSError:
+        return removed
+    for candidate in candidates:
+        if PREVIOUS_SUFFIX not in candidate.name or not candidate.name.startswith("."):
+            continue  # defensive: the glob already says so
+        _remove_tree(candidate)
+        if not candidate.exists():
+            removed.append(candidate)
+    if removed:
+        logger.info("Removed %d bundle(s) left by a previous update", len(removed))
+    return removed
+
+
 def install_update(
     dmg_path: str | Path,
     app_path: str | Path,
     runner: Runner | None = None,
     mount_root: str | Path | None = None,
-    relaunch: bool = True,
-) -> Path:
+    relaunch: bool = False,
+    expected_team: str | None = None,
+    version: str | None = None,
+) -> InstallResult:
     """Mount ``dmg_path``, replace ``app_path`` with the app inside, relaunch.
 
     The swap is two renames on one volume — the new app moves into place only
@@ -465,8 +655,23 @@ def install_update(
     ``app_path`` is a single rename wide. macOS exposes no atomic directory
     exchange through Python.
 
+    **The replaced bundle is kept.** Deleting it would pull the ground out from
+    under the process asking for the update: a PyInstaller build imports
+    modules lazily out of its own bundle, so the running app starts failing at
+    the next import it has not made yet. It is renamed to
+    ``.<name>.previous-<version>`` instead, and the *next* launch clears it
+    through :func:`cleanup_previous_bundles`.
+
+    The caller decides what happens to the running process, because only it
+    knows how to shut itself down cleanly. By default nothing is relaunched:
+    :attr:`InstallResult.relaunch_cmd` is the ``open -n`` argv to run — ``-n``
+    because the old instance is still up and LaunchServices would otherwise
+    just activate it — after which the caller quits. ``relaunch=True`` runs it
+    here instead, which only makes sense when the caller quits immediately.
+
     Call :func:`verify_signature` on the DMG first; this function assumes the
-    image has already been vouched for.
+    image has already been vouched for, and re-verifies the copy it staged out
+    of it before touching the installed app.
     """
     runner = runner or _run
     dmg_path = Path(dmg_path)
@@ -506,22 +711,36 @@ def install_update(
         except OSError:
             pass
 
-    previous = app_path.parent / f".{app_path.name}.previous"
+    # The DMG was verified; this checks what actually came out of it, before
+    # anything on disk moves. Gatekeeper already assessed the image itself.
+    try:
+        verify_signature(staged, runner=runner, expected_team=expected_team, assess_gatekeeper=False)
+    except Exception:
+        _remove_tree(staged)
+        raise
+
+    previous = _previous_bundle_path(app_path, version)
     _remove_tree(previous)
-    if app_path.exists():
+    had_previous = app_path.exists()
+    if had_previous:
         os.replace(app_path, previous)
     try:
         os.replace(staged, app_path)
     except OSError as error:
-        if previous.exists() and not app_path.exists():
+        if had_previous and previous.exists() and not app_path.exists():
             os.replace(previous, app_path)
         _remove_tree(staged)
         raise UpdateError(f"could not move the new app into {app_path}: {error}") from error
-    _remove_tree(previous)
 
+    relaunch_cmd = ("open", "-n", str(app_path))
     if relaunch:
-        runner(["open", str(app_path)])
-    return app_path
+        runner(list(relaunch_cmd))
+    return InstallResult(
+        app_path=app_path,
+        previous_path=previous if had_previous else None,
+        relaunch_cmd=relaunch_cmd,
+        relaunched=relaunch,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -569,8 +788,16 @@ class UpdateService:
         """Return the newer release, or None when this build is current."""
         return check_for_update(self.current_version, self.feed)
 
-    def download_and_install(self, info: UpdateInfo, progress: ProgressCallback | None = None) -> Path:
-        """Download, verify, then install. Verification failure installs nothing."""
+    def download_and_install(
+        self, info: UpdateInfo, progress: ProgressCallback | None = None
+    ) -> InstallResult:
+        """Download, verify, then install. Verification failure installs nothing.
+
+        The returned :class:`InstallResult` says where the replaced bundle went
+        and how to start the new one. Nothing is relaunched here: the menu
+        action runs ``result.relaunch_cmd`` and then quits the app, and the new
+        instance calls :func:`cleanup_previous_bundles` on the way up.
+        """
         assert info is not None, "info is required"
         app_path = self.app_path
         scratch = None if self._download_dir else Path(tempfile.mkdtemp(prefix="murmur-download-"))
@@ -580,7 +807,13 @@ class UpdateService:
         try:
             download_dmg(info.dmg_url, dmg_path, progress=progress, opener=self._opener)
             verify_signature(dmg_path, runner=self._runner, expected_team=self._expected_team)
-            return install_update(dmg_path, app_path, runner=self._runner)
+            return install_update(
+                dmg_path,
+                app_path,
+                runner=self._runner,
+                expected_team=self._expected_team,
+                version=info.version,
+            )
         finally:
             dmg_path.unlink(missing_ok=True)
             if scratch is not None:
@@ -588,17 +821,23 @@ class UpdateService:
 
 
 __all__ = [
+    "ALLOWED_DOWNLOAD_HOSTS",
     "BUILD_INFO_NAME",
     "DEFAULT_FEED_URL",
     "EXPECTED_TEAM_ID",
+    "PREVIOUS_SUFFIX",
     "TEAM_ID_ENV_VAR",
+    "AllowlistRedirectHandler",
+    "InstallResult",
     "UpdateError",
     "UpdateFeed",
     "UpdateFeedError",
     "UpdateInfo",
     "UpdateService",
     "UpdateVerificationError",
+    "check_download_url",
     "check_for_update",
+    "cleanup_previous_bundles",
     "compare_versions",
     "default_app_path",
     "download_dmg",
@@ -607,5 +846,6 @@ __all__ = [
     "is_newer",
     "parse_team_identifier",
     "read_build_info",
+    "team_requirement",
     "verify_signature",
 ]

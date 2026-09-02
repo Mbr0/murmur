@@ -4,6 +4,7 @@ A real :class:`~engines.model_store.ModelStore` over a temporary root backs
 every test, so "installed" means files actually on disk. No AppKit, no network.
 """
 
+import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,7 +12,9 @@ from tempfile import TemporaryDirectory
 from cleanup.vocabulary import VocabularyError
 from engines.model_store import ModelFile, ModelSpec, ModelStore
 from services.model_profile_service import CHIP_APPLE_SILICON, CHIP_INTEL, VOXTRAL_MIN_RAM_GB
-from settings_window import VocabularySectionModel
+from engines.base import LANGUAGE_AUTO, WHISPER_LANGUAGES
+from services.language_service import available_languages
+from settings_window import CONFIG_LANGUAGE, LanguageSectionModel, VocabularySectionModel
 from ui.download_sheet import CONFIG_ENGINE_ID, CONFIG_MODEL_ID, EngineSectionModel
 
 TURBO_Q5 = ModelSpec(
@@ -51,6 +54,7 @@ class _Fixture:
         self.store = ModelStore(root=Path(tmp), catalog=CATALOG)
         self.config: dict = {}
         self.engine_changes: list[tuple[str, str]] = []
+        self.saved_changes: list[dict] = []
         self.saves = 0
 
     def install(self, spec: ModelSpec) -> None:
@@ -62,21 +66,31 @@ class _Fixture:
             with open(directory / item.name, "wb") as handle:
                 handle.truncate(item.size_bytes)
 
-    def section(self, chip=CHIP_APPLE_SILICON, ram_gb=VOXTRAL_MIN_RAM_GB, default_engine="whispercpp"):
+    def section(
+        self,
+        chip=CHIP_APPLE_SILICON,
+        ram_gb=VOXTRAL_MIN_RAM_GB,
+        default_engine="whispercpp",
+        refusal=None,
+    ):
+        def on_engine_change(engine, model):
+            self.engine_changes.append((engine, model))
+            return refusal
+
         return EngineSectionModel(
             self.config,
             self.store,
             chip=chip,
             ram_gb=ram_gb,
             default_engine=default_engine,
-            on_engine_change=lambda engine, model: self.engine_changes.append(
-                (engine, model)
-            ),
-            save=self._save,
+            on_engine_change=on_engine_change,
+            save_changes=self._save_changes,
         )
 
-    def _save(self, config):
-        assert config is self.config
+    def _save_changes(self, changes):
+        # Only the keys the section owns; never a whole-config snapshot.
+        assert set(changes) == {CONFIG_ENGINE_ID, CONFIG_MODEL_ID}, changes
+        self.saved_changes.append(dict(changes))
         self.saves += 1
 
 
@@ -160,6 +174,10 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(self.fx.config[CONFIG_MODEL_ID], "whispercpp-turbo")
         self.assertEqual(self.fx.engine_changes, [("whispercpp", "whispercpp-turbo")])
         self.assertEqual(self.fx.saves, 1)
+        self.assertEqual(
+            self.fx.saved_changes,
+            [{CONFIG_ENGINE_ID: "whispercpp", CONFIG_MODEL_ID: "whispercpp-turbo"}],
+        )
 
     def test_selecting_a_missing_model_only_moves_the_highlight(self):
         section = self.fx.section()
@@ -201,6 +219,63 @@ class SelectionTests(unittest.TestCase):
         self.assertTrue(section.selected_choice.installed)
         self.assertEqual(self.fx.config[CONFIG_MODEL_ID], "voxtral-4bit")
         self.assertEqual(self.fx.engine_changes, [("voxtral_mlx", "voxtral-4bit")])
+
+    def test_a_refused_swap_writes_nothing_and_reverts_the_highlight(self):
+        """Config must never claim an engine the app declined to load."""
+        self.fx.install(TURBO_Q5)
+        self.fx.install(TURBO)
+        self.fx.config.update(
+            {CONFIG_ENGINE_ID: "whispercpp", CONFIG_MODEL_ID: "whispercpp-turbo-q5"}
+        )
+        section = self.fx.section(refusal="Stop recording before switching.")
+
+        self.assertFalse(section.select("whispercpp-turbo"))
+
+        self.assertEqual(section.refusal, "Stop recording before switching.")
+        self.assertEqual(section.selected_model_id, "whispercpp-turbo-q5")
+        self.assertEqual(self.fx.config[CONFIG_MODEL_ID], "whispercpp-turbo-q5")
+        self.assertEqual(self.fx.saves, 0)
+        self.assertEqual(self.fx.saved_changes, [])
+
+    def test_the_app_is_asked_before_anything_is_written(self):
+        self.fx.install(TURBO)
+        seen = []
+        section = EngineSectionModel(
+            self.fx.config,
+            self.fx.store,
+            chip=CHIP_APPLE_SILICON,
+            ram_gb=VOXTRAL_MIN_RAM_GB,
+            default_engine="whispercpp",
+            on_engine_change=lambda engine, model: seen.append(
+                ("asked", self.fx.config.get(CONFIG_MODEL_ID))
+            ),
+            save_changes=lambda changes: seen.append(("saved", changes)),
+        )
+
+        self.assertTrue(section.select("whispercpp-turbo"))
+
+        self.assertEqual(seen[0], ("asked", None))  # nothing written yet
+        self.assertEqual(seen[1][0], "saved")
+        self.assertIsNone(section.refusal)
+
+    def test_an_accepted_swap_clears_an_earlier_refusal(self):
+        self.fx.install(TURBO)
+        self.fx.install(VOXTRAL)
+        refusals = ["busy", None]
+        section = EngineSectionModel(
+            self.fx.config,
+            self.fx.store,
+            chip=CHIP_APPLE_SILICON,
+            ram_gb=VOXTRAL_MIN_RAM_GB,
+            default_engine="whispercpp",
+            on_engine_change=lambda engine, model: refusals.pop(0),
+        )
+
+        self.assertFalse(section.select("whispercpp-turbo"))
+        self.assertEqual(section.refusal, "busy")
+
+        self.assertTrue(section.select("whispercpp-turbo"))
+        self.assertIsNone(section.refusal)
 
 
 class DeleteTests(unittest.TestCase):
@@ -367,6 +442,66 @@ class VocabularySectionModelTests(unittest.TestCase):
         self.assertIn("Line 3", str(caught.exception))
         self.assertEqual(model.terms, ["Boske", "Murmur"])
         self.assertEqual(model.row_count, 1)
+
+
+class LanguageSectionModelTests(unittest.TestCase):
+    """The Language popup's rows, and the one key it is allowed to write."""
+
+    WHISPER_CODES = available_languages(
+        types.SimpleNamespace(languages=WHISPER_LANGUAGES)
+    )
+
+    def test_an_untouched_popup_writes_nothing(self):
+        model = LanguageSectionModel({CONFIG_LANGUAGE: "fr"}, self.WHISPER_CODES)
+        self.assertEqual(model.changes_for_index(model.selected_index), {})
+
+    def test_saving_a_new_choice_writes_the_code(self):
+        model = LanguageSectionModel({CONFIG_LANGUAGE: "fr"}, self.WHISPER_CODES)
+        index = model.codes.index("nl")
+        self.assertEqual(model.changes_for_index(index), {CONFIG_LANGUAGE: "nl"})
+
+    def test_a_one_row_engine_cannot_overwrite_the_users_language(self):
+        """whisper.cpp reported only "auto"; every Save then wrote language=auto."""
+        model = LanguageSectionModel({CONFIG_LANGUAGE: "fr"}, (LANGUAGE_AUTO,))
+
+        self.assertIn("fr", model.codes)
+        self.assertEqual(model.selected_index, model.codes.index("fr"))
+        self.assertEqual(model.changes_for_index(model.selected_index), {})
+
+    def test_a_missing_language_gets_its_own_row_and_a_title(self):
+        model = LanguageSectionModel({CONFIG_LANGUAGE: "sv"}, (LANGUAGE_AUTO, "en"))
+        self.assertEqual(model.codes, (LANGUAGE_AUTO, "en", "sv"))
+        self.assertEqual(model.titles, ("Automatic", "English", "SV"))
+
+    def test_auto_is_the_default_when_config_says_nothing(self):
+        model = LanguageSectionModel({}, self.WHISPER_CODES)
+        self.assertEqual(model.initial, LANGUAGE_AUTO)
+        self.assertEqual(model.code_at(model.selected_index), LANGUAGE_AUTO)
+
+    def test_switching_engines_relists_languages_and_keeps_the_choice(self):
+        """The popup used to keep the old engine's list, and save by index."""
+        model = LanguageSectionModel({CONFIG_LANGUAGE: "nl"}, self.WHISPER_CODES)
+        voxtral_codes = (LANGUAGE_AUTO, "en", "es", "fr", "nl", "pt")
+
+        rebuilt = model.rebuilt(voxtral_codes, model.selected_index)
+
+        self.assertEqual(rebuilt.codes, voxtral_codes)
+        self.assertEqual(rebuilt.code_at(rebuilt.selected_index), "nl")
+        self.assertEqual(rebuilt.changes_for_index(rebuilt.selected_index), {})
+
+    def test_a_language_the_new_engine_lacks_survives_the_switch(self):
+        model = LanguageSectionModel({CONFIG_LANGUAGE: "ja"}, self.WHISPER_CODES)
+
+        rebuilt = model.rebuilt((LANGUAGE_AUTO, "en", "fr"), model.selected_index)
+
+        self.assertIn("ja", rebuilt.codes)
+        self.assertEqual(rebuilt.code_at(rebuilt.selected_index), "ja")
+
+    def test_an_out_of_range_row_is_a_programming_error(self):
+        model = LanguageSectionModel({}, (LANGUAGE_AUTO, "en"))
+        with self.assertRaises(AssertionError):
+            model.code_at(2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,10 @@ ONBOARDING_VERSION = 1
 
 CONFIG_KEY_COMPLETED = "onboarding_completed"
 CONFIG_KEY_VERSION = "onboarding_version"
+#: Same two keys the Settings engine section owns (``ui/download_sheet.py``).
+#: The wizard writes them when — and only when — its engine step ended ready.
+CONFIG_KEY_ENGINE_ID = "engine_id"
+CONFIG_KEY_MODEL_ID = "model_id"
 
 STEP_WELCOME = "welcome"
 STEP_MICROPHONE = "microphone"
@@ -154,14 +158,18 @@ STRINGS: dict[str, dict[str, str]] = {
 
 
 def format_size(size_bytes: int) -> str:
-    """Human-readable model size; ``0`` means the size is not on record."""
+    """Human-readable model size; ``0`` means the size is not on record.
+
+    Delegates to :func:`engines.model_store.human_size`, which formats in the
+    decimal units model sources publish. A second formatter here, in binary
+    units, printed a different size for the same model than the Settings
+    download sheet did.
+    """
     if not size_bytes:
         return "unknown size"
-    if size_bytes >= 1024**3:
-        return f"{size_bytes / 1024**3:.1f} GB"
-    if size_bytes >= 1024**2:
-        return f"{size_bytes / 1024**2:.0f} MB"
-    return f"{size_bytes / 1024:.0f} KB"
+    from engines.model_store import human_size
+
+    return human_size(size_bytes)
 
 
 def should_show(config: dict[str, Any]) -> bool:
@@ -444,8 +452,23 @@ class OnboardingState:
         ]
 
     def to_config(self) -> dict[str, Any]:
-        """Config updates to persist when the wizard closes."""
-        return {CONFIG_KEY_COMPLETED: True, CONFIG_KEY_VERSION: ONBOARDING_VERSION}
+        """Config updates to persist when the wizard closes.
+
+        The engine keys come along only when the engine step actually ended
+        ready — downloaded here, or already on disk. Without them the wizard
+        could fetch a model and then leave the app with no engine recorded, so
+        the next launch reported no model and reopened the wizard. A skipped or
+        failed step writes nothing, rather than naming a model that is absent.
+        """
+        updates: dict[str, Any] = {
+            CONFIG_KEY_COMPLETED: True,
+            CONFIG_KEY_VERSION: ONBOARDING_VERSION,
+        }
+        if self._statuses[STEP_ENGINE] == STATUS_READY:
+            choice = self.engine_choice
+            updates[CONFIG_KEY_ENGINE_ID] = choice.engine_id
+            updates[CONFIG_KEY_MODEL_ID] = choice.model_id
+        return updates
 
     # -- actions ----------------------------------------------------------
 
@@ -515,16 +538,24 @@ class OnboardingState:
         :class:`engines.model_store.ModelStore` documents; the window hops to
         the main thread itself.
         """
+        from ui.download_sheet import DownloadSheetState
+
         downloader = self._download or default_download
         model_id = self.engine_choice.model_id
+        # Ticks describe one file at a time, and a model can be several. Summing
+        # them is what the Settings sheet already does, so the wizard borrows the
+        # same state object rather than reporting the current file as the whole
+        # model — which reset the bar to zero as each new file opened.
+        progress_state = DownloadSheetState(model_id)
         self.download_bytes_done = 0
         self.download_bytes_total = 0
         self._errors.pop(STEP_ENGINE, None)
         self._set_status(STEP_ENGINE, STATUS_DOWNLOADING)
 
         def tick(update: Any) -> None:
-            self.download_bytes_done = getattr(update, "bytes_done", 0)
-            self.download_bytes_total = getattr(update, "bytes_total", 0)
+            progress_state.update(update)
+            self.download_bytes_done = progress_state.bytes_done
+            self.download_bytes_total = progress_state.bytes_total
             observer = self.on_download_progress
             if observer is not None:
                 observer(update)

@@ -7,6 +7,8 @@ Wave 1d changes:
   drops them, so they are excluded outright rather than merely not collected —
   ``mlx_audio`` carries TTS modules that import torch, and a torch left in the
   build environment would otherwise be dragged back in through them.
+- ``ffmpeg`` and ``ffprobe`` are gone with them: they were bundled only for
+  that adapter, and nothing in the app shells out to either any more.
 - The whisper.cpp ``whisper-server`` binary is bundled as ``bin/whisper-server``
   (decision D2). ``engines.whispercpp.resolve_whisper_server_binary()`` looks
   for it at ``<sys._MEIPASS>/bin/whisper-server`` when frozen.
@@ -20,7 +22,6 @@ Wave 1d changes:
 import importlib.util
 import os
 import platform
-import shutil
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
@@ -42,36 +43,6 @@ if not os.path.isfile(WHISPER_SERVER):
         "   process; without the binary the default engine cannot start.)"
     )
 
-# --- ffmpeg -----------------------------------------------------------------
-# Still bundled for the legacy openai-whisper adapter, which murmur.py patches
-# onto PATH at startup. Drop both once engines/whisper_openai.py is archived.
-# PATH first; then Apple Silicon Homebrew, then Intel Homebrew.
-# If none exist, keep a conventional path — isfile checks below skip bundling.
-ffmpeg_path = next(
-    (
-        p
-        for p in (
-            shutil.which("ffmpeg"),
-            "/opt/homebrew/bin/ffmpeg",
-            "/usr/local/bin/ffmpeg",
-        )
-        if p and os.path.isfile(p)
-    ),
-    "/opt/homebrew/bin/ffmpeg",
-)
-ffprobe_path = next(
-    (
-        p
-        for p in (
-            shutil.which("ffprobe"),
-            "/opt/homebrew/bin/ffprobe",
-            "/usr/local/bin/ffprobe",
-        )
-        if p and os.path.isfile(p)
-    ),
-    "/opt/homebrew/bin/ffprobe",
-)
-
 datas = [
     ("assets/icons/logo_menu_template.png", "assets/icons"),
     ("assets/icons/logo_menu_white.png", "assets/icons"),
@@ -88,11 +59,11 @@ datas = [
 ]
 
 # Destination "bin" puts it at <sys._MEIPASS>/bin/whisper-server.
+# ffmpeg and ffprobe used to sit beside it for the openai-whisper adapter. That
+# adapter is archived, nothing left in the app shells out to either binary, and
+# whisper.cpp reads the WAV the recorder already writes — so they are gone, and
+# with them two Homebrew binaries of someone else's provenance in a signed bundle.
 binaries = [(WHISPER_SERVER, "bin")]
-if os.path.isfile(ffmpeg_path):
-    binaries.append((ffmpeg_path, "."))
-if os.path.isfile(ffprobe_path):
-    binaries.append((ffprobe_path, "."))
 
 hiddenimports = [
     "rumps",

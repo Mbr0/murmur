@@ -17,6 +17,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from engines import EngineError, EngineNotLoadedError, EngineUnavailableError, Hints, create_engine
+from engines.base import LANGUAGE_AUTO, WHISPER_LANGUAGES
 from engines.whispercpp import (
     BINARY_ENV_VAR,
     ENGINE_CLASS,
@@ -348,11 +349,20 @@ class LifecycleTests(ServerBackedTestCase):
         info = self.make_engine().info()
         self.assertEqual(info.id, "whispercpp")
         self.assertEqual(info.model_id, "ggml-large-v3-turbo")
-        self.assertEqual(info.languages, ("auto",))
         self.assertFalse(info.supports_streaming)
         self.assertTrue(info.supports_hints)
         self.assertFalse(info.requires_apple_silicon)
         self.assertEqual(info.size_bytes, self.model_path.stat().st_size)
+
+    def test_info_lists_the_whisper_languages_not_only_auto(self):
+        """A one-row picker is the bug: Settings must be able to offer a language."""
+        info = self.make_engine().info()
+        self.assertEqual(info.languages, WHISPER_LANGUAGES)
+        self.assertEqual(info.languages[0], LANGUAGE_AUTO)
+        for code in ("en", "fr", "nl", "de", "es", "ja", "zh"):
+            self.assertIn(code, info.languages, code)
+        self.assertGreater(len(info.languages), 1)
+        self.assertEqual(len(set(info.languages)), len(info.languages))
 
 
 class TranscriptionTests(ServerBackedTestCase):

@@ -138,16 +138,30 @@ sign_macho "${APP_BUNDLE}"
 codesign --verify --strict --verbose=2 "${APP_BUNDLE}"
 
 if [ "${NOTARIZE}" = "true" ]; then
-    if [ -z "${CODE_SIGN_IDENTITY}" ] || [ -z "${APPLE_ID}" ] || [ -z "${APPLE_TEAM_ID}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD}" ]; then
-        echo "NOTARIZE=true requires CODE_SIGN_IDENTITY, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_SPECIFIC_PASSWORD."
-        exit 1
+    # A stored keychain profile keeps the password out of the environment as
+    # well as out of argv; without one, "@env:" at least keeps it out of argv,
+    # where `ps` shows every argument to every user on the machine.
+    if [ -n "${NOTARY_KEYCHAIN_PROFILE:-}" ]; then
+        NOTARY_ARGS=(--keychain-profile "${NOTARY_KEYCHAIN_PROFILE}")
+        if [ -z "${CODE_SIGN_IDENTITY}" ]; then
+            echo "NOTARIZE=true requires CODE_SIGN_IDENTITY."
+            exit 1
+        fi
+    else
+        if [ -z "${CODE_SIGN_IDENTITY}" ] || [ -z "${APPLE_ID}" ] || [ -z "${APPLE_TEAM_ID}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD}" ]; then
+            echo "NOTARIZE=true requires CODE_SIGN_IDENTITY, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_SPECIFIC_PASSWORD"
+            echo "(or NOTARY_KEYCHAIN_PROFILE — see RELEASE_SIGNING.md)."
+            exit 1
+        fi
+        NOTARY_ARGS=(
+            --apple-id "${APPLE_ID}"
+            --team-id "${APPLE_TEAM_ID}"
+            --password "@env:APPLE_APP_SPECIFIC_PASSWORD"
+        )
+        export APPLE_APP_SPECIFIC_PASSWORD
     fi
     ditto -c -k --sequesterRsrc --keepParent "${APP_BUNDLE}" "${ZIP_PATH}"
-    xcrun notarytool submit "${ZIP_PATH}" \
-        --apple-id "${APPLE_ID}" \
-        --team-id "${APPLE_TEAM_ID}" \
-        --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
-        --wait
+    xcrun notarytool submit "${ZIP_PATH}" "${NOTARY_ARGS[@]}" --wait
     xcrun stapler staple "${APP_BUNDLE}"
     echo "Notarization complete."
 fi
