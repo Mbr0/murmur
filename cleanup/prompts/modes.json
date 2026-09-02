@@ -1,0 +1,32 @@
+{
+  "dictation": {
+    "display_name": "Dictation",
+    "description": "Verbatim. No cleanup at all.",
+    "is_passthrough": true,
+    "default_tone": "neutral"
+  },
+  "message": {
+    "display_name": "Message",
+    "description": "Short and casual, for chat and texts.",
+    "is_passthrough": false,
+    "default_tone": "neutral"
+  },
+  "mail": {
+    "display_name": "Mail",
+    "description": "A written email; greeting and sign-off only when it reads like one.",
+    "is_passthrough": false,
+    "default_tone": "neutral"
+  },
+  "notes": {
+    "display_name": "Notes",
+    "description": "A personal note; bullet-ish lines when the dictation lists things.",
+    "is_passthrough": false,
+    "default_tone": "neutral"
+  },
+  "code": {
+    "display_name": "Code",
+    "description": "Fixes dictation artefacts only; code tokens stay untouched.",
+    "is_passthrough": false,
+    "default_tone": "neutral"
+  }
+}

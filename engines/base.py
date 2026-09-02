@@ -90,7 +90,14 @@ class Transcript:
 
 @dataclass(frozen=True)
 class Partial:
-    """Intermediate result emitted while streaming."""
+    """Intermediate result emitted while streaming.
+
+    ``text`` is the full text so far, not a delta: every partial carries the
+    whole utterance as the engine understands it at that moment, so a consumer
+    **replaces** what it holds rather than appending. A later partial may even
+    be shorter than the one before it, because the decoder is free to revise a
+    word it has already emitted.
+    """
 
     text: str
     is_final: bool
