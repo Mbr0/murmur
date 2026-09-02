@@ -340,7 +340,21 @@ class VoxtralMlxEngine(Engine):
             hints_applied=hints_applied,
         )
 
-    def _stream(self, chunks: Iterable[bytes]) -> Iterator[Partial]:
+    def _stream(
+        self,
+        chunks: Iterable[bytes],
+        language: str | None = None,
+        hints: Hints | None = None,
+    ) -> Iterator[Partial]:
+        """``language`` and ``hints`` are accepted and ignored.
+
+        The realtime session takes neither: there is no language flag and no
+        initial-prompt equivalent to bias it with. They are in the signature so
+        the live and batch paths describe an utterance identically, and because
+        the app's rule for when a live decode may stand in for the batch one
+        (:meth:`Engine.stream`) depends on the caller having passed the
+        language, not on this engine having used it.
+        """
         session = self._runtime.create_session(self._model)
         assert session is not None, "runtime.create_session() returned None"
         text = ""

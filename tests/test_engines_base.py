@@ -70,7 +70,14 @@ class FakeEngine(Engine):
 class StreamingFakeEngine(FakeEngine):
     supports_streaming = True
 
-    def _stream(self, chunks):
+    def __init__(self):
+        super().__init__()
+        self.last_stream_language = "unset"
+        self.last_stream_hints = "unset"
+
+    def _stream(self, chunks, language=None, hints=None):
+        self.last_stream_language = language
+        self.last_stream_hints = hints
         for index, chunk in enumerate(chunks):
             yield Partial(text=chunk.decode(), is_final=False, start_s=float(index))
         yield Partial(text="done", is_final=True)
@@ -243,6 +250,23 @@ class EngineContractTests(unittest.TestCase):
         partials = list(engine.stream([b"one", b"two"]))
         self.assertEqual([p.text for p in partials], ["one", "two", "done"])
         self.assertEqual([p.is_final for p in partials], [False, False, True])
+
+    def test_stream_passes_the_language_and_hints_through(self):
+        # The live path describes an utterance exactly as the batch path does,
+        # so a caller never has to know which one decoded it.
+        engine = StreamingFakeEngine()
+        engine.load()
+        hints = Hints(vocabulary=("Murmur",))
+        list(engine.stream([b"one"], language="fr", hints=hints))
+        self.assertEqual(engine.last_stream_language, "fr")
+        self.assertIs(engine.last_stream_hints, hints)
+
+    def test_stream_defaults_to_auto_detection_and_no_hints(self):
+        engine = StreamingFakeEngine()
+        engine.load()
+        list(engine.stream([b"one"]))
+        self.assertIsNone(engine.last_stream_language)
+        self.assertIsNone(engine.last_stream_hints)
 
     def test_streaming_engine_without_stream_implementation_fails_loudly(self):
         class BrokenStreamer(FakeEngine):

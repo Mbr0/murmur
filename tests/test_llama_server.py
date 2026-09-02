@@ -303,6 +303,52 @@ class LifecycleTests(ServerBackedTestCase):
         self.assertTrue(spawn.process.stderr.closed)
 
 
+class InterruptedStartTests(ServerBackedTestCase):
+    """Quitting during the model load must not leave a 2 GB child behind."""
+
+    def test_stop_during_a_start_aborts_it_and_kills_the_child(self):
+        # The realistic case: the user quits while the first cleanup is still
+        # loading the GGUF. start() holds no lock stop() needs, and the child
+        # it already spawned is terminated rather than orphaned.
+        self.recorder.healthy = False  # /health never comes good
+        spawn = FakeSpawn()
+        server = self.make_server(spawn=spawn, startup_timeout_s=30.0)
+        failures = []
+
+        def run():
+            try:
+                server.start()
+            except LlamaServerError as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and spawn.process is None:
+            time.sleep(0.01)
+        self.assertIsNotNone(spawn.process, "the child was never spawned")
+
+        started_at = time.monotonic()
+        server.stop()
+        elapsed = time.monotonic() - started_at
+
+        worker.join(5.0)
+        self.assertFalse(worker.is_alive())
+        self.assertLess(elapsed, 2.0)
+        self.assertTrue(spawn.process.terminated)
+        self.assertFalse(server.is_running)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("stopped", str(failures[0]).lower())
+
+    def test_a_start_after_a_stop_is_allowed_again(self):
+        # stop() must not poison the object: CleanupRuntime builds a fresh
+        # server per attempt, but a restart of the same one has to work.
+        server = self.make_server()
+        server.stop()
+        server.start()
+        self.assertTrue(server.is_running)
+
+
 SYSTEM_PROMPT = "Clean up the transcript. Return only the cleaned text."
 
 

@@ -5,6 +5,7 @@ placement maths and the presenter (driven with a fake window and a fake
 main-thread hop). No test asserts on transcript text reaching a log.
 """
 
+import threading
 import unittest
 
 from engines import Partial
@@ -533,6 +534,55 @@ class PillPresenterTests(unittest.TestCase):
         self.assertEqual(self.window.calls[-1][1], PHASE_ERROR)
         self.assertAlmostEqual(self.timers.last.interval, ERROR_HIDE_AFTER_S)
         self.assertTrue(self.timers.last.started)
+
+    def test_feed_stream_stops_touching_the_pill_once_it_is_cancelled(self):
+        # The batch path gave up on this decoder and the next utterance owns the
+        # pill now. A late partial from the abandoned worker must not appear.
+        cancelled = threading.Event()
+
+        def stream():
+            yield Partial(text="first", is_final=False)
+            cancelled.set()
+            yield Partial(text="stale words", is_final=False)
+
+        self.presenter.listening()
+        text = self.presenter.feed_stream(stream(), cancelled=cancelled)
+
+        self.assertEqual(text, "first")
+        self.assertNotIn("stale", self.presenter.state.text)
+        self.assertNotIn("stale", [call[2] for call in self.window.calls if len(call) > 2])
+
+    def test_a_cancelled_stream_that_dies_does_not_show_an_error(self):
+        # The pill belongs to the next utterance; an error from the abandoned
+        # worker would wipe the live text the user is watching.
+        cancelled = threading.Event()
+
+        def dying_stream():
+            yield Partial(text="hello", is_final=False)
+            cancelled.set()
+            raise RuntimeError("engine died")
+
+        self.presenter.listening()
+        with self.assertRaises(RuntimeError):
+            self.presenter.feed_stream(dying_stream(), cancelled=cancelled)
+
+        self.assertNotEqual(self.presenter.state.phase, PHASE_ERROR)
+
+    def test_working_can_show_a_label_instead_of_the_transcript(self):
+        self.presenter.listening()
+        self.presenter.partial(Partial(text="the quick brown fox", is_final=False))
+
+        state = self.presenter.working(label="Preparing cleanup…")
+
+        self.assertEqual(state.phase, PHASE_WORKING)
+        self.assertEqual(state.text, "Preparing cleanup…")
+        # The transcript is kept: the done state still reports it.
+        self.assertEqual(self.presenter.text, "the quick brown fox")
+
+    def test_working_without_a_label_still_shows_the_transcript(self):
+        self.presenter.listening()
+        self.presenter.partial(Partial(text="hello there", is_final=False))
+        self.assertEqual(self.presenter.working().text, "hello there")
 
     def test_feed_stream_drops_the_partial_transcript_when_the_engine_fails(self):
         def dying_stream():

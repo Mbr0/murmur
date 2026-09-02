@@ -363,6 +363,14 @@ class LlamaServer:
         self._stderr: _StderrDrain | None = None
         self._port: int | None = None
         self._exit_code: int | None = None
+        # Held only for pointer swaps — never across a wait, a poll or a
+        # terminate — so stop() can interrupt a start() that is still loading
+        # the GGUF without ever queueing behind it.
+        self._lifecycle = threading.Lock()
+        #: The child start() has spawned but not yet accepted, so stop() can
+        #: reach it. Without this a quit during the 60 s load orphans 2 GB.
+        self._starting = None
+        self._stop_requested = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -456,6 +464,10 @@ class LlamaServer:
         if self.is_running:
             return
         self._exit_code = None
+        with self._lifecycle:
+            # A fresh start clears an older stop: stop() is also how a dead
+            # child is reaped, and that must not veto the next attempt.
+            self._stop_requested = False
 
         binary = self._resolve_binary()
         port = _free_port()
@@ -466,20 +478,40 @@ class LlamaServer:
         started_at = time.monotonic()
         process = self._spawn(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         drain = _StderrDrain.attach(process)
+        with self._lifecycle:
+            self._starting = process
         deadline = started_at + self._startup_timeout_s
         while True:
+            if self._stop_requested:
+                # The app is quitting. Kill what we spawned and say so rather
+                # than polling /health for another minute nobody is waiting on.
+                self._release_starting(process, drain)
+                raise LlamaServerError(
+                    f"{BINARY_NAME} was stopped while it was still starting"
+                )
             if process.poll() is not None:
                 exit_code = process.returncode
-                self._stop(process, drain)
+                self._release_starting(process, drain)
                 detail = _stderr_tail(drain)
                 raise LlamaServerError(
                     f"{BINARY_NAME} exited with code {exit_code} during startup"
                     + (f": {detail}" if detail else "")
                 )
             if self._health_ok(port):
-                self._process = process
-                self._stderr = drain
-                self._port = port
+                with self._lifecycle:
+                    self._starting = None
+                    stopped = self._stop_requested
+                    if not stopped:
+                        self._process = process
+                        self._stderr = drain
+                        self._port = port
+                if stopped:
+                    # It came up after the app asked to quit. Nothing will ever
+                    # use it, so it is shut down here rather than published.
+                    self._stop(process, drain)
+                    raise LlamaServerError(
+                        f"{BINARY_NAME} was stopped while it was still starting"
+                    )
                 logger.info(
                     "%s ready on port %d after %.1fs",
                     BINARY_NAME,
@@ -491,13 +523,20 @@ class LlamaServer:
                 break
             time.sleep(_HEALTH_POLL_INTERVAL_S)
 
-        self._stop(process, drain)
+        self._release_starting(process, drain)
         detail = _stderr_tail(drain)
         raise LlamaServerError(
             f"{BINARY_NAME} did not answer {HEALTH_PATH} within "
             f"{self._startup_timeout_s:g}s on port {port}"
             + (f": {detail}" if detail else "")
         )
+
+    def _release_starting(self, process, drain: "_StderrDrain | None") -> None:
+        """Forget the child :meth:`start` was waiting on, then stop it."""
+        with self._lifecycle:
+            if self._starting is process:
+                self._starting = None
+        self._stop(process, drain)
 
     def _health_ok(self, port: int) -> bool:
         """True when ``GET /health`` answers 2xx. A 503 or any failure is "not yet"."""
@@ -547,11 +586,23 @@ class LlamaServer:
                 pass
 
     def stop(self) -> None:
-        """Stop the child, close its pipes and join the drain. Idempotent."""
-        process, self._process = self._process, None
-        drain, self._stderr = self._stderr, None
-        self._port = None
+        """Stop the child, close its pipes and join the drain. Idempotent.
+
+        Safe to call from another thread while :meth:`start` is still loading
+        the model: the flag makes that loop give up on its next pass, and the
+        child it already spawned is terminated here rather than orphaned. The
+        only waits are the bounded ones in :meth:`_stop`, so a quit costs at
+        most a terminate-then-kill grace period, never a model load.
+        """
+        with self._lifecycle:
+            self._stop_requested = True
+            process, self._process = self._process, None
+            starting, self._starting = self._starting, None
+            drain, self._stderr = self._stderr, None
+            self._port = None
         self._stop(process, drain)
+        if starting is not None and starting is not process:
+            self._stop(starting)
 
 
 @dataclass(frozen=True)

@@ -250,6 +250,38 @@ class DownloadController:
             self._on_change(self.state)
 
 
+def download_model(
+    store,
+    model_id: str,
+    *,
+    total_bytes: int = 0,
+    on_change: Callable[[DownloadSheetState], None] | None = None,
+    dispatch: Callable[[Callable[[], None]], None] | None = None,
+    spawn: Callable[[Callable[[], None]], object] | None = None,
+) -> DownloadController:
+    """Start a download for *any* catalog model and return its controller.
+
+    :class:`EngineSectionModel` deliberately hides everything that is not a
+    speech engine, so the cleanup GGUF has no row, no Download button and no way
+    into the sheet. This is the door for those: same store, same resume, same
+    checksums, same progress state — only the popup is bypassed.
+
+    ``total_bytes`` seeds the progress bar from the catalog size, which keeps it
+    honest before the first file is opened; 0 simply means "unknown yet".
+    """
+    assert store is not None, "store is required"
+    assert model_id, "model_id is required"
+    assert total_bytes >= 0, f"total_bytes cannot be negative: {total_bytes}"
+    kwargs = {}
+    if dispatch is not None:
+        kwargs["dispatch"] = dispatch
+    if spawn is not None:
+        kwargs["spawn"] = spawn
+    controller = DownloadController(store, on_change=on_change, **kwargs)
+    controller.start(model_id, total_bytes)
+    return controller
+
+
 @dataclass(frozen=True)
 class EngineChoice:
     """One row of the "Speech engine" popup."""
@@ -522,5 +554,6 @@ __all__ = [
     "DownloadSheetState",
     "EngineChoice",
     "EngineSectionModel",
+    "download_model",
     "main_thread_dispatcher",
 ]

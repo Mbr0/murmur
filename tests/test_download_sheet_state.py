@@ -32,6 +32,7 @@ from ui.download_sheet import (
     DownloadController,
     DownloadSheetState,
     EngineSectionModel,
+    download_model,
 )
 
 GB = 1_000_000_000
@@ -277,6 +278,44 @@ class DownloadControllerTests(unittest.TestCase):
         self.assertTrue(finished.wait(timeout=5), "download thread never finished")
         self.assertEqual(controller.state.phase, PHASE_DONE)
         self.assertFalse(controller.is_running)
+
+
+class DownloadModelEntryPointTests(unittest.TestCase):
+    """The way a non-speech model (the cleanup GGUF) is fetched.
+
+    ``EngineSectionModel`` filters the cleanup model out of the popup on
+    purpose, so without this entry point the only way to download it was the
+    one-shot alert — and a single "Not now" left it unreachable for good.
+    """
+
+    def test_it_downloads_a_model_the_speech_popup_never_lists(self):
+        store = _FakeStore(ticks=[_tick("cleanup.gguf", 100, 100, True)])
+        seen = []
+        controller = download_model(
+            store,
+            CLEANUP_MODEL_SPEC.id,
+            total_bytes=100,
+            dispatch=lambda func: func(),
+            spawn=lambda func: func(),
+            on_change=lambda state: seen.append(state.phase),
+        )
+
+        self.assertEqual(store.downloaded, [CLEANUP_MODEL_SPEC.id])
+        self.assertEqual(store.verified, [CLEANUP_MODEL_SPEC.id])
+        self.assertEqual(controller.state.phase, PHASE_DONE)
+        self.assertEqual(seen[-1], PHASE_DONE)
+        self.assertFalse(controller.is_running)
+
+    def test_a_failure_is_reported_as_sheet_state_not_an_exception(self):
+        store = _FakeStore(download_error=ModelStoreError("cannot reach host"))
+        controller = download_model(
+            store,
+            CLEANUP_MODEL_SPEC.id,
+            dispatch=lambda func: func(),
+            spawn=lambda func: func(),
+        )
+        self.assertEqual(controller.state.phase, PHASE_FAILED)
+        self.assertIn("cannot reach host", controller.state.error)
 
 
 class SpeechEngineFilterTests(unittest.TestCase):

@@ -74,6 +74,7 @@ logger = _configure_logging()
 if hasattr(sys, '_MEIPASS'):
     logger.info(f"Added bundled resources to PATH: {sys._MEIPASS}")
 
+import itertools
 import pyperclip
 import threading
 import subprocess
@@ -109,7 +110,12 @@ from cleanup.vocabulary import (
 from engines import create_engine
 from engines.model_store import CATALOG, ModelIntegrityError, ModelStore, models_for_engine
 from transcription_filters import is_likely_hallucination, should_skip_audio
-from ui.download_sheet import PHASE_DONE, PHASE_FAILED, PHASE_IDLE, DownloadController
+from ui.download_sheet import (
+    PHASE_DONE,
+    PHASE_FAILED,
+    PHASE_IDLE,
+    download_model,
+)
 from ui.pill_window import PillPresenter
 from ui.onboarding_window import OnboardingCallbacks, should_show, show_onboarding
 from services.audio_capture_service import AudioCaptureService
@@ -134,7 +140,10 @@ from services.hotkey_service import (
     reset_accessibility_permission,
     unregister_global_hotkey,
 )
-from services.model_profile_service import default_engine_for_current_machine
+from services.model_profile_service import (
+    default_engine_for_current_machine,
+    detect_ram_gb,
+)
 from services.persistence_service import (
     DEFAULT_CONFIG,
     PersistencePaths,
@@ -607,6 +616,7 @@ def reload_engine_decision(
     is_recording: bool,
     is_processing: bool,
     engine_ready: bool,
+    stream_active: bool = False,
 ) -> str:
     """Whether a requested engine swap may start now.
 
@@ -615,13 +625,19 @@ def reload_engine_decision(
     is easier to act on than a delayed surprise. Recording and transcription
     both hold the engine, so both block; a second request while one is already
     in flight is refused too.
+
+    ``stream_active`` is the fourth holder and the least obvious one: when the
+    batch path gives up waiting for the live decoder it clears both flags and
+    finishes the utterance, while the abandoned worker is still inside
+    ``engine.stream()``. The app looks idle and is not, so a swap there would
+    call ``unload()`` on a model being read.
     """
     assert requested and len(requested) == 2, "requested is (engine_id, model_id)"
     if is_reloading:
         return RELOAD_BUSY
     if is_recording:
         return RELOAD_RECORDING
-    if is_processing:
+    if is_processing or stream_active:
         return RELOAD_BUSY
     if engine_ready and tuple(active) == tuple(requested):
         return RELOAD_UNCHANGED
@@ -696,6 +712,44 @@ def finalize_transcript(
     return replace(raw_text, vocabulary), hallucination
 
 
+def reapply_replacements(text: str, vocabulary, *, replace=apply_replacements) -> str:
+    """Run the user's replacements again over cleaned-up text.
+
+    The cleanup pass rewrites sentences, and a rewrite re-cases words: a term
+    the user spelled "Murmur" comes back "murmur" the moment the model starts a
+    clause with it. The replacements are cheap and idempotent, so the cheapest
+    honest fix is to apply them once more on the way to the clipboard.
+
+    Deliberately *not* the hallucination filter. That reads the engine's own
+    words (see :func:`finalize_transcript`); re-judging a sentence the model
+    wrote would let its phrasing suppress a real transcript.
+    """
+    assert text is not None, "text is required"
+    return replace(text, vocabulary)
+
+
+def stream_text_for_token(result, token) -> str | None:
+    """The live decoder's text, but only when it belongs to ``token``.
+
+    Every utterance takes a number. The worker publishes ``(token, text)`` and
+    the collector accepts it only while that number is still the current one.
+
+    Without it: a stream that overran its join timeout was abandoned, kept
+    running, and eventually wrote its text into the same slot — which the *next*
+    utterance then read and pasted. The user said one thing and got the previous
+    sentence. Returns None for a stale token, a stream that failed, or one that
+    produced nothing but whitespace.
+    """
+    if result is None or token is None:
+        return None
+    result_token, text = result
+    if result_token != token:
+        return None
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Cleanup pipeline (Wave 2)
 # ---------------------------------------------------------------------------
@@ -720,6 +774,41 @@ CLEANUP_START_FAILED_REASON = "the cleanup server could not start"
 
 #: Reason given when it comes up and dies again on the very next request.
 CLEANUP_UNSTABLE_REASON = "the cleanup server keeps stopping"
+
+#: Reason given when the server is still loading the model. Not a failure: the
+#: start carries on in the background, so the next utterance is cleaned.
+CLEANUP_NOT_READY_REASON = "the cleanup model is still loading"
+
+#: Reason given for a request that arrives after the app has begun quitting.
+CLEANUP_STOPPING_REASON = "Murmur is shutting the cleanup server down"
+
+#: How long one utterance may wait for the cleanup server's *first* start.
+#: The load itself is allowed up to ``LlamaServer.startup_timeout_s`` (60 s, and
+#: the client retries once on a dead child, so ~120 s in the worst case) and it
+#: keeps running in the background past this — but the user is standing there
+#: holding a finished sentence, and eight seconds is already a long time to
+#: watch a pill say nothing. Past it the raw text is pasted with a visible
+#: notice and the *next* utterance gets the cleaned version.
+CLEANUP_FIRST_USE_WAIT_S = 8.0
+
+#: What to do about a cleanup that did not run. See :func:`cleanup_notice_kind`.
+CLEANUP_NOTICE_NOTIFY = "notify"
+CLEANUP_NOTICE_OFFER = "offer"
+
+#: Menu entry that fetches the cleanup GGUF. It is not a speech engine, so the
+#: Settings popup filters it out and this is its only permanent home.
+CLEANUP_DOWNLOAD_MENU_TITLE = "Download cleanup model…"
+
+#: Hidden config key: start the cleanup server at launch rather than on the
+#: first utterance. Absent from ``DEFAULT_CONFIG`` on purpose — it costs 2 GB of
+#: resident memory for a feature the user may not touch this session, so it is
+#: opt-out for machines that can clearly afford it and invisible elsewhere.
+CLEANUP_PREWARM_KEY = "cleanup_prewarm"
+CLEANUP_PREWARM_DEFAULT = True
+
+#: Below this, pre-warming competes with the speech model for RAM and the Mac
+#: starts swapping mid-dictation. Matches the cleanup feature's own floor.
+CLEANUP_PREWARM_MIN_RAM_GB = 16
 
 #: Why cleanup did not run, when the answer is configuration rather than a
 #: failure. These are the user's own settings, so they are logged, never shown.
@@ -747,6 +836,24 @@ def pro_enabled(feature: str, config: dict | None = None) -> bool:
     return bool(config.get(PRO_OVERRIDE_KEY, False))
 
 
+def language_is_auto(language: str | None) -> bool:
+    """Whether the configured language leaves detection to the engine.
+
+    The one place that decides what "auto" means, because two very different
+    things depend on the answer and they must never disagree:
+
+    * the cleanup prompt (:func:`prompt_language`) says "the same language as
+      the dictation" instead of naming one;
+    * the live decode may stand in for the batch pass. Voxtral's ``stream()``
+      accepts a language and cannot honour it, so a user who pinned French must
+      get the batch result — the pill still showed them the live words while
+      they spoke, which is what the pill is for.
+    """
+    if not language:
+        return True
+    return str(language).strip().lower() in ("", "auto")
+
+
 def prompt_language(language: str | None) -> str | None:
     """Language for the cleanup prompt: ``"auto"`` and ``""`` both mean None.
 
@@ -754,10 +861,9 @@ def prompt_language(language: str | None) -> str | None:
     dictation", which is exactly what auto-detect means. Passing the literal
     string "auto" would ask the model to write in a language called "auto".
     """
-    if not language:
+    if language_is_auto(language):
         return None
-    stripped = str(language).strip()
-    return None if stripped.lower() in ("", "auto") else stripped
+    return str(language).strip()
 
 
 def code_transform_language(language: str | None) -> str:
@@ -820,6 +926,88 @@ def cleanup_skipped_message(reason: str) -> str:
     """The visible notice for a cleanup that was attempted and did not deliver."""
     assert reason, "reason is required"
     return f"Cleanup skipped — {reason}. Your text was pasted unchanged."
+
+
+def cleanup_notice_kind(reason: str | None) -> str | None:
+    """What to do about a cleanup that did not run: nothing, a notice, or an offer.
+
+    A missing model is the one failure with a fix the user can act on, so it
+    earns the modal; everything else is a notification that says what happened
+    and gets out of the way. None means the pass delivered and there is nothing
+    to say.
+    """
+    if not reason:
+        return None
+    if reason == CLEANUP_MODEL_MISSING_REASON:
+        return CLEANUP_NOTICE_OFFER
+    return CLEANUP_NOTICE_NOTIFY
+
+
+def paste_and_settle(text: str, *, type_text, pill=None, offer=None) -> bool:
+    """Paste ``text``, tell the pill how it went, and only then run ``offer``.
+
+    The order is the whole point. ``offer`` raises a modal alert, and a modal
+    raised *before* the paste takes key focus — so the synthesised ⌘V lands in
+    the alert instead of the user's document and the transcript is gone. The
+    offer is therefore queued during the cleanup pass and released here, once
+    :func:`type_text` has returned.
+
+    Returns True when the text landed.
+    """
+    assert text is not None, "text is required"
+    assert callable(type_text), "type_text must be callable"
+    pasted = bool(type_text(text))
+    if pill is not None:
+        if pasted:
+            pill.done(len(text))
+        else:
+            pill.error("Could not paste")
+    if offer is not None:
+        offer()
+    return pasted
+
+
+def should_offer_cleanup_download(
+    *, declined: bool, downloading: bool, installed: bool
+) -> bool:
+    """Whether the automatic "download the cleanup model?" alert may be shown.
+
+    Asked at most once a session: a modal on every utterance would be worse than
+    no cleanup at all. But a decline is not permanent — that is what
+    :data:`CLEANUP_DOWNLOAD_MENU_TITLE` is for. Setting the flag *before* the
+    alert (so a "Not now" burned the one chance) is exactly what left the model
+    unreachable for the rest of the session.
+    """
+    return not (declined or downloading or installed)
+
+
+def cleanup_download_menu_enabled(*, installed: bool, downloading: bool) -> bool:
+    """Whether the "Download cleanup model…" entry is clickable.
+
+    Always present, because a user who said "Not now" needs a way back and the
+    Settings popup deliberately does not list this model. Dead when there is
+    nothing to do: already here, or already coming down.
+    """
+    return not (installed or downloading)
+
+
+def should_prewarm_cleanup(
+    config: dict, *, pro: bool, cleanup_enabled: bool, installed: bool, ram_gb: int | None
+) -> bool:
+    """Whether to start the cleanup server at launch instead of on first use.
+
+    Pre-warming trades 2 GB of resident memory, from launch, for the multi-second
+    wait the first cleaned utterance would otherwise pay. Worth it only when
+    every one of these holds: the feature is licensed and switched on, the model
+    is actually on disk, and the Mac has memory to spare. Anything else waits for
+    the first utterance, where :data:`CLEANUP_FIRST_USE_WAIT_S` bounds the cost.
+    """
+    assert config is not None, "config is required"
+    if not (pro and cleanup_enabled and installed):
+        return False
+    if not config.get(CLEANUP_PREWARM_KEY, CLEANUP_PREWARM_DEFAULT):
+        return False
+    return ram_gb is not None and ram_gb >= CLEANUP_PREWARM_MIN_RAM_GB
 
 
 def run_cleanup(
@@ -926,8 +1114,21 @@ class CleanupRuntime:
     * the request itself failed (timeout, HTTP error, empty reply) → the client
       already degrades that to a ``skipped`` result carrying the original text.
 
-    Every public method is safe to call from the transcription thread; one lock
-    serialises them, so two recordings can never race a start.
+    Every public method is safe to call from the transcription thread. Two locks,
+    and the split between them is the whole design:
+
+    * ``_lock`` serialises *requests*, so two recordings cannot talk to the
+      server at once. It is held across the HTTP call, which can take seconds.
+    * ``_state_lock`` guards the server and client references and is only ever
+      held for a pointer swap — never across a start, a request or a stop.
+
+    :meth:`stop` therefore never queues behind anything. It used to take the one
+    lock that :meth:`cleanup` held across a 60 s ``server.start()``, so quitting
+    during the first cleanup froze the main thread for up to two minutes.
+
+    The start itself runs on its own thread for the same reason: an utterance
+    waits :data:`CLEANUP_FIRST_USE_WAIT_S` for it and then gives up and pastes
+    the raw text, while the load carries on and the next utterance is cleaned.
     """
 
     def __init__(
@@ -937,20 +1138,52 @@ class CleanupRuntime:
         server_factory=LlamaServer,
         client_factory=CleanupClient,
         on_status=None,
+        first_use_wait_s: float = CLEANUP_FIRST_USE_WAIT_S,
     ) -> None:
         assert callable(model_path_provider), "model_path_provider must be callable"
+        assert first_use_wait_s > 0, "first_use_wait_s must be positive"
         self._model_path_provider = model_path_provider
         self._server_factory = server_factory
         self._client_factory = client_factory
         self._on_status = on_status
+        self._first_use_wait_s = float(first_use_wait_s)
         self._lock = threading.RLock()
+        self._state_lock = threading.Lock()
         self._server = None
         self._client = None
+        #: The server object a start thread is holding but has not published, so
+        #: :meth:`stop` can reach a child that is still loading its GGUF.
+        self._starting_server = None
+        self._starter = None
+        self._start_error = None
+        #: Set when a start attempt has finished, either way. Waited on by
+        #: :meth:`_wait_for_client`, and by :meth:`stop` to release the waiters.
+        self._settled = threading.Event()
+        self._stopping = threading.Event()
 
     @property
     def is_started(self) -> bool:
         """True while a server object is held, whether or not its child is alive."""
         return self._server is not None
+
+    def prewarm(self) -> bool:
+        """Start the server in the background, before any utterance needs it.
+
+        Returns True when a start was kicked off. False means there was nothing
+        to start: no model on disk, one already running, or the app is quitting.
+        Never raises and never waits — a failure here simply leaves the first
+        utterance to pay what it would have paid anyway.
+        """
+        model_path = self._model_path_provider()
+        if model_path is None:
+            return False
+        return self._begin_start(model_path)
+
+    def wait_until_ready(self, timeout: float) -> bool:
+        """Block until a start attempt has finished. True when one is serving."""
+        self._settled.wait(timeout)
+        with self._state_lock:
+            return self._client is not None
 
     def cleanup(self, text: str, system_prompt: str) -> CleanupResult:
         """Clean ``text``, starting or restarting the server if it has to.
@@ -962,58 +1195,140 @@ class CleanupRuntime:
         """
         assert text is not None, "text is required"
         assert system_prompt, "system_prompt is required"
-        model_path = self._model_path_provider()
-        if model_path is None:
-            return CleanupResult(text=text, skipped=True, reason=CLEANUP_MODEL_MISSING_REASON)
-
-        with self._lock:
-            for attempt in (1, 2):
-                try:
-                    client = self._ensure_client(model_path)
-                except Exception as error:
-                    self._discard()
-                    logger.warning("Cleanup server could not start: %s", error)
-                    return CleanupResult(
-                        text=text, skipped=True, reason=CLEANUP_START_FAILED_REASON
-                    )
-                try:
+        for attempt in (1, 2):
+            model_path = self._model_path_provider()
+            if model_path is None:
+                return CleanupResult(
+                    text=text, skipped=True, reason=CLEANUP_MODEL_MISSING_REASON
+                )
+            if self._stopping.is_set():
+                return CleanupResult(text=text, skipped=True, reason=CLEANUP_STOPPING_REASON)
+            client, reason = self._wait_for_client(model_path)
+            if client is None:
+                return CleanupResult(text=text, skipped=True, reason=reason)
+            try:
+                with self._lock:
                     return client.cleanup(text, system_prompt)
-                except LlamaServerError as error:
-                    # The child exited under us (an OOM kill is the realistic
-                    # case). One restart, one retry: a second death is a real
-                    # problem and must not loop while the user waits to paste.
-                    logger.warning("Cleanup server stopped (attempt %d): %s", attempt, error)
-                    self._discard()
-            return CleanupResult(text=text, skipped=True, reason=CLEANUP_UNSTABLE_REASON)
+            except LlamaServerError as error:
+                # The child exited under us (an OOM kill is the realistic case).
+                # One restart, one retry: a second death is a real problem and
+                # must not loop while the user waits to paste.
+                logger.warning("Cleanup server stopped (attempt %d): %s", attempt, error)
+                self._discard()
+        return CleanupResult(text=text, skipped=True, reason=CLEANUP_UNSTABLE_REASON)
 
     def stop(self) -> None:
-        """Stop the child and forget it. Idempotent; called on quit."""
-        with self._lock:
-            self._discard()
+        """Stop the child and forget it. Idempotent; called on quit.
+
+        Takes no lock a request or a start could be holding, so it returns in
+        the time one ``terminate``-then-``kill`` takes, whatever else is in
+        flight. A start still running finds ``_stopping`` set and shuts down the
+        child it was waiting on rather than publishing it.
+        """
+        self._stopping.set()
+        # Anyone waiting on a start that will now never publish is released.
+        self._settled.set()
+        self._discard()
 
     # -- internals ---------------------------------------------------------
 
-    def _ensure_client(self, model_path):
-        """The client for a live server, starting one when there is none."""
-        server = self._server
+    def _wait_for_client(self, model_path):
+        """``(client, reason)``: a live client, or why there is not one yet."""
+        with self._state_lock:
+            client = self._client
+            server = self._server
         if server is not None and not server.is_running:
             # ``is_running`` reaps a dead child; the object cannot be reused.
             self._discard()
-            server = None
-        if server is None:
-            self._status(CLEANUP_PREPARING_STATUS)
-            started_at = time.monotonic()
+            client = None
+        if client is not None:
+            return client, None
+
+        self._begin_start(model_path)
+        settled = self._settled.wait(self._first_use_wait_s)
+        with self._state_lock:
+            client = self._client
+            error = self._start_error
+        if client is not None:
+            return client, None
+        if self._stopping.is_set():
+            return None, CLEANUP_STOPPING_REASON
+        if not settled:
+            # Still loading. Not a failure: the start carries on behind us and
+            # the next utterance finds it ready.
+            logger.info(
+                "Cleanup server not ready within %.0fs; pasting the raw text",
+                self._first_use_wait_s,
+            )
+            return None, CLEANUP_NOT_READY_REASON
+        logger.warning("Cleanup server could not start: %s", error)
+        return None, CLEANUP_START_FAILED_REASON
+
+    def _begin_start(self, model_path) -> bool:
+        """Kick off a background start unless one is running or pointless."""
+        with self._state_lock:
+            if self._stopping.is_set() or self._client is not None:
+                return False
+            if self._starter is not None and self._starter.is_alive():
+                return False
+            self._start_error = None
+            self._settled.clear()
+            thread = threading.Thread(
+                target=self._start_server,
+                args=(model_path,),
+                daemon=True,
+                name="murmur-cleanup-start",
+            )
+            self._starter = thread
+        self._status(CLEANUP_PREPARING_STATUS)
+        thread.start()
+        return True
+
+    def _start_server(self, model_path) -> None:
+        """Body of the start thread. Publishes a client, or the reason there is none."""
+        started_at = time.monotonic()
+        server = None
+        try:
             server = self._server_factory(model_path)
+            with self._state_lock:
+                self._starting_server = server
             server.start()
-            self._server = server
-            self._client = self._client_factory(server)
-            logger.info("Cleanup server ready in %.1fs", time.monotonic() - started_at)
-        return self._client
+        except Exception as error:
+            with self._state_lock:
+                self._starting_server = None
+                self._start_error = error
+            self._stop_server(server)
+            self._settled.set()
+            return
+
+        with self._state_lock:
+            self._starting_server = None
+            stopping = self._stopping.is_set()
+            if not stopping:
+                self._server = server
+                self._client = self._client_factory(server)
+        if stopping:
+            # The app asked to quit while the model was loading. Nothing will
+            # ever use this child, so it goes now rather than outliving Murmur.
+            self._stop_server(server)
+            self._settled.set()
+            return
+        logger.info("Cleanup server ready in %.1fs", time.monotonic() - started_at)
+        self._settled.set()
 
     def _discard(self) -> None:
-        """Drop the server object, stopping its child first. Never raises."""
-        server, self._server = self._server, None
-        self._client = None
+        """Drop the server objects, stopping their children first. Never raises."""
+        with self._state_lock:
+            server, self._server = self._server, None
+            starting, self._starting_server = self._starting_server, None
+            self._client = None
+        self._stop_server(server)
+        if starting is not None and starting is not server:
+            self._stop_server(starting)
+
+    @staticmethod
+    def _stop_server(server) -> None:
+        """Stop one server object outside every lock. Never raises."""
         if server is None:
             return
         try:
@@ -1257,13 +1572,28 @@ class MurmurApp(rumps.App):
             self._installed_cleanup_model_path,
             on_status=lambda message: self._set_model_menu_title(message, transient=True),
         )
-        #: Result of the live stream for the utterance being recorded, or None
-        #: when there was no stream or it failed. Read once, by transcribe().
+        #: Live-stream bookkeeping. Every utterance takes a number from
+        #: ``_stream_tokens``; the worker publishes ``(token, text)`` into
+        #: ``_stream_result`` and only while its number is still current, so an
+        #: abandoned decoder can never answer for the utterance after it.
+        #: ``_stream_cancelled`` is how that abandoned worker is told to stop
+        #: drawing on the pill. See :func:`stream_text_for_token`.
+        self._stream_tokens = itertools.count(1)
+        self._stream_lock = threading.Lock()
+        #: Every worker started this session that has not finished, abandoned
+        #: ones included. Read by :meth:`_stream_worker_alive`.
+        self._stream_workers = []
         self._stream_thread = None
-        self._stream_text = None
-        #: The cleanup download is offered once per session, not once per word.
-        self._cleanup_download_offered = False
+        self._stream_token = None
+        self._stream_result = None
+        self._stream_cancelled = None
+        #: The cleanup download alert is asked once per session; a "Not now" is
+        #: recoverable through the Mode submenu, so this is not a life sentence.
+        self._cleanup_download_declined = False
         self._cleanup_download_controller = None
+        #: Set when a cleanup pass wanted the download offer. The modal waits
+        #: until the transcript has been pasted — see :func:`paste_and_settle`.
+        self._cleanup_offer_pending = False
 
         # Menu items - SuperWhisper style
         self.start_stop_item = rumps.MenuItem("Start/Stop Recording", callback=self.toggle_recording)
@@ -1449,6 +1779,13 @@ class MurmurApp(rumps.App):
         self.mode_menu.add(
             rumps.MenuItem(MODE_MENU_AUTOMATIC, callback=self.toggle_context_awareness)
         )
+        # Every mode above except Dictation needs the cleanup model, and the
+        # Settings popup will not offer it (it lists speech engines only), so
+        # this is where it can always be fetched from.
+        self.mode_menu.add(
+            rumps.MenuItem(CLEANUP_DOWNLOAD_MENU_TITLE, callback=self.download_cleanup_model)
+        )
+        self._refresh_cleanup_download_item()
         self._refresh_mode_menu()
 
     def _build_tone_menu(self):
@@ -1782,7 +2119,7 @@ class MurmurApp(rumps.App):
             logger.warning("Could not locate the cleanup model: %s", error)
             return None
 
-    def _clean_up_transcript(self, text, config, language, vocabulary):
+    def _clean_up_transcript(self, text, config, language, vocabulary, pill=None):
         """Run the cleanup pass for one utterance and report what happened.
 
         Returns the text to paste. Cleanup is an improvement on top of a
@@ -1814,6 +2151,13 @@ class MurmurApp(rumps.App):
             logger.debug("Cleanup not run: %s", plan.reason)
             return text
 
+        if pill is not None and not self.cleanup_runtime.is_started:
+            # The first cleaned utterance waits on a 2 GB model load. The menu
+            # bar says so, but the user is looking at the pill, and a pill that
+            # sits on the plain "working" state through several seconds reads as
+            # a hang. Naming the wait is the difference between "it's broken"
+            # and "it's coming".
+            pill.working(label=CLEANUP_PREPARING_STATUS)
         try:
             outcome = run_cleanup(
                 text,
@@ -1826,6 +2170,8 @@ class MurmurApp(rumps.App):
             # The runtime borrows the engine status line for "Preparing
             # cleanup…"; give it back whether the pass worked or not.
             self._set_model_menu_title(self._model_status_title)
+            if pill is not None:
+                pill.working()  # back to the transcript for the paste
         # Lengths and timings only: transcript text never reaches a log.
         logger.info(
             "Cleanup %s in mode %s: %d chars in, %d chars out, %.2fs",
@@ -1840,26 +2186,59 @@ class MurmurApp(rumps.App):
         return outcome.text
 
     def _report_cleanup_skipped(self, reason):
-        """Say out loud that cleanup did not run, and offer the fix when there is one."""
-        if reason == CLEANUP_MODEL_MISSING_REASON:
-            self.run_on_main_thread(self._offer_cleanup_download)
+        """Say out loud that cleanup did not run, and queue the fix when there is one."""
+        kind = cleanup_notice_kind(reason)
+        if kind == CLEANUP_NOTICE_OFFER:
+            # Queued, not shown. The transcript has not been pasted yet, and a
+            # modal alert here takes key focus — so the ⌘V lands in the alert
+            # and the user loses what they just said. Released by
+            # :func:`paste_and_settle` once the text is in.
+            self._cleanup_offer_pending = True
             return
-        rumps.notification(APP_NAME, "Cleanup skipped", cleanup_skipped_message(reason))
+        if kind == CLEANUP_NOTICE_NOTIFY:
+            rumps.notification(APP_NAME, "Cleanup skipped", cleanup_skipped_message(reason))
+
+    def _flush_cleanup_offer(self):
+        """Show any queued cleanup-download offer, now that the paste has landed."""
+        if not self._cleanup_offer_pending:
+            return
+        self._cleanup_offer_pending = False
+        self.run_on_main_thread(self._offer_cleanup_download)
+
+    def _cleanup_download_running(self) -> bool:
+        controller = self._cleanup_download_controller
+        return controller is not None and controller.is_running
 
     def _offer_cleanup_download(self):
         """Offer the cleanup model once per session; download it on a yes."""
-        if self._cleanup_download_offered:
-            return
-        self._cleanup_download_offered = True
         model_id = self._cleanup_model_id()
+        if not should_offer_cleanup_download(
+            declined=self._cleanup_download_declined,
+            downloading=self._cleanup_download_running(),
+            installed=self._installed_cleanup_model_path() is not None,
+        ):
+            return
         if not ui_alerts.show_confirm(
             APP_NAME,
             cleanup_model_missing_message(self._model_display_name(model_id)),
             ok="Download",
             cancel="Not now",
         ):
+            # Remembered so the alert does not return every utterance, but the
+            # Mode submenu keeps the download one click away.
+            self._cleanup_download_declined = True
+            self._refresh_cleanup_download_item()
             return
         self._start_cleanup_download(model_id)
+
+    def download_cleanup_model(self, _=None):
+        """Menu item: fetch the cleanup model, whatever was said to the alert.
+
+        The Settings "Speech engine" popup lists speech models only, so without
+        this entry a single "Not now" left the cleanup model with no route to
+        the disk for the rest of the session.
+        """
+        self._start_cleanup_download(self._cleanup_model_id())
 
     def _start_cleanup_download(self, model_id):
         """Fetch the cleanup model with the same controller the sheet uses.
@@ -1868,18 +2247,19 @@ class MurmurApp(rumps.App):
         attach one to, so it drives the same :class:`DownloadController` and
         shows its status line in the menu, exactly as an app update does.
         """
-        if self._cleanup_download_controller is not None:
-            if self._cleanup_download_controller.is_running:
-                return
-        controller = DownloadController(
-            app_model_store(), on_change=self._cleanup_download_changed
-        )
-        self._cleanup_download_controller = controller
+        if self._cleanup_download_running():
+            return
         try:
             total = app_model_store().spec(model_id).size_bytes
         except Exception:
             total = 0
-        controller.start(model_id, total)
+        self._cleanup_download_controller = download_model(
+            app_model_store(),
+            model_id,
+            total_bytes=total,
+            on_change=self._cleanup_download_changed,
+        )
+        self._refresh_cleanup_download_item()
 
     def _cleanup_download_changed(self, state):
         """Progress ticks from the cleanup model download, in the menu line."""
@@ -1887,6 +2267,7 @@ class MurmurApp(rumps.App):
             self._set_model_menu_title(cleanup_download_status(state), transient=True)
             return
         self._set_model_menu_title(self._model_status_title)
+        self._refresh_cleanup_download_item()
         if state.phase == PHASE_DONE:
             rumps.notification(
                 APP_NAME, "Cleanup ready", "The cleanup model is installed."
@@ -1895,6 +2276,17 @@ class MurmurApp(rumps.App):
             rumps.notification(
                 APP_NAME, "Cleanup model", f"Download failed: {state.error}"
             )
+
+    def _refresh_cleanup_download_item(self):
+        """Grey the download entry out when there is nothing for it to do."""
+        item = self.mode_menu.get(CLEANUP_DOWNLOAD_MENU_TITLE)
+        if item is None:
+            return
+        enabled = cleanup_download_menu_enabled(
+            installed=self._installed_cleanup_model_path() is not None,
+            downloading=self._cleanup_download_running(),
+        )
+        item.set_callback(self.download_cleanup_model if enabled else None)
 
     def load_model(self):
         """Load the configured speech engine. Runs on a background thread."""
@@ -1905,12 +2297,35 @@ class MurmurApp(rumps.App):
             config = self._settle_cleanup_default(config)
             selection = self._resolve_selection(config)
             store = app_model_store()
+            self._maybe_prewarm_cleanup(config)
             if not store.is_installed(selection.model_id):
                 self._report_missing_model(config, selection)
                 return
             self._activate_engine(selection.engine_id, selection.model_id, store)
         except Exception as error:
             self._report_engine_failure(error)
+
+    def _maybe_prewarm_cleanup(self, config):
+        """Start the cleanup server at launch on a Mac that can spare the memory.
+
+        Runs from the model-loading thread, which is already off the main one,
+        and the start itself is another background thread — so nothing here can
+        delay the menu bar. A failure is not reported: the first utterance would
+        have hit the same failure and has the notice for it.
+        """
+        try:
+            if not should_prewarm_cleanup(
+                config,
+                pro=pro_enabled("cleanup", config),
+                cleanup_enabled=resolve_cleanup_enabled(config),
+                installed=self._installed_cleanup_model_path() is not None,
+                ram_gb=detect_ram_gb(),
+            ):
+                return
+            if self.cleanup_runtime.prewarm():
+                logger.info("Pre-warming the cleanup server at launch")
+        except Exception as error:
+            logger.warning("Could not pre-warm the cleanup server: %s", error)
 
     def _activate_engine(self, engine_id, model_id, store):
         """Unload whatever is loaded, then build and publish the new engine.
@@ -2006,6 +2421,7 @@ class MurmurApp(rumps.App):
             is_recording=self.is_recording,
             is_processing=self.is_processing,
             engine_ready=engine_is_ready(self.engine),
+            stream_active=self._stream_worker_alive(),
         )
         if decision == RELOAD_UNCHANGED:
             return None
@@ -2394,41 +2810,82 @@ class MurmurApp(rumps.App):
             return None
         return self.pill
 
-    def _start_stream_worker(self, pill):
+    def _start_stream_worker(self, pill, language=None, hints=None):
         """Decode this utterance live, pushing partials into the pill.
 
         No engine lock: a recording already blocks every engine swap
-        (:func:`reload_engine_decision` refuses while ``is_recording``), and
-        taking the lock here for the whole recording would deadlock the wizard's
-        own capture path against it.
+        (:func:`reload_engine_decision` refuses while ``is_recording``, and
+        while this worker is alive), and taking the lock here for the whole
+        recording would deadlock the wizard's own capture path against it.
+
+        The utterance's token is the safety rail. The worker publishes its text
+        only while that token is still the current one, so a worker abandoned at
+        the join timeout cannot hand its sentence to the utterance after it.
         """
         engine = self.engine
         chunks = self.audio_capture.pcm_chunks()
+        token = next(self._stream_tokens)
+        cancelled = threading.Event()
+        with self._stream_lock:
+            self._stream_token = token
+            self._stream_result = None
+            self._stream_cancelled = cancelled
 
         def run():
             try:
-                self._stream_text = pill.feed_stream(engine.stream(chunks))
+                text = pill.feed_stream(
+                    engine.stream(chunks, language=language, hints=hints),
+                    cancelled=cancelled,
+                )
             except Exception as error:
                 # The WAV is written either way, so a broken stream costs the
                 # live text and nothing else: transcribe() falls back to it.
-                self._stream_text = None
+                text = None
                 logger.warning(
                     "Live transcription failed; using the recorded file instead: %s", error
                 )
+            with self._stream_lock:
+                if self._stream_token == token:
+                    self._stream_result = (token, text)
 
-        self._stream_thread = threading.Thread(
-            target=run, daemon=True, name="murmur-live-stream"
-        )
-        self._stream_thread.start()
+        thread = threading.Thread(target=run, daemon=True, name="murmur-live-stream")
+        self._stream_thread = thread
+        with self._stream_lock:
+            # Pruned here as well as on read, so a long session does not
+            # accumulate one dead Thread object per utterance.
+            self._stream_workers = [
+                worker for worker in self._stream_workers if worker.is_alive()
+            ]
+            self._stream_workers.append(thread)
+        thread.start()
+
+    def _stream_worker_alive(self) -> bool:
+        """True while any live decoder — abandoned ones included — holds the engine.
+
+        An abandoned worker is dropped from ``_stream_thread`` but is still
+        inside ``engine.stream()``, so it is tracked separately: this is what
+        stops an engine swap unloading the model out from under it.
+        """
+        with self._stream_lock:
+            self._stream_workers = [
+                worker for worker in self._stream_workers if worker.is_alive()
+            ]
+            return bool(self._stream_workers)
 
     def _collect_stream_text(self):
         """Take the live decoder's final text, or None when there is none.
 
         Called once per utterance, before the batch path runs. A stream that is
         still going after :data:`STREAM_JOIN_TIMEOUT_S` is abandoned rather than
-        waited on: the recorded file is right there and always answers.
+        waited on: the recorded file is right there and always answers. Being
+        abandoned means two things at once — its text is refused from here on
+        (the token stops matching) and it is told to stop drawing on the pill,
+        which by then belongs to whatever the user does next.
         """
         thread, self._stream_thread = self._stream_thread, None
+        with self._stream_lock:
+            token, self._stream_token = self._stream_token, None
+            cancelled, self._stream_cancelled = self._stream_cancelled, None
         if thread is not None:
             thread.join(STREAM_JOIN_TIMEOUT_S)
             if thread.is_alive():
@@ -2436,11 +2893,11 @@ class MurmurApp(rumps.App):
                     "Live transcription did not finish within %.0fs; using the recorded file",
                     STREAM_JOIN_TIMEOUT_S,
                 )
-                self._stream_text = None
-        text, self._stream_text = self._stream_text, None
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-        return None
+                if cancelled is not None:
+                    cancelled.set()
+        with self._stream_lock:
+            result, self._stream_result = self._stream_result, None
+        return stream_text_for_token(result, token)
 
     def start_recording(self):
         """Start audio recording"""
@@ -2453,7 +2910,6 @@ class MurmurApp(rumps.App):
         self.upload_item.set_callback(None)  # Disable transcribe file
 
         self._stream_thread = None
-        self._stream_text = None
         pill = self._active_pill(config)
         # Only an engine that can stream gets the live feed; whisper.cpp shows
         # state only, which is what the pill's phases are for.
@@ -2483,7 +2939,15 @@ class MurmurApp(rumps.App):
         if pill is not None:
             pill.listening()
         if streaming:
-            self._start_stream_worker(pill)
+            # The live decode is described exactly as the batch one will be.
+            # Voxtral honours neither, but the settings must reach the engine
+            # for the day one does, and transcribe() decides what to trust.
+            vocabulary = vocabulary_from_config(config)
+            self._start_stream_worker(
+                pill,
+                language=resolve_language(config, front_app_bundle_id()),
+                hints=hints_from_vocabulary(vocabulary),
+            )
 
     def stop_recording(self):
         """Stop recording and transcribe"""
@@ -2575,13 +3039,24 @@ class MurmurApp(rumps.App):
             vocabulary = vocabulary_from_config(config)
             hints = hints_from_vocabulary(vocabulary)
 
-            if stream_text is not None:
+            if stream_text is not None and language_is_auto(language):
                 # The live decoder already produced the whole utterance while
                 # the user was speaking; running the file through the same
                 # engine again would only cost a second and say the same thing.
+                #
+                # Only when the language is auto, though. The streaming engine
+                # cannot honour a pinned language (see Engine.stream), so a user
+                # who chose French would otherwise get whatever the decoder
+                # guessed. The pill still showed them the live words; the batch
+                # pass below is what actually gets pasted.
                 logger.info("Using the live stream result (%d chars)", len(stream_text))
                 raw_text = stream_text
             else:
+                if stream_text is not None:
+                    logger.info(
+                        "Ignoring the live stream result: the language is pinned to %s",
+                        language,
+                    )
                 logger.info("Starting transcription in language %s", language)
                 with self._engine_lock:
                     transcript = self.engine.transcribe(
@@ -2598,15 +3073,20 @@ class MurmurApp(rumps.App):
             if text and not is_hallucination:
                 # Cleanup sits between the replacements and the paste: it reads
                 # what the user actually meant to write, terms included.
-                text = self._clean_up_transcript(text, config, language, vocabulary)
+                text = self._clean_up_transcript(text, config, language, vocabulary, pill)
+                # …and the replacements run once more over what came back: the
+                # model rewrites sentences, and a rewrite re-cases terms.
+                text = reapply_replacements(text, vocabulary)
                 # Small delay then paste (paste_text copies, pastes, then restores clipboard)
                 time.sleep(0.15)
-                pasted = self.type_text(text)
-                if pill is not None:
-                    if pasted:
-                        pill.done(len(text))
-                    else:
-                        pill.error("Could not paste")
+                # The paste comes first and the queued download offer second:
+                # a modal raised before it would swallow the keystrokes.
+                paste_and_settle(
+                    text,
+                    type_text=self.type_text,
+                    pill=pill,
+                    offer=self._flush_cleanup_offer,
+                )
 
                 # Transcription complete - text is pasted, no notification needed
                 logger.info("Transcribed and pasted")

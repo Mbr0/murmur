@@ -398,6 +398,18 @@ class StreamTests(VoxtralTestCase):
         with self.assertRaises(EngineError):
             list(engine.stream(["not bytes"]))
 
+    def test_stream_accepts_a_language_and_hints_and_ignores_them(self):
+        # Voxtral Realtime has no dial for either. It takes them so the caller
+        # can describe one utterance the same way on both paths; the app knows
+        # not to trust the live text when a language was pinned.
+        session = FakeSession(per_chunk=["hi"])
+        engine = self.loaded_engine(FakeRuntime(session=session))
+        partials = list(
+            engine.stream([b"\x00\x00"], language="fr", hints=Hints(vocabulary=("Murmur",)))
+        )
+        self.assertEqual([p.text for p in partials], ["hi", "hi"])
+        self.assertEqual(session.fed, [b"\x00\x00"])
+
     def test_stream_fails_loudly_when_the_session_never_finishes(self):
         session = FakeSession(never_done=True)
         engine = self.loaded_engine(FakeRuntime(session=session))

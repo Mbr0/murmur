@@ -1,28 +1,44 @@
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from murmur import (
     APP_CATALOG,
+    CLEANUP_DOWNLOAD_MENU_TITLE,
     CLEANUP_MODEL_MISSING_REASON,
+    CLEANUP_NOTICE_NOTIFY,
+    CLEANUP_NOTICE_OFFER,
+    CLEANUP_NOT_READY_REASON,
     CLEANUP_OFF_DISABLED,
     CLEANUP_OFF_PASSTHROUGH,
     CLEANUP_OFF_PRO,
     CLEANUP_PREPARING_STATUS,
+    CLEANUP_PREWARM_KEY,
     CLEANUP_START_FAILED_REASON,
+    CLEANUP_STOPPING_REASON,
     CLEANUP_UNSTABLE_REASON,
     MODE_MENU_AUTOMATIC,
     PRO_OVERRIDE_KEY,
     CleanupPlan,
     CleanupRuntime,
+    cleanup_download_menu_enabled,
     cleanup_model_missing_message,
+    cleanup_notice_kind,
     cleanup_plan,
     cleanup_skipped_message,
     code_transform_language,
+    language_is_auto,
     mode_menu_state,
+    paste_and_settle,
     pro_enabled,
     prompt_language,
+    reapply_replacements,
     run_cleanup,
+    should_offer_cleanup_download,
+    should_prewarm_cleanup,
+    stream_text_for_token,
     tone_menu_state,
     MISSING_MODEL_ONBOARDING,
     MISSING_MODEL_SETTINGS,
@@ -297,6 +313,7 @@ class ReloadEngineDecisionTests(unittest.TestCase):
             is_recording=False,
             is_processing=False,
             engine_ready=True,
+            stream_active=False,
         )
         kwargs.update(overrides)
         return reload_engine_decision(**kwargs)
@@ -328,6 +345,18 @@ class ReloadEngineDecisionTests(unittest.TestCase):
             self._decide(active=("whispercpp", "turbo"), engine_ready=False),
             RELOAD_START,
         )
+
+    def test_an_abandoned_live_stream_still_blocks_the_swap(self):
+        # The batch path gave up waiting on the live decoder, so the app looks
+        # idle while a worker is still inside engine.stream(). Unloading the
+        # engine there pulls the model out from under a decode in flight.
+        self.assertEqual(
+            self._decide(stream_active=True, is_recording=False, is_processing=False),
+            RELOAD_BUSY,
+        )
+
+    def test_a_finished_stream_stops_blocking(self):
+        self.assertEqual(self._decide(stream_active=False), RELOAD_START)
 
 
 class HintsNoticeTests(unittest.TestCase):
@@ -883,6 +912,225 @@ class PipelineOrderTests(unittest.TestCase):
         # simply not called; asserted here as the contract the wiring relies on.
         self.assertEqual(text, "Thank you")
 
+    def test_the_replacements_are_applied_again_after_the_model_answers(self):
+        # The LLM rewrites sentences, and a rewrite re-cases words: "Murmur"
+        # comes back as "murmur" at the start of a new clause. The user asked
+        # for a spelling, so it is restored on the way to the clipboard.
+        vocabulary = vocabulary_from_config(
+            {
+                "vocabulary_replacements": [
+                    {"from": "murmer", "to": "Murmur", "match_case": False}
+                ]
+            }
+        )
+        outcome = run_cleanup(
+            "Murmur is running",
+            CleanupPlan("message", "neutral", True),
+            cleanup=lambda text, prompt: CleanupResult(text="murmer is running"),
+        )
+        self.assertEqual(outcome.text, "murmer is running")
+        self.assertEqual(reapply_replacements(outcome.text, vocabulary), "Murmur is running")
+
+
+class ReapplyReplacementsTests(unittest.TestCase):
+    """Replacements run again after cleanup; the filter does not."""
+
+    def _vocabulary(self):
+        return vocabulary_from_config(
+            {
+                "vocabulary_replacements": [
+                    {"from": "murmer", "to": "Murmur", "match_case": False}
+                ]
+            }
+        )
+
+    def test_a_term_the_model_re_cased_is_put_back(self):
+        self.assertEqual(
+            reapply_replacements("murmer is running", self._vocabulary()),
+            "Murmur is running",
+        )
+
+    def test_text_with_nothing_to_replace_is_returned_unchanged(self):
+        self.assertEqual(
+            reapply_replacements("nothing to fix here", self._vocabulary()),
+            "nothing to fix here",
+        )
+
+    def test_the_hallucination_filter_is_not_run_again(self):
+        # "Thank you" is a classic silence hallucination, but the filter reads
+        # the engine's own words; re-judging a *cleaned* sentence would let the
+        # model's phrasing suppress a real transcript.
+        self.assertEqual(
+            reapply_replacements("Thank you", vocabulary_from_config({})), "Thank you"
+        )
+
+
+class StreamTokenTests(unittest.TestCase):
+    """An abandoned live decoder must never speak for the next utterance."""
+
+    def test_the_text_of_the_utterance_being_collected_is_taken(self):
+        self.assertEqual(stream_text_for_token((7, "  hello there  "), 7), "hello there")
+
+    def test_a_result_from_an_abandoned_worker_is_discarded(self):
+        # Utterance 7 was abandoned at the join timeout and finished later.
+        # Without the token, utterance 8 pastes utterance 7's sentence.
+        self.assertIsNone(stream_text_for_token((7, "the previous sentence"), 8))
+
+    def test_no_result_at_all_is_none(self):
+        self.assertIsNone(stream_text_for_token(None, 8))
+
+    def test_a_token_already_taken_is_none(self):
+        self.assertIsNone(stream_text_for_token((7, "hello"), None))
+
+    def test_a_blank_or_failed_stream_is_none(self):
+        self.assertIsNone(stream_text_for_token((7, "   "), 7))
+        self.assertIsNone(stream_text_for_token((7, None), 7))
+
+
+class LanguageAutoTests(unittest.TestCase):
+    """Whether the live decode may stand in for the batch pass."""
+
+    def test_blank_and_auto_leave_detection_to_the_engine(self):
+        for value in (None, "", "   ", "auto", "AUTO", " Auto "):
+            self.assertTrue(language_is_auto(value), value)
+
+    def test_a_real_language_code_is_not_auto(self):
+        for value in ("fr", "en-GB", "ja"):
+            self.assertFalse(language_is_auto(value), value)
+
+    def test_prompt_language_agrees_with_it(self):
+        # One rule, one place: the cleanup prompt and the stream-vs-batch
+        # choice must never disagree about what "auto" means.
+        self.assertIsNone(prompt_language("auto"))
+        self.assertEqual(prompt_language("fr"), "fr")
+
+
+class CleanupNoticeKindTests(unittest.TestCase):
+    """A missing model is an offer; everything else is a plain notification."""
+
+    def test_a_missing_model_becomes_the_download_offer(self):
+        self.assertEqual(
+            cleanup_notice_kind(CLEANUP_MODEL_MISSING_REASON), CLEANUP_NOTICE_OFFER
+        )
+
+    def test_any_other_failure_is_a_notification(self):
+        for reason in (CLEANUP_START_FAILED_REASON, CLEANUP_UNSTABLE_REASON,
+                       CLEANUP_NOT_READY_REASON):
+            self.assertEqual(cleanup_notice_kind(reason), CLEANUP_NOTICE_NOTIFY, reason)
+
+    def test_a_pass_that_delivered_says_nothing(self):
+        self.assertIsNone(cleanup_notice_kind(None))
+        self.assertIsNone(cleanup_notice_kind(""))
+
+
+class PasteAndSettleTests(unittest.TestCase):
+    """The modal offer waits until the keystrokes have landed."""
+
+    def test_the_offer_runs_after_the_paste_not_before_it(self):
+        order = []
+        pasted = paste_and_settle(
+            "hello",
+            type_text=lambda text: order.append(("paste", text)) or True,
+            offer=lambda: order.append(("offer", None)),
+        )
+        self.assertTrue(pasted)
+        self.assertEqual([step for step, _ in order], ["paste", "offer"])
+
+    def test_the_pill_is_told_the_text_landed_before_the_offer(self):
+        order = []
+        pill = SimpleNamespace(
+            done=lambda length: order.append(("done", length)),
+            error=lambda message: order.append(("error", message)),
+        )
+        paste_and_settle(
+            "hello",
+            type_text=lambda text: True,
+            pill=pill,
+            offer=lambda: order.append(("offer", None)),
+        )
+        self.assertEqual(order, [("done", 5), ("offer", None)])
+
+    def test_a_failed_paste_shows_the_error_and_still_offers(self):
+        order = []
+        pill = SimpleNamespace(
+            done=lambda length: order.append(("done", length)),
+            error=lambda message: order.append(("error", message)),
+        )
+        pasted = paste_and_settle(
+            "hello",
+            type_text=lambda text: False,
+            pill=pill,
+            offer=lambda: order.append(("offer", None)),
+        )
+        self.assertFalse(pasted)
+        self.assertEqual([step for step, _ in order], ["error", "offer"])
+
+    def test_nothing_pending_means_nothing_after_the_paste(self):
+        self.assertTrue(paste_and_settle("hello", type_text=lambda text: True))
+
+
+class CleanupDownloadOfferTests(unittest.TestCase):
+    """"Not now" must not be a life sentence for the cleanup model."""
+
+    def _offer(self, **overrides):
+        kwargs = dict(declined=False, downloading=False, installed=False)
+        kwargs.update(overrides)
+        return should_offer_cleanup_download(**kwargs)
+
+    def test_the_offer_is_shown_when_nothing_is_in_the_way(self):
+        self.assertTrue(self._offer())
+
+    def test_declining_stops_the_modal_for_the_session(self):
+        self.assertFalse(self._offer(declined=True))
+
+    def test_a_download_already_running_is_not_offered_again(self):
+        self.assertFalse(self._offer(downloading=True))
+
+    def test_an_installed_model_is_never_offered(self):
+        self.assertFalse(self._offer(installed=True))
+
+    def test_the_menu_entry_stays_clickable_after_a_decline(self):
+        # This is what makes the decline recoverable: the alert is asked once,
+        # the menu item is the way back.
+        self.assertTrue(cleanup_download_menu_enabled(installed=False, downloading=False))
+
+    def test_the_menu_entry_is_dead_while_downloading_or_installed(self):
+        self.assertFalse(cleanup_download_menu_enabled(installed=False, downloading=True))
+        self.assertFalse(cleanup_download_menu_enabled(installed=True, downloading=False))
+
+    def test_the_menu_entry_says_what_it_downloads(self):
+        self.assertIn("cleanup", CLEANUP_DOWNLOAD_MENU_TITLE.lower())
+
+
+class PrewarmDecisionTests(unittest.TestCase):
+    """Starting the 2 GB server at launch, only where it is free to do so."""
+
+    def _decide(self, **overrides):
+        kwargs = dict(
+            config=_config(),
+            pro=True,
+            cleanup_enabled=True,
+            installed=True,
+            ram_gb=16,
+        )
+        kwargs.update(overrides)
+        return should_prewarm_cleanup(**kwargs)
+
+    def test_an_eligible_mac_pre_warms(self):
+        self.assertTrue(self._decide())
+
+    def test_a_small_mac_waits_for_the_first_utterance(self):
+        self.assertFalse(self._decide(ram_gb=8))
+        self.assertFalse(self._decide(ram_gb=None))
+
+    def test_nothing_is_started_without_the_model_the_switch_or_pro(self):
+        self.assertFalse(self._decide(installed=False))
+        self.assertFalse(self._decide(cleanup_enabled=False))
+        self.assertFalse(self._decide(pro=False))
+
+    def test_the_config_key_switches_it_off(self):
+        self.assertFalse(self._decide(config=_config(**{CLEANUP_PREWARM_KEY: False})))
+
 
 class ModeAndToneMenuTests(unittest.TestCase):
     def test_the_configured_mode_is_the_ticked_one(self):
@@ -927,15 +1175,21 @@ class ModeAndToneMenuTests(unittest.TestCase):
 class FakeLlamaServer:
     """A llama-server whose life is scripted by the test."""
 
-    def __init__(self, model_path, *, start_error=None):
+    def __init__(self, model_path, *, start_error=None, start_gate=None):
         self.model_path = model_path
         self.starts = 0
         self.stops = 0
         self.alive = False
         self.start_error = start_error
+        #: Held closed to imitate a 60 s model load. Released by the test.
+        self.start_gate = start_gate
+        self.entered_start = threading.Event()
 
     def start(self):
         self.starts += 1
+        self.entered_start.set()
+        if self.start_gate is not None:
+            self.start_gate.wait(5.0)
         if self.start_error is not None:
             raise self.start_error
         self.alive = True
@@ -954,13 +1208,19 @@ class FakeLlamaServer:
 
 
 class FakeCleanupClient:
-    def __init__(self, server, replies=None):
+    def __init__(self, server, replies=None, request_gate=None):
         self.server = server
         self.calls = []
         self._replies = list(replies or [])
+        #: Held closed to imitate a request the server is still answering.
+        self.request_gate = request_gate
+        self.entered_request = threading.Event()
 
     def cleanup(self, text, system_prompt):
         self.calls.append(text)
+        self.entered_request.set()
+        if self.request_gate is not None:
+            self.request_gate.wait(5.0)
         if not self.server.is_running:
             raise LlamaServerError("llama-server exited (code 137)")
         if self._replies:
@@ -971,28 +1231,44 @@ class FakeCleanupClient:
 class _RuntimeFixture:
     """A CleanupRuntime over fake factories, plus what they produced."""
 
-    def __init__(self, model_path="/models/cleanup.gguf", start_errors=(), replies=None):
+    def __init__(
+        self,
+        model_path="/models/cleanup.gguf",
+        start_errors=(),
+        replies=None,
+        start_gate=None,
+        request_gate=None,
+        first_use_wait_s=None,
+    ):
         self.servers = []
         self.clients = []
         self.statuses = []
         self._start_errors = list(start_errors)
         self._replies = replies
+        self._start_gate = start_gate
+        self._request_gate = request_gate
         self.model_path = model_path
+        extra = {} if first_use_wait_s is None else {"first_use_wait_s": first_use_wait_s}
         self.runtime = CleanupRuntime(
             lambda: self.model_path,
             server_factory=self._server,
             client_factory=self._client,
             on_status=self.statuses.append,
+            **extra,
         )
 
     def _server(self, model_path):
         error = self._start_errors.pop(0) if self._start_errors else None
-        server = FakeLlamaServer(model_path, start_error=error)
+        server = FakeLlamaServer(
+            model_path, start_error=error, start_gate=self._start_gate
+        )
         self.servers.append(server)
         return server
 
     def _client(self, server):
-        client = FakeCleanupClient(server, replies=self._replies)
+        client = FakeCleanupClient(
+            server, replies=self._replies, request_gate=self._request_gate
+        )
         self.clients.append(client)
         return client
 
@@ -1117,6 +1393,132 @@ class CleanupRuntimeTests(unittest.TestCase):
         message = cleanup_model_missing_message("Ministral 3 3B Instruct")
         self.assertIn("Ministral 3 3B Instruct", message)
         self.assertIn("pasted", message)
+
+
+class CleanupFirstUseTests(unittest.TestCase):
+    """The first utterance waits a bounded time; nothing waits on a quit."""
+
+    def _release(self, *gates):
+        for gate in gates:
+            self.addCleanup(gate.set)
+        return gates[0] if len(gates) == 1 else gates
+
+    def test_a_first_start_that_outruns_the_budget_pastes_the_raw_text(self):
+        gate = self._release(threading.Event())
+        fixture = _RuntimeFixture(start_gate=gate, first_use_wait_s=0.05)
+
+        result = fixture.runtime.cleanup("hello", "SYSTEM")
+
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.reason, CLEANUP_NOT_READY_REASON)
+        self.assertEqual(result.text, "hello")  # the transcript is never lost
+        self.assertEqual(fixture.statuses, [CLEANUP_PREPARING_STATUS])
+
+    def test_the_server_keeps_starting_so_the_next_utterance_is_cleaned(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        fixture = _RuntimeFixture(start_gate=gate, first_use_wait_s=0.05)
+
+        fixture.runtime.cleanup("one", "SYSTEM")
+        gate.set()  # the model finished loading in the background
+        result = fixture.runtime.cleanup("two", "SYSTEM")
+
+        self.assertEqual(result.text, "cleaned: two")
+        self.assertEqual(len(fixture.servers), 1)  # not started twice
+        self.assertEqual(fixture.clients[0].calls, ["two"])
+
+    def test_a_second_utterance_does_not_start_a_second_server(self):
+        gate = self._release(threading.Event())
+        fixture = _RuntimeFixture(start_gate=gate, first_use_wait_s=0.05)
+
+        fixture.runtime.cleanup("one", "SYSTEM")
+        fixture.runtime.cleanup("two", "SYSTEM")
+
+        self.assertEqual(len(fixture.servers), 1)
+
+    def test_stop_returns_while_a_request_is_still_in_flight(self):
+        gate = self._release(threading.Event())
+        fixture = _RuntimeFixture(request_gate=gate)
+        worker = threading.Thread(
+            target=fixture.runtime.cleanup, args=("hello", "SYSTEM"), daemon=True
+        )
+        worker.start()
+        self.addCleanup(worker.join, 5.0)
+        # The request lock is held by the worker for as long as the gate is shut.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not fixture.clients:
+            time.sleep(0.01)
+        self.assertTrue(fixture.clients)
+        self.assertTrue(fixture.clients[0].entered_request.wait(2.0))
+
+        started_at = time.monotonic()
+        fixture.runtime.stop()
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(fixture.servers[0].stops, 1)
+
+    def test_stop_does_not_wait_on_a_start_that_is_still_loading(self):
+        gate = self._release(threading.Event())
+        fixture = _RuntimeFixture(start_gate=gate, first_use_wait_s=0.05)
+        fixture.runtime.cleanup("hello", "SYSTEM")
+        self.assertTrue(fixture.servers[0].entered_start.wait(2.0))
+
+        started_at = time.monotonic()
+        fixture.runtime.stop()
+        elapsed = time.monotonic() - started_at
+
+        # Quitting must not sit behind a 60 s model load.
+        self.assertLess(elapsed, 1.0)
+        self.assertFalse(fixture.runtime.is_started)
+
+    def test_a_request_after_stop_skips_rather_than_starting_again(self):
+        fixture = _RuntimeFixture()
+        fixture.runtime.stop()
+
+        result = fixture.runtime.cleanup("hello", "SYSTEM")
+
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.reason, CLEANUP_STOPPING_REASON)
+        self.assertEqual(result.text, "hello")
+        self.assertEqual(fixture.servers, [])
+
+    def test_a_server_started_after_a_stop_is_shut_down_again(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        fixture = _RuntimeFixture(start_gate=gate, first_use_wait_s=0.05)
+        fixture.runtime.cleanup("hello", "SYSTEM")
+        self.assertTrue(fixture.servers[0].entered_start.wait(2.0))
+
+        fixture.runtime.stop()
+        self.assertGreaterEqual(fixture.servers[0].stops, 1)
+        gate.set()  # the child finally came up, after the app asked to quit
+
+        # It is never published, and it does not outlive the quit.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and fixture.servers[0].alive:
+            time.sleep(0.01)
+        self.assertFalse(fixture.servers[0].alive)
+        self.assertFalse(fixture.runtime.is_started)
+
+    def test_prewarm_starts_the_server_before_any_utterance(self):
+        fixture = _RuntimeFixture()
+
+        self.assertTrue(fixture.runtime.prewarm())
+        self.assertTrue(fixture.runtime.wait_until_ready(2.0))
+        self.assertEqual(len(fixture.servers), 1)
+        self.assertTrue(fixture.runtime.is_started)
+
+        # The utterance that follows pays nothing.
+        self.assertEqual(fixture.runtime.cleanup("hello", "SYSTEM").text, "cleaned: hello")
+        self.assertEqual(len(fixture.servers), 1)
+
+    def test_prewarm_without_the_model_starts_nothing(self):
+        fixture = _RuntimeFixture()
+        fixture.model_path = None
+
+        self.assertFalse(fixture.runtime.prewarm())
+        self.assertEqual(fixture.servers, [])
 
 
 class AppCatalogTests(unittest.TestCase):

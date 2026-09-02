@@ -47,6 +47,7 @@ Wave 2 (the smart layer) adds:
   it is the most sensitive thing this app can read.
 - ``cleanup_model_id``: catalog id of the GGUF the cleanup server loads.
 - ``pill_enabled``: whether the floating pill is shown while dictating
+- ``cleanup_prewarm``: start the local cleanup server in the background at launch when cleanup is enabled and its model is installed
   (``ui/pill_window.py``).
 
 Writers that own only a few keys must go through :meth:`PersistenceService.update_config`
@@ -108,6 +109,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "include_selection": False,
     "cleanup_model_id": CLEANUP_MODEL_ID,
     "pill_enabled": True,
+    "cleanup_prewarm": True,
 }
 
 #: Key whose ``None`` means "ask the machine once"; see :func:`resolve_cleanup_enabled`.

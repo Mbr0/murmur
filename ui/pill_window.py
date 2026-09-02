@@ -160,11 +160,18 @@ class PillController:
         )
         return self._state
 
-    def on_working(self) -> PillState:
-        """Audio is in, the engine (or cleanup) is thinking."""
+    def on_working(self, label: str | None = None) -> PillState:
+        """Audio is in, the engine (or cleanup) is thinking.
+
+        ``label`` replaces the displayed line for a wait the user would
+        otherwise read as a hang — the cleanup server's first, multi-second
+        start. It is display only: the buffered transcript is untouched, so the
+        *done* state still shows the words that were actually pasted.
+        """
         self._hide_at = None
+        line = _one_line(label) if label else self._buffer
         self._state = PillState(
-            phase=PHASE_WORKING, text=ellipsise_start(self._buffer), visible=True
+            phase=PHASE_WORKING, text=ellipsise_start(line), visible=True
         )
         return self._state
 
@@ -680,10 +687,10 @@ class PillPresenter:
         self._present(state)
         return state
 
-    def working(self) -> PillState:
+    def working(self, label: str | None = None) -> PillState:
         self._cancel_timer()
         with self._lock:
-            state = self._controller.on_working()
+            state = self._controller.on_working(label)
         self._present(state)
         return state
 
@@ -725,7 +732,12 @@ class PillPresenter:
 
     # -- streaming -----------------------------------------------------------
 
-    def feed_stream(self, partials: Iterable[Partial] | Iterator[Partial]) -> str:
+    def feed_stream(
+        self,
+        partials: Iterable[Partial] | Iterator[Partial],
+        *,
+        cancelled: threading.Event | None = None,
+    ) -> str:
         """Pump ``engine.stream()`` output into the pill; return the full text.
 
         The returned text is the complete utterance, not the shortened line the
@@ -733,19 +745,34 @@ class PillPresenter:
         they use :meth:`listening`, :meth:`working` and :meth:`done` and the pill
         shows state only.
 
-        An engine that raises mid-stream leaves the pill visible with no hide
-        deadline of its own, so the failure is turned into the error phase —
-        which drops the half-transcript and schedules the 3 s fade — before the
-        exception carries on to the caller.
+        ``cancelled`` is how an *abandoned* decoder lets go. The app gives up on
+        a stream that overruns its join timeout and moves on to the next
+        utterance, but the generator keeps running — and every partial it pushes
+        after that lands on a pill that now belongs to somebody else's words.
+        Once the event is set this stops presenting anything at all, including
+        the error state: the failure of a stream nobody is waiting for is not
+        news the user needs mid-sentence.
+
+        An engine that raises mid-stream while still current leaves the pill
+        visible with no hide deadline of its own, so the failure is turned into
+        the error phase — which drops the half-transcript and schedules the 3 s
+        fade — before the exception carries on to the caller.
         """
         assert partials is not None, "partials is required"
+
+        def abandoned() -> bool:
+            return cancelled is not None and cancelled.is_set()
+
         text = ""
         try:
             for partial in partials:
+                if abandoned():
+                    break
                 self.partial(partial)
                 text = partial_buffer_text(partial)
         except Exception:
-            self.error("Transcription failed")
+            if not abandoned():
+                self.error("Transcription failed")
             raise
         return text
 

@@ -25,7 +25,8 @@ Wave 2 changes:
   ``cleanup.llama_server.resolve_llama_server_binary()`` looks for it at
   ``<sys._MEIPASS>/bin/llama-server`` when frozen.
 - ``cleanup/prompts/`` is collected as data. ``cleanup.modes`` reads those files
-  from disk at call time (``PROMPTS_DIR = Path(__file__).parent / "prompts"``),
+  from disk at import time (``MODES``/``TONES`` load with the module, so a missing
+  manifest fails app launch) (``PROMPTS_DIR = Path(__file__).parent / "prompts"``),
   and a frozen module's ``__file__`` is ``<sys._MEIPASS>/cleanup/modes.py`` — so
   the destination has to be ``cleanup/prompts`` exactly, or every mode raises
   ``PromptFileMissingError`` in the bundle and nowhere else.

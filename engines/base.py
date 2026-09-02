@@ -192,15 +192,33 @@ class Engine(ABC):
         self._ensure_loaded()
         return self._transcribe(wav_path, language=language, hints=hints, long_form=long_form)
 
-    def stream(self, chunks: Iterable[bytes]) -> Iterator[Partial]:
+    def stream(
+        self,
+        chunks: Iterable[bytes],
+        language: str | None = None,
+        hints: Hints | None = None,
+    ) -> Iterator[Partial]:
         """Yield partials for a live audio stream.
+
+        ``language`` and ``hints`` mean what they mean in :meth:`transcribe`, so
+        one utterance is described the same way whichever path decodes it and no
+        caller has to know which one ran.
+
+        An engine may ignore either: Voxtral Realtime, the only streaming engine
+        Murmur ships, has no biasing dial at all and says so in its own
+        :meth:`_stream`. **That is why a live decode is not automatically the
+        final transcript.** The app treats the streamed text as the answer only
+        when the configured language is ``auto`` — see ``murmur.language_is_auto``
+        — and otherwise keeps the partials for the pill and takes the batch
+        result, which the engine *can* honour. That rule lives in those two
+        places and nowhere else.
 
         Raises :class:`EngineCapabilityError` when ``supports_streaming`` is False.
         """
         if not self.supports_streaming:
             raise EngineCapabilityError(f"{type(self).__name__} does not support streaming")
         self._ensure_loaded()
-        return self._stream(chunks)
+        return self._stream(chunks, language=language, hints=hints)
 
     def runtime_summary(self) -> str:
         """One line describing what the engine actually loaded onto, for the log.
@@ -225,8 +243,19 @@ class Engine(ABC):
     ) -> Transcript:
         """Engine-specific transcription; called only when loaded."""
 
-    def _stream(self, chunks: Iterable[bytes]) -> Iterator[Partial]:
-        """Engine-specific streaming; only reached when ``supports_streaming``."""
+    def _stream(
+        self,
+        chunks: Iterable[bytes],
+        language: str | None = None,
+        hints: Hints | None = None,
+    ) -> Iterator[Partial]:
+        """Engine-specific streaming; only reached when ``supports_streaming``.
+
+        Implementations that cannot honour ``language`` or ``hints`` must still
+        accept them and say in their docstring that they are ignored, rather
+        than dropping them from the signature: a silent ``TypeError`` at the
+        first live utterance is a worse answer than a documented no-op.
+        """
         raise NotImplementedError(
             f"{type(self).__name__} advertises streaming but does not implement _stream()"
         )
