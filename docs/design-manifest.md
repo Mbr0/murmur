@@ -12,7 +12,7 @@
 
 ## Palette (live)
 
-Source: [`ui_theme.py`](../ui_theme.py)
+Source: [`ui/theme.py`](../ui/theme.py)
 
 | Role | Light (RGB 0–1) | Target hex |
 |------|-----------------|------------|
@@ -30,4 +30,4 @@ Current brand green is slightly brighter than Boske moss — low-priority harmon
 
 ## For agents
 
-AppKit/Cocoa styling only. Keep local-only trust copy aligned with `MANIFEST.md`. Theme constants live in `ui_theme.py`.
+AppKit/Cocoa styling only. Keep local-only trust copy aligned with `MANIFEST.md`. Theme constants live in `ui/theme.py`.

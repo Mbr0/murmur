@@ -1025,7 +1025,7 @@ class EngineTab:
         self._sheet_bar = None
 
     def _alert(self, message: str) -> None:
-        import ui_alerts
+        from ui import alerts as ui_alerts
 
         ui_alerts.show_alert("Murmur", message)
 

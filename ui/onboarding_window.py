@@ -635,7 +635,7 @@ def _appkit() -> Any:
     )
     from PyObjCTools import AppHelper
 
-    import ui_theme
+    from ui import theme as ui_theme
 
     _APPKIT = _types.SimpleNamespace(
         objc=objc,
@@ -749,7 +749,7 @@ def _button(
 class OnboardingWindow:
     """The wizard window: fixed size, centred, one step at a time.
 
-    Built in code like :mod:`history_window`, themed through :mod:`ui_theme`,
+    Built in code like :mod:`ui.history_window`, themed through :mod:`ui.theme`,
     every control carrying a VoiceOver label. Long work (download, test
     recording) runs on a background thread and hops back to the main thread the
     way ``murmur.MurmurApp.run_on_main_thread`` does.

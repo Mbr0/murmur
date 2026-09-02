@@ -48,6 +48,60 @@ WHISPER_LANGUAGES: tuple[str, ...] = (
 )
 
 
+#: whisper.cpp's ``verbose_json`` reports ``language`` as one of whisper's own
+#: English language names (e.g. ``"english"``, ``"french"``), not the ISO
+#: 639-1 codes the rest of Murmur (and the Voxtral engine) use. Maps the name
+#: for every code in :data:`WHISPER_LANGUAGES` to that code so
+#: :func:`normalize_language_code` can undo it. Verified against upstream
+#: whisper's ``tokenizer.py`` ``LANGUAGES`` table.
+_LANGUAGE_NAME_TO_CODE: dict[str, str] = {
+    "english": "en",
+    "french": "fr",
+    "dutch": "nl",
+    "german": "de",
+    "spanish": "es",
+    "italian": "it",
+    "portuguese": "pt",
+    "polish": "pl",
+    "russian": "ru",
+    "ukrainian": "uk",
+    "turkish": "tr",
+    "swedish": "sv",
+    "danish": "da",
+    "norwegian": "no",
+    "finnish": "fi",
+    "czech": "cs",
+    "romanian": "ro",
+    "hungarian": "hu",
+    "greek": "el",
+    "japanese": "ja",
+    "chinese": "zh",
+    "korean": "ko",
+    "arabic": "ar",
+    "hindi": "hi",
+    "indonesian": "id",
+    "vietnamese": "vi",
+}
+
+
+def normalize_language_code(value: str | None) -> str | None:
+    """Fold an engine's raw ``language`` into the ISO 639-1 code the app uses.
+
+    ``None``, ``""`` and :data:`LANGUAGE_AUTO` all mean "no language" and
+    return None. Everything else is lower-cased; a whisper language *name*
+    (as whisper.cpp's ``verbose_json`` reports it, e.g. ``"english"``) is
+    mapped to its code via :data:`_LANGUAGE_NAME_TO_CODE`. An ISO code, or
+    anything else not in that table, passes through lower-cased and
+    unchanged: this never raises.
+    """
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if not text or text == LANGUAGE_AUTO:
+        return None
+    return _LANGUAGE_NAME_TO_CODE.get(text, text)
+
+
 class EngineError(Exception):
     """Base class for every engine failure."""
 

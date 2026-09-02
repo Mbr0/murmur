@@ -955,8 +955,8 @@ def _make_spacer(height: int) -> Any:
 
 
 def _imported_theme() -> Any:
-    """``ui_theme``, imported on demand, for a context that carries none."""
-    import ui_theme
+    """``ui.theme``, imported on demand, for a context that carries none."""
+    from ui import theme as ui_theme
 
     return ui_theme
 
@@ -1520,7 +1520,7 @@ class SmartTab:
             self._alert(f"That file could not be written.\n\n{error}")
 
     def _alert(self, message: str) -> None:
-        import ui_alerts
+        from ui import alerts as ui_alerts
 
         ui_alerts.show_alert("Murmur", message)
 

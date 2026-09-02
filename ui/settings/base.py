@@ -132,15 +132,15 @@ class TabLifecycle:
 
 # -- Shared controls ---------------------------------------------------------
 #
-# Every helper takes the theme module (``ui_theme``) rather than importing it,
+# Every helper takes the theme module (``ui.theme``) rather than importing it,
 # so a tab can be rendered against a stub. ``theme=None`` means "the real one".
 
 
 def _theme_or_default(theme: Any) -> Any:
-    """The passed theme, or ``ui_theme`` imported on demand."""
+    """The passed theme, or ``ui.theme`` imported on demand."""
     if theme is not None:
         return theme
-    import ui_theme
+    from ui import theme as ui_theme
 
     return ui_theme
 

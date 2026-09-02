@@ -1,6 +1,6 @@
 # MASTER: Murmur v2
 
-**Status:** ✅ approved 2026-09-02 · Waves 0–3 merged (PRs #4–#7) · Wave 4 wiring in progress
+**Status:** ✅ approved 2026-09-02 · Waves 0–4 merged (PRs #4–#8) · Wave 5 in progress
 **Base branch:** `main` (after PR #2)
 **Source:** study in `../2026-09-02-competitive-analysis/`, Part II "What should change"
 
@@ -133,10 +133,10 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 | E4e (serial) | `murmur.py` | Engine routing: Cloud when entitled and under allowance, else local. Pro gate on cleanup, modes, context, vocabulary beyond 20 terms, snippets, coding mode. Free tier one-time 60-minute cloud trial counter. |
 
 **Done when**
-- [ ] License verification passes test vectors and rejects tampered, expired and wrong-audience tokens
-- [ ] Cloud engine works against a recorded fixture of the proxy; fallback triggers at 95% in tests
-- [ ] Pro gate is a single function, tested, with no feature check scattered in UI code
-- [ ] Suite green
+- [x] License verification passes test vectors and rejects tampered, expired, wrong-audience, wrong-alg, future-iat and wrong-device tokens (throwaway Ed25519 key in tests)
+- [x] Cloud engine works against a fake proxy (loopback server); fallback triggers at 95% in tests; contract proposed to Boske (D6)
+- [x] Pro gate is a single function (`is_pro_feature_enabled`), tested; UI only receives a `pro_gate` callable; a guard test forbids licence imports under ui/
+- [x] Suite green (1700 tests, 2026-09-02)
 
 ## Wave 5 — Split and harden (SERIAL)
 

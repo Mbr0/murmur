@@ -674,10 +674,10 @@ UNKNOWN_VERSION = "unknown"
 
 
 def _resolved_theme(theme: Any) -> Any:
-    """The context's theme, or ``ui_theme`` imported on demand."""
+    """The context's theme, or ``ui.theme`` imported on demand."""
     if theme is not None:
         return theme
-    import ui_theme
+    from ui import theme as ui_theme
 
     return ui_theme
 
@@ -969,7 +969,7 @@ class AccountTab:
     # -- actions ---------------------------------------------------------
 
     def _sign_in_clicked(self, _sender) -> None:
-        import ui_alerts
+        from ui import alerts as ui_alerts
 
         if self.context.service(SERVICE_LICENSE) is None:
             ui_alerts.show_alert(NO_LICENCE_TITLE, NO_LICENCE_BODY)
@@ -1007,7 +1007,7 @@ class AccountTab:
         return action
 
     def _save_key(self, provider: str) -> None:
-        import ui_alerts
+        from ui import alerts as ui_alerts
 
         from services.keychain import KeychainError
 
@@ -1031,7 +1031,7 @@ class AccountTab:
         ui_alerts.show_alert(KEY_SAVED_TITLE, KEY_SAVED_BODY.format(provider=label))
 
     def _remove_key(self, provider: str) -> None:
-        import ui_alerts
+        from ui import alerts as ui_alerts
 
         from services.keychain import KeychainError
 

@@ -137,7 +137,20 @@ Run tests:
 
 ```bash
 source venv/bin/activate
-python -m unittest discover -s tests -p "test_*.py"
+python -m unittest discover -s tests -p "test_*.py"       # unit
+bash scripts/tools/run_integration.sh                     # integration (macOS)
+```
+
+Project layout:
+
+```
+murmur.py     entry point: PATH for the bundled binaries, then app.lifecycle
+app/          config, decisions, services, pipeline, menu, windows, lifecycle
+engines/      whisper.cpp, Voxtral/MLX, Murmur Cloud, own key, model store
+cleanup/      llama-server, modes, tones, context, vocabulary, snippets, filters
+ui/           settings/, onboarding_window, pill_window, history_window, theme, alerts
+services/     audio capture, hotkey, text insertion, persistence, licence, usage
+tests/        unit tests, plus tests/integration/ for the end-to-end suite
 ```
 
 ## Acknowledgements

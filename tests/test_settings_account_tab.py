@@ -753,7 +753,7 @@ class KeyProbeTests(unittest.TestCase):
         tab.refresh()
         tab._key_fields["mistral"].setStringValue_(SECRET)
 
-        with unittest.mock.patch("ui_alerts.show_alert"):
+        with unittest.mock.patch("ui.alerts.show_alert"):
             tab._save_key("mistral")
 
         self.assertEqual(tab._key_indicators["mistral"].value, KEY_STORED)

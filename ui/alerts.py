@@ -20,11 +20,18 @@ ICON_CANDIDATES = (
 )
 _icon_cache = None
 
+#: The checkout this file lives in. Wave 5 moved the module from the repo root
+#: into ``ui/``, so its own directory is one level too deep for ``assets/``: a
+#: source run would have looked in ``ui/assets/logos/`` and quietly shown every
+#: alert with the default Python icon. The bundle was never affected — it reads
+#: ``sys._MEIPASS`` — which is exactly why this would not have been noticed.
+_SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 def resource_path(relative_path):
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+    return os.path.join(_SOURCE_ROOT, relative_path)
 
 
 def app_icon_image():

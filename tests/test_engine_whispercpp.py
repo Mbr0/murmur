@@ -63,6 +63,7 @@ class _Recorder:
         self.requests = []
         self.inference_status = 200
         self.healthy = True
+        self.response = CANNED_RESPONSE
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -97,7 +98,7 @@ class _Handler(BaseHTTPRequestHandler):
         if status != 200:
             self._send(status, b'{"error":"failed to process audio"}')
             return
-        self._send(200, json.dumps(CANNED_RESPONSE).encode("utf-8"))
+        self._send(200, json.dumps(self.recorder.response).encode("utf-8"))
 
 
 class FakeProcess:
@@ -377,7 +378,7 @@ class TranscriptionTests(ServerBackedTestCase):
         transcript = engine.transcribe(self.wav, language="nl")
 
         self.assertEqual(transcript.text, "Murmur schrijft mee.")
-        self.assertEqual(transcript.language, "dutch")
+        self.assertEqual(transcript.language, "nl")
         self.assertEqual(transcript.duration_s, 2.5)
         self.assertEqual(transcript.engine_id, "whispercpp")
         self.assertEqual([s.text for s in transcript.segments], ["Murmur", "schrijft mee."])
@@ -459,6 +460,15 @@ class TranscriptionTests(ServerBackedTestCase):
         engine.load()
         with self.assertRaises(EngineError):
             engine.transcribe(self.tmp / "missing.wav")
+
+    def test_language_name_is_normalized_to_an_iso_code(self):
+        # whisper.cpp's verbose_json reports the language *name* ("english"),
+        # not the ISO code the rest of Murmur uses.
+        self.recorder.response = dict(CANNED_RESPONSE, language="english")
+        engine = self.make_engine()
+        engine.load()
+        transcript = engine.transcribe(self.wav)
+        self.assertEqual(transcript.language, "en")
 
 
 class BinaryResolutionTests(unittest.TestCase):

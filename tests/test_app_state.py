@@ -7,18 +7,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from murmur import (
+from app.config import (
     APP_CATALOG,
     APP_VERSION,
     AUDIO_DIR,
-    HISTORY_ORIGIN_BY_ENGINE,
-    SM_STATUS_ENABLED,
-    LaunchAtLoginUnavailable,
-    MurmurApp,
-    apply_launch_at_login,
-    history_origin_for,
-    launch_at_login_enabled,
-    login_item_service,
+)
+from app.decisions import (
+    ACCOUNT_STATUS_FREE,
+    ACCOUNT_STATUS_NOT_SAVED,
+    ACCOUNT_STATUS_PRO,
+    ACCOUNT_STATUS_PRO_GRACE,
     CLEANUP_DOWNLOAD_MENU_TITLE,
     CLEANUP_MODEL_MISSING_REASON,
     CLEANUP_NOTICE_NOTIFY,
@@ -32,90 +30,100 @@ from murmur import (
     CLEANUP_START_FAILED_REASON,
     CLEANUP_STOPPING_REASON,
     CLEANUP_UNSTABLE_REASON,
-    MODE_MENU_AUTOMATIC,
-    ACCOUNT_STATUS_FREE,
-    ACCOUNT_STATUS_NOT_SAVED,
-    ACCOUNT_STATUS_PRO,
-    ACCOUNT_STATUS_PRO_GRACE,
+    CleanupPlan,
     ENTITLEMENT_REFRESH_INTERVAL_S,
     ENTITLEMENT_RETRY_BASE_S,
     ENTITLEMENT_RETRY_MAX_S,
     FREE_MODE_ID,
+    HISTORY_ORIGIN_BY_ENGINE,
+    LaunchAtLoginUnavailable,
+    MISSING_MODEL_ONBOARDING,
+    MISSING_MODEL_SETTINGS,
+    MODE_MENU_AUTOMATIC,
     NOTICE_KEY_FAILED,
     NOTICE_KEY_RATE_LIMITED,
     NOTICE_KEY_REJECTED,
-    SIGN_IN_MENU_TITLE,
-    CleanupPlan,
-    CleanupRuntime,
-    RemoteEngineKey,
-    UsageConfigStore,
-    account_menu_title,
-    after_byok_failure,
-    byok_provider_name,
-    next_refresh_delay,
-    pinned_cloud_config,
-    configured_mode_id,
-    expand_gated_snippets,
-    gated_vocabulary,
-    lease_is_present,
-    notice_to_show,
-    own_key_present,
-    publish_entitlements,
-    remote_engine_key,
-    resolve_plan_mode,
-    should_consume_trial,
-    should_refresh_allowance,
-    should_refresh_entitlements,
-    cleanup_download_menu_enabled,
-    cleanup_model_missing_message,
-    cleanup_notice_kind,
-    cleanup_plan,
-    cleanup_skipped_message,
-    code_transform_language,
-    language_is_auto,
-    mode_menu_state,
-    paste_and_settle,
-    prompt_language,
-    reapply_replacements,
-    run_cleanup,
-    should_offer_cleanup_download,
-    should_prewarm_cleanup,
-    stream_text_for_token,
-    tone_menu_state,
-    MISSING_MODEL_ONBOARDING,
-    MISSING_MODEL_SETTINGS,
     NO_MODEL_STATUS,
     RELOAD_BUSY,
     RELOAD_RECORDING,
     RELOAD_START,
     RELOAD_UNCHANGED,
+    RemoteEngineKey,
+    SIGN_IN_MENU_TITLE,
+    SM_STATUS_ENABLED,
     about_menu_title,
+    account_menu_title,
+    after_byok_failure,
+    apply_launch_at_login,
+    byok_provider_name,
+    cleanup_download_menu_enabled,
+    cleanup_model_missing_message,
+    cleanup_notice_kind,
+    cleanup_plan,
+    cleanup_skipped_message,
     clear_mic_device_selection,
+    code_transform_language,
+    configured_mode_id,
     download_progress_status,
     engine_is_ready,
+    expand_gated_snippets,
     finalize_transcript,
+    gated_vocabulary,
     hints_notice_message,
+    history_origin_for,
+    language_is_auto,
+    launch_at_login_enabled,
+    lease_is_present,
+    login_item_service,
     missing_model_action,
+    mode_menu_state,
     model_integrity_message,
     model_status_title,
     model_unavailable_message,
+    next_refresh_delay,
+    notice_to_show,
+    own_key_present,
+    paste_and_settle,
+    pinned_cloud_config,
+    prompt_language,
+    publish_entitlements,
     push_to_talk_degraded_message,
+    reapply_replacements,
     reload_engine_decision,
     remember_hints_notice,
+    remote_engine_key,
     resolve_engine_selection,
     resolve_mic_device,
     resolve_mic_device_index,
+    resolve_plan_mode,
+    run_cleanup,
     should_apply_ready_on_reset,
+    should_consume_trial,
+    should_offer_cleanup_download,
+    should_prewarm_cleanup,
+    should_refresh_allowance,
+    should_refresh_entitlements,
     should_reject_toggle,
     should_reject_upload,
     should_relaunch_after_install,
     should_show_hints_notice,
-    skip_audio_user_message,
     should_toggle_for_press_action,
+    skip_audio_user_message,
+    stream_text_for_token,
+    tone_menu_state,
     update_available_message,
     update_installed_message,
     update_relaunch_failed_message,
     verify_model_before_load,
+)
+from app.services import (
+    UsageConfigStore,
+)
+from app.pipeline import (
+    CleanupRuntime,
+)
+from app.lifecycle import (
+    MurmurApp,
 )
 from cleanup.context import AppContext
 from cleanup.llama_server import CLEANUP_MODEL_SPEC, CleanupResult, LlamaServerError
@@ -719,7 +727,7 @@ class FreeTierTestCase(GateTestCase):
 
 
 class ProGateCallSiteTests(GateTestCase):
-    """One gate, and every place in ``murmur.py`` that asks it something.
+    """One gate, and every place in ``app/`` that asks it something.
 
     The gate itself is :mod:`services.license_service`'s and is tested there.
     What is tested here is that each gated feature is actually asked about at
@@ -730,8 +738,14 @@ class ProGateCallSiteTests(GateTestCase):
     def test_the_gate_is_the_licensed_one(self):
         # Not a config key, not a local copy: a second opinion about what "Pro"
         # means is exactly the bug the single gate exists to prevent.
-        source = (Path(__file__).resolve().parent.parent / "murmur.py").read_text(
-            encoding="utf-8"
+        #
+        # Read over the whole app package since Wave 5: the gate used to live in
+        # one file, and a second opinion introduced in any of the six that
+        # replaced it would be the same bug.
+        root = Path(__file__).resolve().parent.parent
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [root / "murmur.py", *sorted((root / "app").glob("*.py"))]
         )
         self.assertNotIn("pro_override_for_dev", source)
         self.assertNotIn("def pro_enabled", source)
@@ -748,7 +762,7 @@ class ProGateCallSiteTests(GateTestCase):
 
     def test_without_context_the_configured_mode_applies_everywhere(self):
         self.publish(pro=True)
-        with patch("murmur.is_pro_feature_enabled", lambda f: f != "context"):
+        with patch("app.decisions.is_pro_feature_enabled", lambda f: f != "context"):
             mode = resolve_plan_mode(
                 _config(cleanup_mode="notes", context_awareness=True),
                 _context("com.apple.mail"),
@@ -873,7 +887,7 @@ class UserDataInLogsTests(GateTestCase):
     SECRET = "my-private-snippet-body"
 
     def test_an_unreadable_cleanup_mode_logs_the_type_only(self):
-        with patch("murmur.mode_from_config", side_effect=ValueError(self.SECRET)):
+        with patch("app.decisions.mode_from_config", side_effect=ValueError(self.SECRET)):
             with self.assertLogs("murmur", level="WARNING") as caught:
                 self.assertEqual(configured_mode_id(_config()), FREE_MODE_ID)
 
@@ -1908,7 +1922,7 @@ class SettingsServicesTests(GateTestCase):
         app = SimpleNamespace(
             persistence=object(), _keychain_probed=False, _keychain_store=None
         )
-        with patch("murmur.KeychainStore", Unavailable):
+        with patch("app.services.KeychainStore", Unavailable):
             services = MurmurApp._settings_services(
                 SimpleNamespace(
                     persistence=app.persistence,
@@ -1930,7 +1944,7 @@ class KeychainProbeTests(unittest.TestCase):
                 raise KeychainUnavailable("no Security framework")
 
         app = SimpleNamespace(_keychain_probed=False, _keychain_store=None)
-        with patch("murmur.KeychainStore", Unavailable):
+        with patch("app.services.KeychainStore", Unavailable):
             store = MurmurApp._keychain(app)
 
         self.assertIsNone(store)
@@ -1949,7 +1963,7 @@ class KeychainProbeTests(unittest.TestCase):
                         raise _error
 
                 app = SimpleNamespace(_keychain_probed=False, _keychain_store=None)
-                with patch("murmur.KeychainStore", Exploding):
+                with patch("app.services.KeychainStore", Exploding):
                     with self.assertLogs("murmur", level="WARNING") as captured:
                         store = MurmurApp._keychain(app)
 
@@ -1966,7 +1980,7 @@ class KeychainProbeTests(unittest.TestCase):
                 made.append(self)
 
         app = SimpleNamespace(_keychain_probed=False, _keychain_store=None)
-        with patch("murmur.KeychainStore", Fine):
+        with patch("app.services.KeychainStore", Fine):
             first = MurmurApp._keychain(app)
             second = MurmurApp._keychain(app)
 
@@ -2208,7 +2222,7 @@ class SetLaunchAtLoginTests(unittest.TestCase):
         service = _BridgedAppService(ok=False)
         app = SimpleNamespace(_login_item_service=service)
 
-        with patch("murmur.ui_alerts.show_alert") as alert:
+        with patch("ui.alerts.show_alert") as alert:
             state = MurmurApp.set_launch_at_login(app, True)
 
         self.assertFalse(state)
@@ -2774,7 +2788,7 @@ class SessionNoticeTests(GateTestCase):
         app = self._app()
         shown = []
 
-        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+        with patch("app.pipeline.rumps.notification", lambda *a: shown.append(a[-1])):
             MurmurApp._announce_route(app, "Your Mistral key was rejected", once_key="k")
             MurmurApp._announce_route(app, "Your Mistral key was rejected", once_key="k")
 
@@ -2784,7 +2798,7 @@ class SessionNoticeTests(GateTestCase):
         app = self._app()
         shown = []
 
-        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+        with patch("app.pipeline.rumps.notification", lambda *a: shown.append(a[-1])):
             MurmurApp._announce_route(app, "rejected", once_key="byok key rejected")
             MurmurApp._announce_route(app, "rate limited", once_key="byok rate limited")
 
@@ -2794,7 +2808,7 @@ class SessionNoticeTests(GateTestCase):
         app = self._app()
         shown = []
 
-        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+        with patch("app.pipeline.rumps.notification", lambda *a: shown.append(a[-1])):
             MurmurApp._announce_route(app, NOTICE_SIGN_IN)
             MurmurApp._announce_route(app, NOTICE_SIGN_IN)
 
@@ -2827,7 +2841,7 @@ class RouteNoticeTests(GateTestCase):
         shown = []
         app = SimpleNamespace(usage=usage)
 
-        with patch("murmur.rumps.notification", lambda *a: shown.append(a[-1])):
+        with patch("app.pipeline.rumps.notification", lambda *a: shown.append(a[-1])):
             MurmurApp._announce_route(app, ALLOWANCE_MESSAGE)
             MurmurApp._announce_route(app, ALLOWANCE_MESSAGE)
 
@@ -3052,7 +3066,7 @@ class CloudCleanupSelectionTests(GateTestCase):
         pill = SimpleNamespace(working=lambda label=None: labels.append(label))
         config = _config(cleanup_mode="message")
 
-        with patch("murmur.capture_context", lambda include_selection=False: _context()):
+        with patch("app.pipeline.capture_context", lambda include_selection=False: _context()):
             MurmurApp._clean_up_transcript(
                 app, "hello", config, "en", vocabulary_from_config(config), pill
             )
@@ -3125,7 +3139,7 @@ class RemoteEngineCacheTests(unittest.TestCase):
 
         app = self._app()
         config = _config()
-        with patch("murmur.build_engine", build):
+        with patch("app.pipeline.build_engine", build):
             first = MurmurApp._remote_engine_for(app, ENGINE_CLOUD, config)
             second = MurmurApp._remote_engine_for(app, ENGINE_CLOUD, config)
 
@@ -3140,7 +3154,7 @@ class RemoteEngineCacheTests(unittest.TestCase):
             return _FakeEngine(engine_id)
 
         app = self._app()
-        with patch("murmur.build_engine", build):
+        with patch("app.pipeline.build_engine", build):
             MurmurApp._remote_engine_for(app, ENGINE_BYOK, _config(byok_provider="mistral"))
             MurmurApp._remote_engine_for(app, ENGINE_BYOK, _config(byok_provider="openai"))
 
@@ -3202,7 +3216,7 @@ class PinnedProxyOriginTests(unittest.TestCase):
             seen.append(kwargs["config"].get(CONFIG_CLOUD_BASE_URL))
             return _FakeEngine(engine_id)
 
-        with patch("murmur.build_engine", build):
+        with patch("app.pipeline.build_engine", build):
             MurmurApp._remote_engine_for(
                 app, ENGINE_CLOUD, _config(cloud_base_url=self.ELSEWHERE)
             )
@@ -3218,7 +3232,7 @@ class PinnedProxyOriginTests(unittest.TestCase):
             def __init__(self, base_url, lease_provider):
                 seen.append(base_url)
 
-        with patch("murmur.CloudCleanupClient", Client):
+        with patch("app.pipeline.CloudCleanupClient", Client):
             MurmurApp._cleanup_client(app, _config(cloud_base_url=self.ELSEWHERE))
 
         self.assertEqual(seen, [self.PINNED])
@@ -3237,7 +3251,7 @@ class PinnedProxyOriginTests(unittest.TestCase):
     def test_an_unchanged_origin_says_nothing_at_all(self):
         app = self._app()
 
-        with patch("murmur.logger") as log:
+        with patch("app.services.logger") as log:
             MurmurApp._hosted_config(app, _config())
 
         log.warning.assert_not_called()
@@ -3268,7 +3282,7 @@ class RemoteEngineBuildFailureTests(unittest.TestCase):
         def build(engine_id, **kwargs):
             raise ValueError("engine 'byok' needs config['byok_provider']")
 
-        with patch("murmur.build_engine", build):
+        with patch("app.pipeline.build_engine", build):
             with self.assertRaises(EngineError) as caught:
                 MurmurApp._remote_engine_for(self._app(), ENGINE_BYOK, _config())
 
@@ -3279,7 +3293,7 @@ class RemoteEngineBuildFailureTests(unittest.TestCase):
             def load(self):
                 raise ValueError("base_url must be https")
 
-        with patch("murmur.build_engine", lambda engine_id, **kw: Failing(engine_id)):
+        with patch("app.pipeline.build_engine", lambda engine_id, **kw: Failing(engine_id)):
             with self.assertRaises(EngineError):
                 MurmurApp._remote_engine_for(self._app(), ENGINE_CLOUD, _config())
 
@@ -3287,7 +3301,7 @@ class RemoteEngineBuildFailureTests(unittest.TestCase):
         def build(engine_id, **kwargs):
             raise ValueError("cloud_base_url=https://user:sekrit@host is not https")
 
-        with patch("murmur.build_engine", build):
+        with patch("app.pipeline.build_engine", build):
             with self.assertRaises(EngineError) as caught:
                 MurmurApp._remote_engine_for(self._app(), ENGINE_CLOUD, _config())
 
@@ -3300,13 +3314,13 @@ class RemoteEngineBuildFailureTests(unittest.TestCase):
             def load(self):
                 raise ByokAuthError("401")
 
-        with patch("murmur.build_engine", lambda engine_id, **kw: Failing(engine_id)):
+        with patch("app.pipeline.build_engine", lambda engine_id, **kw: Failing(engine_id)):
             with self.assertRaises(ByokAuthError):
                 MurmurApp._remote_engine_for(self._app(), ENGINE_BYOK, _config())
 
     def test_a_failed_build_is_not_cached_as_the_engine(self):
         app = self._app()
-        with patch("murmur.build_engine", lambda *a, **k: (_ for _ in ()).throw(ValueError())):
+        with patch("app.pipeline.build_engine", lambda *a, **k: (_ for _ in ()).throw(ValueError())):
             with self.assertRaises(EngineError):
                 MurmurApp._remote_engine_for(app, ENGINE_CLOUD, _config())
 

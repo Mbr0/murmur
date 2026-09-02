@@ -1,6 +1,6 @@
 import unittest
 
-from transcription_filters import is_likely_hallucination, should_skip_audio
+from cleanup.transcription_filters import is_likely_hallucination, should_skip_audio
 
 
 class ShouldSkipAudioTests(unittest.TestCase):
