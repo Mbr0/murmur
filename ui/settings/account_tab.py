@@ -67,6 +67,9 @@ BYOK_PROVIDER_LABELS: dict[str, str] = {"mistral": "Mistral", "openai": "OpenAI"
 #: Names of the providers this tab reads out of :attr:`TabContext.services`.
 SERVICE_LICENSE = "license"
 SERVICE_KEYCHAIN = "keychain"
+#: Injected truth about the secret store: True when the lease is kept in memory
+#: because the Keychain could not be reached.
+SERVICE_SECRET_STORE_VOLATILE = "secret_store_volatile"
 SERVICE_SCHEDULER = "scheduler"
 
 #: Device-linking states.
@@ -99,6 +102,10 @@ STATUS_PRO_GRACE_NO_DATE = "Pro (grace)"
 CLOUD_VOICE_INCLUDED = "Cloud voice included"
 CLOUD_VOICE_MINUTES = "Cloud voice included — {minutes} minutes a month"
 STATUS_UNAVAILABLE = "Licence status unavailable"
+#: Appended to the status line when the lease is held in memory only, because
+#: the Keychain could not be reached. Signing in, quitting and being Free again
+#: reads as a billing failure; this is the tab admitting it before the sign-in.
+STATUS_NOT_PERSISTED = "Sign-in will not persist: Keychain unavailable"
 
 KEY_STORED = "Key stored"
 KEY_NOT_STORED = "No key stored"
@@ -288,6 +295,7 @@ class AccountTabModel:
         build_info: dict,
         scheduler: Callable[[float, Callable[[], None]], Any] | None = None,
         now: Callable[[], float] | None = None,
+        secret_store_volatile: bool = False,
     ) -> None:
         assert config is not None, "config is required"
         assert callable(license_provider), "license_provider must be callable"
@@ -303,6 +311,8 @@ class AccountTabModel:
         self._link_poller = link_poller
         self._sign_out = sign_out
         self.keychain = keychain
+        #: True when the lease cannot be stored, so it dies with the process.
+        self.secret_store_volatile = bool(secret_store_volatile)
         self.version = str(version)
         self.build_info = dict(build_info or {})
         self._scheduler = scheduler or _start_timer
@@ -346,7 +356,15 @@ class AccountTabModel:
         return self.entitlements is not None and bool(getattr(self.entitlements, "source", ""))
 
     def status_line(self) -> str:
-        """The one line that says what this Mac is entitled to."""
+        """The one line that says what this Mac is entitled to.
+
+        On a Mac with no reachable Keychain it also says that whatever the user
+        does on this tab lasts until they quit — the warning belongs next to
+        the sign-in button, not in a log nobody reads.
+        """
+        return self._with_persistence_warning(self._entitlement_status())
+
+    def _entitlement_status(self) -> str:
         if not self.license_available:
             return STATUS_UNAVAILABLE
         if not self.is_pro:
@@ -355,6 +373,11 @@ class AccountTabModel:
         if getattr(self.entitlements, "in_grace", False):
             return STATUS_PRO_GRACE.format(date=when) if when else STATUS_PRO_GRACE_NO_DATE
         return STATUS_PRO_UNTIL.format(date=when) if when else STATUS_PRO
+
+    def _with_persistence_warning(self, line: str) -> str:
+        if not self.secret_store_volatile:
+            return line
+        return f"{line} — {STATUS_NOT_PERSISTED}"
 
     def detail_line(self) -> str:
         """The cloud-voice line under the status, or "" when not entitled."""
@@ -819,6 +842,9 @@ class AccountTab:
             version=str(version),
             build_info=build_info,
             scheduler=context.service(SERVICE_SCHEDULER) or self._schedule,
+            secret_store_volatile=bool(
+                context.service(SERVICE_SECRET_STORE_VOLATILE, False)
+            ),
             **_license_callables(context.service(SERVICE_LICENSE)),
         )
 
@@ -1073,8 +1099,10 @@ __all__ = [
     "SERVICE_KEYCHAIN",
     "SERVICE_LICENSE",
     "SERVICE_SCHEDULER",
+    "SERVICE_SECRET_STORE_VOLATILE",
     "SERVICE_VERSION",
     "STATUS_FREE",
+    "STATUS_NOT_PERSISTED",
     "UPDATE_CHANNELS",
     "AccountTab",
     "AccountTabModel",

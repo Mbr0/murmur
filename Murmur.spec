@@ -30,6 +30,21 @@ Wave 2 changes:
   and a frozen module's ``__file__`` is ``<sys._MEIPASS>/cleanup/modes.py`` — so
   the destination has to be ``cleanup/prompts`` exactly, or every mode raises
   ``PromptFileMissingError`` in the bundle and nowhere else.
+
+Wave 4 changes:
+
+- ``cryptography`` is collected whole. It verifies the Ed25519 signature on a
+  Boske lease, and its primitives live in a compiled Rust extension reached
+  through ``_cffi_backend``; static analysis finds neither, so a bundle built
+  without ``collect_all`` imports ``services.license_service`` happily and then
+  fails at the first lease.
+- ``Security`` is a hidden import: ``services/keychain.py`` reaches the macOS
+  Keychain through PyObjC's Security bindings when they are installed
+  (``pyobjc-framework-Security``, see requirements.txt) and through ctypes when
+  they are not. Only the PyObjC path needs naming here.
+- ``engines/factory.py`` and ``services/engine_router.py`` need no spec edit:
+  the first-party sweep below enumerates every submodule of ``engines`` and
+  ``services`` from disk.
 """
 
 import importlib.util
@@ -125,6 +140,15 @@ hiddenimports = [
     "ui_theme",
     "ui_alerts",
     "transcription_filters",
+    # Wave 4: the Keychain store's PyObjC backend. Named unconditionally on
+    # purpose — a "hidden import not found" warning here is the signal that the
+    # build machine skipped `pip install -r requirements.txt` and the bundle is
+    # about to ship on the ctypes fallback. It is a warning, not an error,
+    # because that fallback does work.
+    "Security",
+    # cryptography's CFFI bridge. collect_all below brings the package and its
+    # Rust extension; the backend module is a separate top-level import.
+    "_cffi_backend",
 ]
 
 
@@ -150,7 +174,10 @@ MLX_REQUIRED = ("mlx", "mlx_audio")
 #: tokenizers need it; it is skipped when the environment does not have it.
 MLX_OPTIONAL = ("tokenizers", "safetensors", "sentencepiece", "huggingface_hub", "miniaudio")
 
-collect_packages = ["quickmachotkey"]
+# cryptography is collected on every architecture: lease verification is not a
+# macOS-only or Apple-Silicon-only concern, and its Rust extension does not
+# survive static analysis.
+collect_packages = ["quickmachotkey", "cryptography"]
 
 if IS_ARM64:
     missing = [name for name in MLX_REQUIRED if importlib.util.find_spec(name) is None]

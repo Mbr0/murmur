@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <strong>100% on-device</strong> · Local speech engine · No cloud · Menu bar app
+  <strong>On-device by default</strong> · Local speech engine · Optional cloud, off until you turn it on · Menu bar app
 </p>
 
 <br>
@@ -67,9 +67,33 @@ Open **Settings** from the menu bar. It has five tabs — General, Engine, Smart
 | Recording | Red indicator |
 | Working | Processing spinner |
 
+## Free, Pro and the cloud
+
+Murmur is free and fully local: press the shortcut, speak, text appears. **Pro**
+unlocks the smart layer — AI cleanup, writing modes and tones, context awareness
+that picks a mode from the app you are typing into, vocabularies beyond 20 terms,
+snippets and spoken-code mode — and is enabled by a licence tied to your Boske
+ID, from **Settings → Account** or the menu bar's *Sign in with Boske ID…*. All
+of it still runs on your Mac.
+
+Two ways to send audio off the Mac, both off by default and both chosen in
+**Settings → Engine**:
+
+- **Murmur Cloud** — transcription through our EU proxy on your Boske plan, with
+  a one-time 60-minute trial for signed-in free accounts. Minutes and words are
+  metered and shown on the same tab, and Murmur switches back to your own engine
+  with a visible notice once you reach 95% of your allowance. Never a silent
+  fallback and never a surprise bill.
+- **Own key** — your own Mistral or OpenAI account. The key is stored in the
+  macOS Keychain, never in a config file, and nothing is metered by us.
+
+With cloud **Off**, no audio and no text leaves the machine. **Settings →
+Privacy** always states, in plain language, exactly what leaves the Mac for the
+configuration you have.
+
 ## Privacy
 
-All transcription runs **locally** on your Mac. The local speech engine is [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (bundled `whisper-server`, `large-v3-turbo`) or, on Apple Silicon with 16 GB of RAM or more, Voxtral Mini 4B Realtime through [mlx-audio](https://github.com/Blaizzy/mlx-audio). No audio or text is sent to the cloud. Speech engine models download on demand from **Settings → Speech engine** and live under `~/Library/Application Support/Murmur/models/`; history and audio files, when enabled, are stored under `~/.murmur_*`.
+All transcription runs **locally** on your Mac by default. The local speech engine is [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (bundled `whisper-server`, `large-v3-turbo`) or, on Apple Silicon with 16 GB of RAM or more, Voxtral Mini 4B Realtime through [mlx-audio](https://github.com/Blaizzy/mlx-audio). Nothing is sent to the cloud unless you turn on Murmur Cloud or Own key yourself (see above). Speech engine models download on demand from **Settings → Speech engine** and live under `~/Library/Application Support/Murmur/models/`; history and audio files, when enabled, are stored under `~/.murmur_*`.
 
 ## Troubleshooting
 

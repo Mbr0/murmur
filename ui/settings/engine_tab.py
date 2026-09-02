@@ -246,9 +246,10 @@ def _format_when(value: Any) -> str | None:
 def format_license_line(status: Any | None) -> str:
     """One line describing the signed-in plan, or that nobody is signed in.
 
-    ``status`` is whatever ``services["license"]()`` returns: an object with
-    ``pro``, ``cloud_voice``, ``expires_at`` and ``in_grace``. Wave 4 fills it
-    in; until then the provider is simply absent and this reads "Not signed in".
+    ``status`` is the entitlements :meth:`EngineTabModel._read_license` got out
+    of ``services["license"]``: an object with ``pro``, ``cloud_voice``,
+    ``expires_at`` and ``in_grace``. ``None`` — no licence service, or one that
+    could not be read — reads "Not signed in".
     """
     if status is None:
         return NOT_SIGNED_IN
@@ -620,9 +621,29 @@ class EngineTabModel:
         self._original = self.as_config()
 
     def _read_license(self) -> Any | None:
-        if self._license_provider is None:
+        """The current entitlements, for the status line only.
+
+        ``services["license"]`` is the Wave 4 ``LicenseService`` itself — the
+        Account tab binds four of its methods — so the object handed here is not
+        callable. A plain callable returning entitlements is accepted too,
+        because that is what this tab's own tests inject and what a build
+        without the service would supply. Neither shape may take the window
+        down: this line *describes* a plan, and the gate that decides anything
+        is ``pro_gate``.
+        """
+        provider = self._license_provider
+        if provider is None:
             return None
-        return self._license_provider()
+        try:
+            if not callable(provider):
+                return provider.current_entitlements()
+            return provider()
+        except Exception as error:  # noqa: BLE001 - a locked Keychain, a bad lease
+            logger.warning(
+                "Could not read the licence for the status line: %s",
+                type(error).__name__,
+            )
+            return None
 
 
 def _one_of(value: Any, allowed: tuple[str, ...], default: str) -> str:

@@ -69,6 +69,22 @@ Wave 3 (cloud and the settings tabs) adds:
 - ``snippets``: list of ``{"trigger", "text"}`` — spoken phrases that expand
   into stored text (``cleanup/snippets.py``, edited on the Smart tab).
 
+Wave 4 (the licence and cloud clients) adds:
+
+- ``cloud_base_url``: origin of the Boske proxy, shared by
+  :class:`engines.cloud.CloudEngine`, :class:`cleanup.cloud_cleanup.CloudCleanupClient`
+  and :class:`services.license_service.LicenseService` so the three never
+  disagree about which host the lease belongs to. Defaults to
+  :data:`engines.factory.DEFAULT_CLOUD_BASE_URL`.
+- the ten counters in :data:`services.usage_service.USAGE_DEFAULTS` — this
+  month's cloud and local minutes and words, the one-time cloud trial, the
+  cached proxy allowance and the "switched to local" notice flag. They are
+  merged in below rather than spelled out twice, so the service that owns them
+  stays the one place they are described.
+
+No secret is ever a config key. The Boske lease and the own-key API keys live
+in the Keychain (``services/keychain.py``); nothing here holds a credential.
+
 Writers that own only a few keys must go through :meth:`PersistenceService.update_config`
 rather than saving a whole config they loaded earlier: a snapshot save silently
 reverts every key another part of the app wrote in the meantime.
@@ -94,6 +110,8 @@ import threading
 from typing import Any
 
 from cleanup.llama_server import CLEANUP_MODEL_ID
+from engines.factory import DEFAULT_CLOUD_BASE_URL
+from services.usage_service import USAGE_DEFAULTS
 
 
 #: Serialises read-modify-write cycles on the config file. Module level rather
@@ -146,6 +164,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "launch_at_login": False,
     "settings_last_tab": "general",
     "snippets": [],
+    # -- Wave 4: the licence and cloud clients -----------------------------
+    "cloud_base_url": DEFAULT_CLOUD_BASE_URL,
+    # The ten usage counters, from the service that owns them. Merged rather
+    # than copied so the two can never drift apart.
+    **USAGE_DEFAULTS,
 }
 
 #: Config keys the privacy surface reads and writes.
