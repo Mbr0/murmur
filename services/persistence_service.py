@@ -50,9 +50,28 @@ Wave 2 (the smart layer) adds:
 - ``cleanup_prewarm``: start the local cleanup server in the background at launch when cleanup is enabled and its model is installed
   (``ui/pill_window.py``).
 
+Wave 3 (cloud and the settings tabs) adds:
+
+- ``cloud_mode``: ``"off" | "murmur_cloud" | "own_key"`` — where transcription
+  happens. ``"off"`` means the local engine and nothing leaving the Mac
+  (read by :func:`what_leaves_the_mac`).
+- ``byok_provider``: ``"mistral" | "openai" | None`` — which provider the
+  own-key engine talks to. ``None`` until the user picks one.
+- ``cleanup_cloud``: whether that cleanup runs in the cloud rather than on this
+  Mac. Only meaningful when ``cleanup_enabled`` is true.
+
 Writers that own only a few keys must go through :meth:`PersistenceService.update_config`
 rather than saving a whole config they loaded earlier: a snapshot save silently
 reverts every key another part of the app wrote in the meantime.
+
+Two keys keep the names Murmur has always used rather than gaining synonyms:
+``save_history`` is the history toggle and ``save_audio`` the keep-audio
+toggle. Use :data:`CONFIG_HISTORY_ENABLED` and :data:`CONFIG_KEEP_AUDIO`.
+
+History entries (``history.json``) are dicts with ``timestamp``, ``source``,
+``text``, ``filename``, ``audio_path`` and, since Wave 3, ``origin``
+(``"local" | "cloud" | "byok"``), ``engine_id`` and ``duration_s``. Entries
+written before Wave 3 read back as ``origin="local"``.
 """
 
 from __future__ import annotations
@@ -110,6 +129,45 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cleanup_model_id": CLEANUP_MODEL_ID,
     "pill_enabled": True,
     "cleanup_prewarm": True,
+    # -- Wave 3: cloud and the settings tabs ------------------------------
+    "cloud_mode": "off",
+    "byok_provider": None,
+    "cleanup_cloud": False,
+}
+
+#: Config keys the privacy surface reads and writes.
+CONFIG_HISTORY_ENABLED = "save_history"
+CONFIG_KEEP_AUDIO = "save_audio"
+CONFIG_PRIVACY_MODE = "privacy_mode"
+CONFIG_CLOUD_MODE = "cloud_mode"
+CONFIG_BYOK_PROVIDER = "byok_provider"
+CONFIG_CLEANUP_ENABLED = "cleanup_enabled"
+CONFIG_CLEANUP_CLOUD = "cleanup_cloud"
+
+CLOUD_MODE_OFF = "off"
+CLOUD_MODE_MURMUR = "murmur_cloud"
+CLOUD_MODE_OWN_KEY = "own_key"
+
+#: Where a transcription was produced, recorded on every history entry.
+ORIGIN_LOCAL = "local"
+ORIGIN_CLOUD = "cloud"
+ORIGIN_BYOK = "byok"
+HISTORY_ORIGINS: tuple[str, ...] = (ORIGIN_LOCAL, ORIGIN_CLOUD, ORIGIN_BYOK)
+
+#: Config keys holding what the user said or typed, as opposed to preferences.
+#: :meth:`PersistenceService.delete_all_data` clears these and keeps the rest.
+USER_CONTENT_CONFIG_KEYS: tuple[str, ...] = (
+    "vocabulary_terms",
+    "vocabulary_replacements",
+    "language_by_app",
+    "mode_by_app",
+    "hints_notice_shown",
+)
+
+#: Own-key providers, in the words a person would recognise.
+BYOK_PROVIDER_LABELS: dict[str, str] = {
+    "mistral": "Mistral",
+    "openai": "OpenAI",
 }
 
 #: Key whose ``None`` means "ask the machine once"; see :func:`resolve_cleanup_enabled`.
@@ -157,6 +215,143 @@ def should_log_sensitive(config: dict[str, Any]) -> bool:
     return bool(config.get("save_history", DEFAULT_CONFIG["save_history"]))
 
 
+def _fresh_default(key: str) -> Any:
+    """A copy of ``DEFAULT_CONFIG[key]``, so resetting cannot alias the default."""
+    default = DEFAULT_CONFIG[key]
+    if isinstance(default, dict):
+        return dict(default)
+    if isinstance(default, list):
+        return list(default)
+    return default
+
+
+def validate_history_origin(origin: str) -> str:
+    """Return ``origin`` when it is one Murmur knows, else raise ``ValueError``."""
+    if origin not in HISTORY_ORIGINS:
+        allowed = ", ".join(HISTORY_ORIGINS)
+        raise ValueError(f"Unknown history origin {origin!r}; expected one of {allowed}.")
+    return origin
+
+
+def normalize_history(entries: Any) -> list[dict[str, Any]]:
+    """Read history entries, giving pre-Wave-3 ones the fields they lack.
+
+    Legacy entries carry no ``origin``: they can only have come from a local
+    engine, so they read back as ``"local"``. An entry with an origin Murmur
+    does not know is read as local too — history is a display surface, and a
+    corrupt file should not stop the window from opening. Non-dict junk is
+    dropped.
+    """
+    if not isinstance(entries, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        item = dict(entry)
+        if item.get("origin") not in HISTORY_ORIGINS:
+            item["origin"] = ORIGIN_LOCAL
+        item.setdefault("engine_id", None)
+        item.setdefault("duration_s", None)
+        normalized.append(item)
+    return normalized
+
+
+def _engine_name(engine_info: Any) -> str | None:
+    """The display name of the selected engine, from an ``EngineInfo`` or dict."""
+    if engine_info is None:
+        return None
+    if isinstance(engine_info, dict):
+        name = engine_info.get("name")
+    else:
+        name = getattr(engine_info, "name", None)
+    return name or None
+
+
+def what_leaves_the_mac(
+    config: dict[str, Any],
+    *,
+    engine_info: Any = None,
+) -> list[str]:
+    """Plain-language lines describing what this configuration sends away.
+
+    The order is fixed so the Privacy tab never reshuffles under the reader:
+    transcription, cleanup, model downloads, update checks, then what is kept
+    on this Mac. ``engine_info`` is only used to name the local engine, and
+    only when transcription actually runs here.
+    """
+    cloud_mode = config.get(CONFIG_CLOUD_MODE, DEFAULT_CONFIG[CONFIG_CLOUD_MODE])
+    lines: list[str] = []
+
+    if cloud_mode == CLOUD_MODE_MURMUR:
+        lines.append(
+            "Audio is sent to Murmur Cloud (the Boske proxy, hosted in the EU) "
+            "to be turned into text."
+        )
+    elif cloud_mode == CLOUD_MODE_OWN_KEY:
+        provider = config.get(CONFIG_BYOK_PROVIDER)
+        label = BYOK_PROVIDER_LABELS.get(provider) if provider else None
+        if label:
+            lines.append(
+                f"Audio is sent to {label} with your own API key, to be turned into text."
+            )
+        else:
+            lines.append(
+                "Audio is sent to the provider you choose, with your own API key, "
+                "to be turned into text."
+            )
+    else:
+        # Anything unrecognised is the local engine: never claim less privacy
+        # than the app actually gives, and never claim more.
+        lines.append("Nothing. Audio and text stay on this Mac.")
+        name = _engine_name(engine_info)
+        if name:
+            lines.append(f"Transcription runs here, using {name}.")
+
+    cleanup_on = bool(config.get(CONFIG_CLEANUP_ENABLED, DEFAULT_CONFIG[CONFIG_CLEANUP_ENABLED]))
+    cleanup_cloud = bool(config.get(CONFIG_CLEANUP_CLOUD, DEFAULT_CONFIG[CONFIG_CLEANUP_CLOUD]))
+    if cleanup_on and cleanup_cloud:
+        lines.append(
+            "Transcribed text is sent to Murmur Cloud (the Boske proxy, hosted in the EU) "
+            "to be cleaned up."
+        )
+
+    lines.append("Model files are downloaded from Hugging Face when you choose an engine.")
+    lines.append("The app checks GitHub for updates when you ask it to.")
+
+    if config.get(CONFIG_HISTORY_ENABLED, DEFAULT_CONFIG[CONFIG_HISTORY_ENABLED]):
+        lines.append("Transcriptions are kept on this Mac, in your history.")
+    else:
+        lines.append("Transcriptions are not kept after they are typed.")
+
+    if config.get(CONFIG_KEEP_AUDIO, DEFAULT_CONFIG[CONFIG_KEEP_AUDIO]):
+        lines.append("Recordings are kept on this Mac.")
+    else:
+        lines.append("Recordings are deleted as soon as they are transcribed.")
+
+    return lines
+
+
+@dataclass(frozen=True)
+class DeletionSummary:
+    """What :meth:`PersistenceService.delete_all_data` actually removed."""
+
+    history_entries: int = 0
+    audio_files: int = 0
+    debug_logs: int = 0
+    config_keys: tuple[str, ...] = ()
+
+    def describe(self) -> str:
+        """One plain-language sentence for the confirmation alert."""
+        parts = [
+            f"{self.history_entries} history entries",
+            f"{self.audio_files} saved recordings",
+        ]
+        if self.config_keys:
+            parts.append("your vocabulary and per-app choices")
+        return "Removed " + ", ".join(parts[:-1]) + f" and {parts[-1]}."
+
+
 @dataclass(frozen=True)
 class PersistencePaths:
     config_file: str
@@ -200,7 +395,7 @@ class PersistenceService:
             return config
 
     def load_history(self) -> list[dict[str, Any]]:
-        return self._load_json_with_default(self._paths.history_file, [])
+        return normalize_history(self._load_json_with_default(self._paths.history_file, []))
 
     def save_history(self, history: list[dict[str, Any]]) -> None:
         self._save_json_file(self._paths.history_file, history)
@@ -211,15 +406,26 @@ class PersistenceService:
         *,
         text: str,
         source_type: str,
+        origin: str = ORIGIN_LOCAL,
+        engine_id: str | None = None,
+        duration_s: float | None = None,
         filename: str | None = None,
         audio_path: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Prepend one entry, capped at 100, and return the new list.
+
+        ``origin`` says where the transcription happened and is validated here:
+        a typo must not quietly label a cloud transcription as local.
+        """
         entry = {
             "timestamp": datetime.now().isoformat(),
             "source": source_type,
             "text": text,
             "filename": filename,
             "audio_path": audio_path,
+            "origin": validate_history_origin(origin),
+            "engine_id": engine_id,
+            "duration_s": duration_s,
         }
         updated = [entry, *history]
         return updated[:100]
@@ -259,6 +465,50 @@ class PersistenceService:
             self._remove_path(path)
 
         self.clear_debug_log()
+
+    def delete_all_data(
+        self,
+        audio_dir: str,
+        config: dict[str, Any] | None = None,
+        *,
+        legacy_paths: tuple[str, ...] | None = None,
+    ) -> DeletionSummary:
+        """Remove everything the user said, keep everything they chose.
+
+        History, saved recordings, debug logs and the legacy ``~/.mywhisper_*``
+        files go. So do the config keys holding user content
+        (:data:`USER_CONTENT_CONFIG_KEYS`) when ``config`` is given: keys with a
+        documented default are reset to it, keys owned by other features are
+        dropped. Preferences — the hotkey, the engine and model, appearance,
+        onboarding flags — are untouched, and the trimmed config is saved.
+        """
+        history_entries = len(self.load_history())
+        audio_files = 0
+        if os.path.isdir(audio_dir):
+            audio_files = sum(1 for _ in os.scandir(audio_dir))
+        debug_logs = sum(1 for path in DEBUG_LOG_PATHS if os.path.exists(path))
+
+        self.clear_all_local_data(audio_dir, legacy_paths=legacy_paths)
+
+        removed_keys: list[str] = []
+        if config is not None:
+            for key in USER_CONTENT_CONFIG_KEYS:
+                if key not in config:
+                    continue
+                if key in DEFAULT_CONFIG:
+                    config[key] = _fresh_default(key)
+                else:
+                    # Owned by a feature that documents no default of its own.
+                    del config[key]
+                removed_keys.append(key)
+            self.save_config(config)
+
+        return DeletionSummary(
+            history_entries=history_entries,
+            audio_files=audio_files,
+            debug_logs=debug_logs,
+            config_keys=tuple(removed_keys),
+        )
 
     def _remove_path(self, path: str) -> None:
         """Remove a file or directory if it exists."""
