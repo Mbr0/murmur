@@ -336,7 +336,7 @@ class EngineTabModel:
             ram_gb=ram_gb,
             default_engine=default_engine,
             on_engine_change=self.on_engine_change,
-            save=save,
+            save_changes=save,
         )
         self._license_status = self._read_license()
         stored_mode = _one_of(

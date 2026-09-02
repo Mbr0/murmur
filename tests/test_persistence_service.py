@@ -785,7 +785,9 @@ class DeleteAllDataTests(unittest.TestCase):
             self.assertEqual(config["vocabulary_terms"], [])
             self.assertEqual(config["vocabulary_replacements"], [])
             self.assertEqual(config["language_by_app"], {})
-            self.assertNotIn("mode_by_app", config)
+            # Wave 2 gave mode_by_app a documented default, so it is reset to
+            # that rather than dropped — the key stays, the overrides go.
+            self.assertEqual(config["mode_by_app"], {})
 
     def test_delete_all_data_does_not_re_arm_a_notice_already_shown(self):
         """"Delete all data" promises to keep what the user chose. Clearing

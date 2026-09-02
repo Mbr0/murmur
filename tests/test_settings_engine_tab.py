@@ -103,6 +103,7 @@ class Fixture:
         self.deleted = []
         self.config: dict = {}
         self.saves = 0
+        self.saved: list[dict] = []
         self.app = FakeApp()
         self.license = FakeLicense()
         self.usage = None
@@ -120,8 +121,12 @@ class Fixture:
         self.deleted.append(model_id)
         self.installed_ids.discard(model_id)
 
-    def save(self, config):
-        assert config is self.config
+    def save(self, changed):
+        # Wave 2 narrowed this callback: a writer hands over only the keys it
+        # owns, never the whole config it loaded (see persistence_service's
+        # update_config note). Anything wider would revert other tabs' writes.
+        assert isinstance(changed, dict) and changed is not self.config
+        self.saved.append(changed)
         self.saves += 1
 
     def model(
