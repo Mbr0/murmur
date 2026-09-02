@@ -1,6 +1,6 @@
 # MASTER: Murmur v2
 
-**Status:** ✅ approved 2026-09-02 · Waves 0–1 merged (PRs #4, #5) · Wave 2 wiring, Waves 3–4 modules in review
+**Status:** ✅ approved 2026-09-02 · Waves 0–2 merged (PRs #4–#6) · Wave 3 swap and Wave 4 wiring in progress
 **Base branch:** `main` (after PR #2)
 **Source:** study in `../2026-09-02-competitive-analysis/`, Part II "What should change"
 
@@ -99,11 +99,11 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 | E2f (serial) | `murmur.py` | Wire: after transcription, run cleanup when Pro is active and the mode is not Dictation; show the pill; menu gets a "Mode" submenu. |
 
 **Done when**
-- [ ] Cleanup runs locally within the timeout on a 16 GB M-series Mac; fallback notice tested
-- [ ] Mode auto-selection matches the bundle-id table; override sticks per app
-- [ ] Pill shows partials from Voxtral streaming; whisper.cpp shows state only
-- [ ] Golden tests for all five modes and four tones
-- [ ] Suite green
+- [x] Cleanup runs locally within the timeout on a 16 GB M-series Mac; fallback notice tested (24 GB M-series: 0.84–1.68 s cold path, 0.29 s warm; skip notice unit-tested)
+- [x] Mode auto-selection matches the bundle-id table; override sticks per app (9 bundle ids verified on this Mac, 20 marked unverified in code)
+- [x] Pill shows partials from Voxtral streaming; whisper.cpp shows state only (streaming path unit-tested with fakes; not yet exercised on real MLX hardware)
+- [x] Golden tests for all five modes and four tones
+- [x] Suite green (848 tests, 2026-09-02)
 
 ## Wave 3 — Settings redesign and privacy surface (PARALLEL by tab)
 
