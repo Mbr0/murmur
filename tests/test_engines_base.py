@@ -297,7 +297,7 @@ class RegistryTests(unittest.TestCase):
         unregister_engine("test_fake")
 
     def test_engine_ids(self):
-        self.assertEqual(ENGINE_IDS, ("whispercpp", "voxtral_mlx"))
+        self.assertEqual(ENGINE_IDS, ("whispercpp", "voxtral_mlx", "byok", "cloud"))
 
     def test_unknown_engine_id_raises_value_error(self):
         with self.assertRaises(ValueError):
