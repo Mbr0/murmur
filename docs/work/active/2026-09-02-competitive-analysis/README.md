@@ -224,3 +224,45 @@ Canopy Studio catalog today (canopystudio.eu): Boske, Grove Fit, Little Bean, Mu
 5. Murmur engine as a mobile package for the consumer apps.
 
 Caution: "powered by Grove models" is honest only once Boske Labs ships a tuned or quantised model. Until then, use the tier names as size tiers only.
+
+---
+
+## 10. Murmur Cloud: Voxtral through the Boske proxy (added 2026-09-02, third pass)
+
+### Unit cost
+
+- Voxtral Mini Transcribe 2: $0.003/min batch, $0.006/min realtime (Mistral, Feb 2026, via aggregators; mistral.ai unreachable from the sandbox).
+- One hour of speech (~9,000 words): Groq Whisper $0.04, Voxtral batch $0.18, OpenAI gpt-4o-mini-transcribe $0.18, whisper-1 $0.36, Google Chirp 3 $0.96. Cleanup of that hour with Ministral 8B: under $0.01.
+- Per user per month (batch + Ministral 8B cleanup, +20% overhead): light 0.5 h €0.11 · typical 3 h €0.66 · heavy 15 h €3.31 · 40 h €8.81.
+
+### Competitor caps
+
+Free tiers cap words: Wispr Flow and Willow 2,000/week (~1 h/month), Typeless 8,000/week (~3.9 h), Aqua and Monologue 1,000 words once. Paid tiers say unlimited and carry fair-use clauses (Superwhisper terms ban bulk/scripted use). Willow meters AI formatting separately on free. Spokenly and VoiceInk give BYOK away and charge only for hosted models.
+
+### Boske today (from the repo)
+
+- Pipeline: `apps/llm-proxy/src/proxy-stt.js` → `api.mistral.ai/v1/audio/transcriptions`, model alias `voxtral-mini-latest`, batch only, 60 min max per request, usage metered in seconds from Mistral's `prompt_audio_seconds` into `cloud_stt_usage`.
+- Allowance: 240 min/seat/month on Cloud tiers (`license-entitlements.ts`), hard HTTP 429 beyond it. `GET /v1/voice/usage` exists, nothing calls it.
+- Auth: short-lived Ed25519 lease JWT issued only to a logged-in website session with a claimed device. No API-key flow.
+- `cloud_voice` add-on is a legacy id, not sellable, no Stripe price. One shared COGS knob across modalities. BEI-008 records $0.72 per fully used seat allowance.
+- Website code prices seats €19 / €39 / €65; ABOUT_BOSKE says €19 / €49 / €59 / €65. Reconcile.
+
+### Proposal
+
+| Tier | Price | Cloud allowance | COGS |
+|------|-------|-----------------|------|
+| Murmur Free | €0 | One-time 60-minute cloud trial | €0.22 once |
+| Murmur Pro | $49 once or any Boske seat | BYOK free (bypasses proxy) | €0 |
+| **Murmur Cloud** | **€5/month or €48/year** | **15 h/month (~135k words), then automatic local fallback, no 429** | typical €0.66, worst €3.31 (34–87% margin) |
+| Boske seats | included | Cloud 4 h (today), Team 10 h (proposed), top-up €5 per 15 h | €0.72 / €1.80 per seat |
+
+Break-even for €5 is ~22 h of batch dictation. Realtime is not offered by the proxy and would double cost; give it its own tier if built. Market in words, meter in seconds.
+
+### Gaps to ship
+
+1. Promote `cloud_voice` to a sellable add-on with a Stripe price (low).
+2. Auth path for the Mac app: reuse desktop device-linking flow or add a per-user API key (medium).
+3. Soft limit: Murmur polls usage and falls back to local before the cap; optional top-up SKU (low).
+4. Usage shown in Murmur Settings and on the Boske account page (low).
+5. Per-modality COGS pin (medium).
+6. Pin the Voxtral version, write the STT decision record, confirm Mistral data residency and zero retention (low).
