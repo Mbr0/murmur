@@ -6,9 +6,18 @@ on:
   pull_request:
     branches: [main, release]
 
+env:
+  # The one model CI downloads. 574 MB, cached on its own sha256 (see the
+  # "Resolve the pinned tag and model digest" step), so a run normally pays
+  # for it once. Voxtral (3.1 GB) and the cleanup GGUF (2.1 GB) are
+  # deliberately NOT downloaded: together they are more than 5 GB and several
+  # minutes per run for engines a local run already covers, so their tests
+  # skip here and say so.
+  WHISPER_MODEL_ID: whispercpp-large-v3-turbo-q5_0
+
 jobs:
-  unit-tests-macos:
-    name: Unit tests (macOS, arm64)
+  macos:
+    name: Unit + integration (macOS, arm64)
     # macOS 26 on Apple Silicon: the MLX wheels are tagged macosx_26_0_arm64,
     # so nothing older can install the Voxtral engine's dependencies.
     runs-on: macos-26
@@ -31,6 +40,83 @@ jobs:
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Keychain smoke test against the real login keychain
+        # Skipped by default everywhere else: it writes (and deletes) items
+        # under a throwaway service name in the runner's own keychain.
+        env:
+          MURMUR_KEYCHAIN_SMOKE: "1"
+        run: python -m unittest tests.test_keychain -v
+
+      # --- integration suite ------------------------------------------------
+
+      - name: Resolve the pinned tag and model digest
+        id: pins
+        # Read from the modules rather than repeated here, so the cache keys
+        # cannot drift from what the code actually pins.
+        run: |
+          python - >> "$GITHUB_OUTPUT" <<'PY'
+          import os
+
+          from engines.model_store import ModelStore
+          from engines.whispercpp import WHISPER_CPP_TAG
+
+          model_id = os.environ["WHISPER_MODEL_ID"]
+          spec = ModelStore().spec(model_id)
+          print(f"whisper_tag={WHISPER_CPP_TAG}")
+          print(f"model_sha={spec.files[0].sha256}")
+          print(f"model_bytes={spec.size_bytes}")
+          PY
+
+      # Decision D2: the app talks to whisper.cpp as a child process. Building
+      # it takes minutes and only changes when the pinned tag does.
+      - name: Restore whisper-server
+        id: whispercpp-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/whispercpp
+          key: whispercpp-${{ runner.os }}-${{ runner.arch }}-${{ steps.pins.outputs.whisper_tag }}
+
+      - name: Build whisper-server
+        if: steps.whispercpp-cache.outputs.cache-hit != 'true'
+        env:
+          WHISPER_CPP_TAG: ${{ steps.pins.outputs.whisper_tag }}
+        run: bash scripts/tools/fetch_whispercpp.sh
+
+      - name: Verify whisper-server is present
+        run: test -x vendor/whispercpp/whisper-server
+
+      - name: Restore the whisper.cpp model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Application Support/Murmur/models/${{ env.WHISPER_MODEL_ID }}
+          key: murmur-model-${{ env.WHISPER_MODEL_ID }}-${{ steps.pins.outputs.model_sha }}
+
+      - name: Download the whisper.cpp model
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading ${WHISPER_MODEL_ID} (${{ steps.pins.outputs.model_bytes }} bytes)"
+          python - <<'PY'
+          import os
+
+          from engines.model_store import ModelStore
+
+          model_id = os.environ["WHISPER_MODEL_ID"]
+          store = ModelStore()
+          store.download(model_id)
+          # download() already checks the digest of what it fetched; verify()
+          # re-hashes what is on disk, which is what the cache will restore.
+          store.verify(model_id)
+          print(f"installed {model_id} at {store.engine_model_path(model_id)}")
+          PY
+
+      - name: Run the integration suite
+        # Every test skips with a reason when its runtime is absent, and a skip
+        # exits 0. So this step is red only for a real failure or error: the
+        # whisper.cpp engine and the paste flow must pass, while Voxtral and
+        # the cleanup model skip for the reasons in the env block above.
+        run: bash scripts/tools/run_integration.sh -v
 
   unit-tests-linux:
     name: Unit tests (Linux, no MLX)

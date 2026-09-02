@@ -39,7 +39,10 @@ cd "${ROOT}"
 python3 -m venv venv
 source venv/bin/activate
 
-# Install dependencies
+# Install dependencies. requirements.txt is the single list: the speech engine
+# wheels, the PyObjC framework wrappers Murmur needs beyond the ones rumps pulls
+# in (ServiceManagement for launch-at-login, Security for the Keychain store),
+# and the crypto used to verify a licence.
 echo ""
 echo "📦 Installing dependencies..."
 pip install --upgrade pip
@@ -76,3 +79,27 @@ echo "📋 Grant these permissions in System Settings → Privacy & Security:"
 echo "   - Microphone (recording)"
 echo "   - Accessibility (paste text at cursor)"
 echo "   Global shortcut (⌥ Space) works without extra permissions."
+echo ""
+
+# Murmur runs two bundled child processes. whisper-server is built above
+# because transcription needs it; llama-server is only for local cleanup
+# (decision D3), which is off by default below 16 GB of RAM, so it is printed
+# rather than built — each build costs several minutes.
+echo "🔨 Bundled binaries (built into vendor/, never committed):"
+if [ -f "${ROOT}/vendor/whispercpp/whisper-server" ]; then
+    echo "   ✅ whisper-server   vendor/whispercpp/whisper-server"
+else
+    echo "   ⬜ whisper-server   bash scripts/tools/fetch_whispercpp.sh"
+fi
+if [ -f "${ROOT}/vendor/llamacpp/llama-server" ]; then
+    echo "   ✅ llama-server     vendor/llamacpp/llama-server"
+else
+    echo "   ⬜ llama-server     bash scripts/tools/fetch_llama.sh   (local cleanup)"
+fi
+echo ""
+echo "🧪 Tests:"
+echo "   Unit (fast, no models, no binaries, no network):"
+echo "     venv/bin/python -m unittest discover -s tests -p 'test_*.py'"
+echo "   Integration (real engines end to end; each test skips with a reason"
+echo "   when its binary or model is missing, so this is safe to run now):"
+echo "     bash scripts/tools/run_integration.sh"
