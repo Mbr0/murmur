@@ -1,0 +1,22 @@
+{
+  "neutral": {
+    "display_name": "Neutral",
+    "description": "Plain and clear, no particular flavour.",
+    "instruction": "Keep the tone plain and neutral — no added warmth, formality, or brevity beyond what cleanup already does."
+  },
+  "warm": {
+    "display_name": "Warm",
+    "description": "Friendly and personable.",
+    "instruction": "Keep the tone warm and personable, as if speaking to someone you know, without adding content."
+  },
+  "formal": {
+    "display_name": "Formal",
+    "description": "Polished and professional.",
+    "instruction": "Keep the tone formal and professional: complete sentences, no slang, no contractions."
+  },
+  "terse": {
+    "display_name": "Terse",
+    "description": "As short as possible.",
+    "instruction": "Keep the tone terse: the fewest words that keep the meaning, no pleasantries."
+  }
+}

@@ -17,6 +17,19 @@ Wave 1d changes:
 - First-party packages (``services``, ``engines``, ``ui``, ``cleanup``) are
   enumerated from disk, so a package another Wave 1 agent lands does not need a
   spec edit, and one that does not exist yet costs nothing.
+
+Wave 2 changes:
+
+- The llama.cpp ``llama-server`` binary is bundled as ``bin/llama-server``
+  beside ``whisper-server`` (decision D3).
+  ``cleanup.llama_server.resolve_llama_server_binary()`` looks for it at
+  ``<sys._MEIPASS>/bin/llama-server`` when frozen.
+- ``cleanup/prompts/`` is collected as data. ``cleanup.modes`` reads those files
+  from disk at import time (``MODES``/``TONES`` load with the module, so a missing
+  manifest fails app launch) (``PROMPTS_DIR = Path(__file__).parent / "prompts"``),
+  and a frozen module's ``__file__`` is ``<sys._MEIPASS>/cleanup/modes.py`` — so
+  the destination has to be ``cleanup/prompts`` exactly, or every mode raises
+  ``PromptFileMissingError`` in the bundle and nowhere else.
 """
 
 import importlib.util
@@ -43,7 +56,28 @@ if not os.path.isfile(WHISPER_SERVER):
         "   process; without the binary the default engine cannot start.)"
     )
 
+# --- bundled llama.cpp cleanup server (decision D3) -------------------------
+
+LLAMA_SERVER = os.path.join(ROOT, "vendor", "llamacpp", "llama-server")
+if not os.path.isfile(LLAMA_SERVER):
+    raise SystemExit(
+        "Murmur.spec: vendor/llamacpp/llama-server is missing.\n"
+        "  Build it first:  bash scripts/tools/fetch_llama.sh\n"
+        "  (decision D3 — cleanup runs on a bundled llama-server child process;\n"
+        "   without the binary every non-dictation mode skips cleanup.)"
+    )
+
+# Prompt templates and manifests are read from disk at runtime by
+# cleanup/modes.py, so they must exist as files inside the bundle. The
+# destination mirrors the source path exactly; see the module docstring.
+PROMPTS_DIR = os.path.join(ROOT, "cleanup", "prompts")
+if not os.path.isdir(PROMPTS_DIR):
+    raise SystemExit(
+        "Murmur.spec: cleanup/prompts is missing — cleanup modes cannot render."
+    )
+
 datas = [
+    ("cleanup/prompts", "cleanup/prompts"),
     ("assets/icons/logo_menu_template.png", "assets/icons"),
     ("assets/icons/logo_menu_white.png", "assets/icons"),
     ("assets/logos/logo_rounded.png", "assets/logos"),
@@ -58,12 +92,14 @@ datas = [
     ("transcription_filters.py", "."),
 ]
 
-# Destination "bin" puts it at <sys._MEIPASS>/bin/whisper-server.
-# ffmpeg and ffprobe used to sit beside it for the openai-whisper adapter. That
-# adapter is archived, nothing left in the app shells out to either binary, and
-# whisper.cpp reads the WAV the recorder already writes — so they are gone, and
-# with them two Homebrew binaries of someone else's provenance in a signed bundle.
-binaries = [(WHISPER_SERVER, "bin")]
+# Destination "bin" puts them at <sys._MEIPASS>/bin/<name>, which is where both
+# resolvers look when frozen.
+# ffmpeg and ffprobe used to sit beside whisper-server for the openai-whisper
+# adapter. That adapter is archived, nothing left in the app shells out to
+# either binary, and whisper.cpp reads the WAV the recorder already writes — so
+# they are gone, and with them two Homebrew binaries of someone else's
+# provenance in a signed bundle.
+binaries = [(WHISPER_SERVER, "bin"), (LLAMA_SERVER, "bin")]
 
 hiddenimports = [
     "rumps",

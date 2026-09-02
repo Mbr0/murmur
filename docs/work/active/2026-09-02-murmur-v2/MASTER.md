@@ -1,6 +1,6 @@
 # MASTER: Murmur v2
 
-**Status:** ✅ approved 2026-09-02 · Wave 0 in PR #4 · Wave 1 next
+**Status:** ✅ approved 2026-09-02 · Waves 0–1 merged (PRs #4, #5) · Wave 2 wiring, Waves 3–4 modules in review
 **Base branch:** `main` (after PR #2)
 **Source:** study in `../2026-09-02-competitive-analysis/`, Part II "What should change"
 
@@ -80,12 +80,12 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 | E1f | `settings_window.py` (strings only), `README.md`, `docs/design-manifest.md` | Copy: "Whisper Model" → "Speech engine"; README engine lines; design manifest register line. Keep the "OpenAI Whisper" credit in the licenses section. |
 
 **Done when**
-- [ ] Hold and toggle both work with Carbon and NSEvent paths; tests cover the 300 ms threshold
-- [ ] Language and vocabulary hints reach both local engines; CSV round-trips
-- [ ] Model switch without restart; download progress visible; sha256 verified
-- [ ] CI produces a signed, notarized DMG when secrets exist; updater installs a signed build; bundle no longer contains torch
-- [ ] Wizard completes on a clean macOS user account
-- [ ] Suite green
+- [x] Hold and toggle both work with Carbon and NSEvent paths; tests cover the 300 ms threshold (Carbon cannot deliver key-up: hold/auto borrow an NSEvent monitor, degrade to toggle without Accessibility)
+- [x] Language and vocabulary hints reach both local engines; CSV round-trips (Voxtral reports hints_applied=False; whisper.cpp applies them)
+- [x] Model switch without restart; download progress visible; sha256 verified (also verified before every activation)
+- [x] CI produces a signed, notarized DMG when secrets exist; updater installs a signed build; bundle no longer contains torch (local build 220 MB DMG; CI path not yet exercised with real secrets)
+- [ ] Wizard completes on a clean macOS user account (state machine tested; needs a manual run on a clean account)
+- [x] Suite green (536 tests, 2026-09-02)
 
 ## Wave 2 — Smart layer, what Pro sells (PARALLEL, then serial wiring)
 

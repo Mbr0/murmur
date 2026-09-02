@@ -21,6 +21,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from engines import ENGINE_IDS
 from engines.model_store import (
     DownloadCancelled,
     DownloadProgress,
@@ -249,6 +250,38 @@ class DownloadController:
             self._on_change(self.state)
 
 
+def download_model(
+    store,
+    model_id: str,
+    *,
+    total_bytes: int = 0,
+    on_change: Callable[[DownloadSheetState], None] | None = None,
+    dispatch: Callable[[Callable[[], None]], None] | None = None,
+    spawn: Callable[[Callable[[], None]], object] | None = None,
+) -> DownloadController:
+    """Start a download for *any* catalog model and return its controller.
+
+    :class:`EngineSectionModel` deliberately hides everything that is not a
+    speech engine, so the cleanup GGUF has no row, no Download button and no way
+    into the sheet. This is the door for those: same store, same resume, same
+    checksums, same progress state — only the popup is bypassed.
+
+    ``total_bytes`` seeds the progress bar from the catalog size, which keeps it
+    honest before the first file is opened; 0 simply means "unknown yet".
+    """
+    assert store is not None, "store is required"
+    assert model_id, "model_id is required"
+    assert total_bytes >= 0, f"total_bytes cannot be negative: {total_bytes}"
+    kwargs = {}
+    if dispatch is not None:
+        kwargs["dispatch"] = dispatch
+    if spawn is not None:
+        kwargs["spawn"] = spawn
+    controller = DownloadController(store, on_change=on_change, **kwargs)
+    controller.start(model_id, total_bytes)
+    return controller
+
+
 @dataclass(frozen=True)
 class EngineChoice:
     """One row of the "Speech engine" popup."""
@@ -434,7 +467,17 @@ class EngineSectionModel:
     # -- internals -------------------------------------------------------
 
     def _runs_here(self, spec: ModelSpec) -> bool:
-        """Voxtral is opt-in on eligible Apple Silicon (decision D1); everything else runs."""
+        """Which catalog entries this section may offer.
+
+        The store the app builds also carries the cleanup GGUF
+        (``cleanup.llama_server.CLEANUP_MODEL_SPEC``), which is not a speech
+        engine at all: offering it here would let a user "select" a chat model
+        as their transcriber. So the section lists only specs whose engine is a
+        registered speech engine, and Voxtral on top of that is opt-in on
+        eligible Apple Silicon (decision D1).
+        """
+        if spec.engine not in ENGINE_IDS:
+            return False
         if spec.engine == ENGINE_VOXTRAL_MLX:
             return voxtral_eligible(self._chip, self._ram_gb)
         return True
@@ -511,5 +554,6 @@ __all__ = [
     "DownloadSheetState",
     "EngineChoice",
     "EngineSectionModel",
+    "download_model",
     "main_thread_dispatcher",
 ]

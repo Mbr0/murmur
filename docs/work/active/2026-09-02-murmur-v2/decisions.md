@@ -31,3 +31,10 @@ _To be filled by `scripts/tools/bakeoff.py` once real EN/FR/NL/DE clips exist (h
 - Model catalog (`engines/model_store.py`) carries real sizes and sha256 for whisper.cpp large-v3-turbo (q5_0 and f16) and `mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit`; metadata pinned to `main` as of 2026-09-02.
 - Voxtral hints gap (see D1) affects Wave 1b: hints reach whisper.cpp; the Voxtral engine reports `hints_applied=False` so the UI can say so.
 - Bake-off WER is computed with a stdlib word-level Levenshtein instead of `jiwer`, to keep `requirements.txt` untouched until Wave 1d. Unit-tested against hand-computed cases.
+
+## Wave 2 findings (2026-09-02)
+
+- **Cleanup model download surface (E2f).** The download *sheet* is an `NSWindow` sheet owned by the Settings window, and the cleanup pass runs with no window attached. So the "cleanup model is missing" path reuses the same `ui.download_sheet.DownloadController`/`DownloadSheetState` and shows its status line in the menu bar, exactly as an app update does, rather than opening a second sheet host. One offer per session; declining pastes the raw text with a visible "cleanup skipped" notice. Wave 3's Smart tab gets the real sheet.
+- **One store, two catalogs.** The app composes `ModelStore(catalog=CATALOG + (CLEANUP_MODEL_SPEC,))` (`murmur.app_model_store`), so the cleanup GGUF gets the same resume, sha256 and delete code as a speech model, while `engines.model_store.CATALOG` stays speech-only and `EngineSectionModel` filters to `engines.ENGINE_IDS`.
+- **Pro gate placeholder.** `murmur.pro_enabled(feature, config)` reads the hidden `pro_override_for_dev` key and is the single call site the whole smart layer gates on. Wave 4e replaces its body with `is_pro_feature_enabled`; no other file learns what "Pro" means.
+- **E2f smoke, 2026-09-02, M-series 24 GB:** 174-char filler-heavy sentence, mode `message`, tone `neutral` through `cleanup_plan` → `run_cleanup` → `CleanupRuntime`: 15.15 s for the first call including the cold server start, 0.29 s warm; both `ran=True`, no skip; server stopped cleanly afterwards.

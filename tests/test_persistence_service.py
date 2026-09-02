@@ -5,11 +5,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from cleanup.llama_server import CLEANUP_MODEL_ID
 from services.persistence_service import (
+    CLEANUP_ENABLED_KEY,
     DEBUG_LOG_PATHS,
     DEFAULT_CONFIG,
     PersistencePaths,
     PersistenceService,
+    resolve_cleanup_enabled,
     should_log_sensitive,
 )
 
@@ -339,6 +342,14 @@ class PersistenceServiceTests(unittest.TestCase):
                 "hints_notice_shown": {"voxtral_mlx": True},
                 "onboarding_completed": True,
                 "onboarding_version": 1,
+                "cleanup_enabled": True,
+                "cleanup_mode": "message",
+                "cleanup_tone": "warm",
+                "mode_by_app": {"com.apple.mail": "mail"},
+                "context_awareness": False,
+                "include_selection": True,
+                "cleanup_model_id": "ministral-3-3b-instruct-2512-q4_k_m",
+                "pill_enabled": False,
             }
             # Fails loudly if DEFAULT_CONFIG gains a key this fixture forgot.
             self.assertEqual(set(full_config.keys()), set(DEFAULT_CONFIG.keys()))
@@ -347,6 +358,67 @@ class PersistenceServiceTests(unittest.TestCase):
             loaded = service.load_config(DEFAULT_CONFIG)
 
             self.assertEqual(loaded, full_config)
+
+
+class CleanupDefaultsTests(unittest.TestCase):
+    """The Wave 2 keys and the one default that has to ask the machine."""
+
+    def test_smart_layer_defaults(self):
+        self.assertIsNone(DEFAULT_CONFIG["cleanup_enabled"])
+        self.assertEqual(DEFAULT_CONFIG["cleanup_mode"], "dictation")
+        self.assertEqual(DEFAULT_CONFIG["cleanup_tone"], "neutral")
+        self.assertEqual(DEFAULT_CONFIG["mode_by_app"], {})
+        self.assertTrue(DEFAULT_CONFIG["context_awareness"])
+        self.assertFalse(DEFAULT_CONFIG["include_selection"])
+        self.assertEqual(DEFAULT_CONFIG["cleanup_model_id"], CLEANUP_MODEL_ID)
+        self.assertTrue(DEFAULT_CONFIG["pill_enabled"])
+
+    def test_undecided_asks_the_machine(self):
+        calls = []
+
+        def probe():
+            calls.append(1)
+            return True
+
+        self.assertTrue(resolve_cleanup_enabled({}, probe=probe))
+        self.assertTrue(
+            resolve_cleanup_enabled({CLEANUP_ENABLED_KEY: None}, probe=probe)
+        )
+        self.assertEqual(len(calls), 2)
+
+    def test_a_stored_answer_is_never_second_guessed(self):
+        def probe():
+            raise AssertionError("the probe must not run once the key is a bool")
+
+        self.assertTrue(
+            resolve_cleanup_enabled({CLEANUP_ENABLED_KEY: True}, probe=probe)
+        )
+        # False is an answer, not an absence: a 16 GB Mac must not switch
+        # cleanup back on for a user who turned it off.
+        self.assertFalse(
+            resolve_cleanup_enabled({CLEANUP_ENABLED_KEY: False}, probe=probe)
+        )
+
+    def test_the_probe_result_is_coerced_to_a_bool(self):
+        self.assertIs(resolve_cleanup_enabled({}, probe=lambda: 0), False)
+        self.assertIs(resolve_cleanup_enabled({}, probe=lambda: 1), True)
+
+    def test_update_config_stores_the_resolved_answer(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = PersistenceService(
+                PersistencePaths(
+                    str(Path(tmp_dir) / "config.json"),
+                    str(Path(tmp_dir) / "history.json"),
+                ),
+                logger=TestLogger(),
+            )
+            loaded = service.load_config(dict(DEFAULT_CONFIG))
+            enabled = resolve_cleanup_enabled(loaded, probe=lambda: True)
+            merged = service.update_config({CLEANUP_ENABLED_KEY: enabled})
+
+            self.assertTrue(merged[CLEANUP_ENABLED_KEY])
+            reloaded = service.load_config(dict(DEFAULT_CONFIG))
+            self.assertIs(reloaded[CLEANUP_ENABLED_KEY], True)
 
 
 if __name__ == "__main__":
