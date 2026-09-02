@@ -74,6 +74,7 @@ logger = _configure_logging()
 if hasattr(sys, '_MEIPASS'):
     logger.info(f"Added bundled resources to PATH: {sys._MEIPASS}")
 
+import functools
 import itertools
 import pyperclip
 import threading
@@ -910,6 +911,12 @@ def apply_launch_at_login(service: Any, enabled: bool) -> bool:
     without the framework. Asking for the state it is already in does nothing:
     ``register()`` on an already-registered service can put the approval
     prompt back in front of a user who never touched the switch.
+
+    The state is *read back* rather than assumed. ``register`` can succeed and
+    still leave the service at ``SMAppServiceStatusRequiresApproval``: the item
+    is registered, macOS reports no error, and Murmur will not start at login
+    until the user allows it in System Settings. Returning what was asked for
+    would put a switch on screen claiming something that is not true yet.
     """
     assert isinstance(enabled, bool), f"expected a bool, got {enabled!r}"
     if service is None:
@@ -917,7 +924,7 @@ def apply_launch_at_login(service: Any, enabled: bool) -> bool:
     if enabled == launch_at_login_enabled(service):
         return enabled
     _sm_call(service, "register" if enabled else "unregister")
-    return enabled
+    return launch_at_login_enabled(service)
 
 
 def login_item_service() -> Any | None:
@@ -1972,13 +1979,11 @@ class MurmurApp(rumps.App):
     def _check_updates_worker(self):
         """Fetch release metadata only. No audio, no text, nothing uploaded.
 
-        The Account tab writes ``update_channel``; nothing reads it yet.
+        Reads the channel the Account tab writes to ``update_channel``.
         """
-        # TODO(wave4): honour config["update_channel"] — UpdateService takes no
-        # channel and UpdateFeed reads one fixed URL, so "beta" needs a second
-        # feed (or a prerelease filter) in services/update_service.py first.
+        channel = self.runtime_config().get("update_channel", "stable")
         try:
-            info = UpdateService(APP_VERSION).check()
+            info = UpdateService(APP_VERSION, channel=channel).check()
         except Exception as error:
             logger.error("Update check failed: %s", error)
             self._alert_on_main(
@@ -2641,6 +2646,14 @@ class MurmurApp(rumps.App):
         Resolved once. The Security binding is what can be missing — off macOS,
         or in a stripped build — and asking again on every window open would
         only repeat the same failure and the same log line.
+
+        Every failure is caught, not only :class:`KeychainUnavailable`. The
+        ctypes backend loads a library and reads symbols out of it, so a broken
+        one raises ``OSError``, ``ValueError`` or a plain ``KeychainError`` just
+        as readily — and anything that escapes here reaches
+        :meth:`open_settings_window_safely` as "Could not open Settings", which
+        is a whole window lost over one optional feature. The type is logged so
+        the log still says which failure it was.
         """
         if self._keychain_probed:
             return self._keychain_store
@@ -2648,8 +2661,12 @@ class MurmurApp(rumps.App):
         try:
             store = KeychainStore()
             store.backend  # resolve now, so an unavailable keychain is known here
-        except KeychainUnavailable as error:
-            logger.warning("The keychain is unavailable; own keys cannot be stored: %s", error)
+        except Exception as error:  # noqa: BLE001 - the backend raises widely
+            logger.warning(
+                "The keychain is unavailable (%s); own keys cannot be stored: %s",
+                type(error).__name__,
+                error,
+            )
             self._keychain_store = None
         else:
             self._keychain_store = store
@@ -2667,11 +2684,19 @@ class MurmurApp(rumps.App):
         ``scheduler`` is deliberately ``None``. The Account tab's own default
         polls off the main thread *and* redraws on it; anything handed in here
         would replace both halves and leave the sign-in line stale.
+
+        ``pro_gate`` is :func:`pro_enabled` bound to one config snapshot, taken
+        here. Still the single gate — the function is unchanged, only its
+        ``config`` argument is filled in — but the tabs ask it several times per
+        refresh, once per gated control, and an unbound ``pro_enabled`` reads
+        the file from disk on every one of those calls, on the main thread. The
+        dict is rebuilt on every Settings open, so the snapshot is never older
+        than the window it is answering for.
         """
         return {
             "usage": None,      # Wave 4: the usage/quota service
             "license": None,    # Wave 4: the licence service
-            "pro_gate": pro_enabled,
+            "pro_gate": functools.partial(pro_enabled, config=self.runtime_config()),
             "keychain": self._keychain(),
             "scheduler": None,
             "version": APP_VERSION,

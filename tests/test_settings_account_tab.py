@@ -10,6 +10,7 @@ and nowhere else — not into the config dict, not into any line the tab shows.
 """
 
 import unittest
+import unittest.mock
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -25,10 +26,12 @@ from services.keychain import (
 )
 from ui.settings.base import TAB_ACCOUNT
 from ui.settings.account_tab import (
+    BYOK_PROVIDERS,
     CHANNEL_BETA,
     CHANNEL_STABLE,
     CONFIG_UPDATE_CHANNEL,
     DEFAULT_POLL_INTERVAL_S,
+    KEY_CHECKING,
     KEY_NOT_STORED,
     KEY_STATE_UNAVAILABLE,
     KEY_STORED,
@@ -594,6 +597,152 @@ class VersionAndChannelTest(unittest.TestCase):
         model = ModelHarness(config={CONFIG_UPDATE_CHANNEL: CHANNEL_BETA}).model
         self.assertEqual(CHANNEL_BETA, model.update_channel)
         self.assertEqual({}, model.apply())
+
+
+class FakeControl:
+    """Anything the tab calls ``setStringValue_``/``setEnabled_`` on."""
+
+    def __init__(self, value=None):
+        self.value = value
+        self.enabled = None
+        self.selected = None
+
+    def setStringValue_(self, value):
+        self.value = value
+
+    def stringValue(self):
+        return self.value
+
+    def setEnabled_(self, enabled):
+        self.enabled = bool(enabled)
+
+    def selectItemAtIndex_(self, index):
+        self.selected = index
+
+
+class SlowStore(InMemorySecretStore):
+    """A store that records every look-up, so the probe can be counted."""
+
+    def __init__(self):
+        super().__init__()
+        self.lookups: list[str] = []
+
+    def has(self, name: str) -> bool:
+        self.lookups.append(name)
+        return super().has(name)
+
+
+class KeyProbeTests(unittest.TestCase):
+    """The stored/not-stored line must not be read on the main thread.
+
+    ``has`` is one ``SecItemCopyMatching``, and after a re-signed build macOS
+    answers it with an access dialog. Asked while the tab is being built, that
+    dialog blocks Settings from opening at all — so the indicator opens saying
+    "Checking…" and the answer arrives from a worker thread.
+    """
+
+    def tab(self, keychain=None):
+        harness = ModelHarness()
+        if keychain is not None:
+            harness.model.keychain = keychain
+        tab = AccountTab()
+        tab.model = harness.model
+        tab._status_label = FakeControl()
+        tab._detail_label = FakeControl()
+        tab._link_label = FakeControl()
+        tab._sign_in_button = FakeControl()
+        tab._sign_out_button = FakeControl()
+        tab._open_button = FakeControl()
+        tab._cancel_button = FakeControl()
+        tab._channel_popup = FakeControl()
+        for provider in BYOK_PROVIDERS:
+            tab._key_fields[provider] = FakeControl("")
+            tab._key_indicators[provider] = FakeControl(KEY_CHECKING)
+            tab._key_buttons[provider] = (FakeControl(), FakeControl())
+        # An immediate dispatcher and an immediate worker: the hop is real, the
+        # threads are not.
+        self.background = []
+        tab._dispatch = lambda func: func()
+        tab._background = lambda func: self.background.append(func) or func()
+        return tab, harness
+
+    def test_the_indicator_starts_as_checking_and_the_buttons_are_dead(self):
+        tab, _ = self.tab()
+
+        tab.refresh()
+
+        for provider in BYOK_PROVIDERS:
+            self.assertEqual(tab._key_indicators[provider].value, KEY_CHECKING)
+            self.assertFalse(tab._key_fields[provider].enabled)
+            for button in tab._key_buttons[provider]:
+                self.assertFalse(button.enabled)
+
+    def test_building_the_tab_never_asks_the_keychain_on_the_spot(self):
+        store = SlowStore()
+        tab, _ = self.tab(keychain=store)
+
+        tab.refresh()
+
+        self.assertEqual(store.lookups, [])
+
+    def test_the_probe_answers_and_the_indicator_follows(self):
+        store = SlowStore()
+        store.set(ITEM_BYOK_MISTRAL, SECRET)
+        tab, _ = self.tab(keychain=store)
+        tab.refresh()
+
+        tab.probe_key_states()
+
+        self.assertEqual(len(self.background), 1)
+        self.assertEqual(tab._key_indicators["mistral"].value, KEY_STORED)
+        self.assertEqual(tab._key_indicators["openai"].value, KEY_NOT_STORED)
+        for provider in BYOK_PROVIDERS:
+            self.assertTrue(tab._key_fields[provider].enabled)
+
+    def test_a_keychain_that_refuses_lands_as_the_third_state(self):
+        tab, _ = self.tab(
+            keychain=RefusingStore(KeychainError(ERR_SEC_INTERACTION_NOT_ALLOWED, "read"))
+        )
+        tab.refresh()
+
+        tab.probe_key_states()
+
+        for provider in BYOK_PROVIDERS:
+            self.assertEqual(tab._key_indicators[provider].value, KEY_UNAVAILABLE)
+            self.assertFalse(tab._key_buttons[provider][0].enabled)
+
+    def test_the_answer_comes_back_through_the_main_thread_hop(self):
+        hops = []
+        store = SlowStore()
+        tab, _ = self.tab(keychain=store)
+        tab._dispatch = lambda func: hops.append(func) or func()
+
+        tab.probe_key_states()
+
+        self.assertEqual(len(hops), 1)
+        self.assertEqual(tab._key_indicators["mistral"].value, KEY_NOT_STORED)
+
+    def test_saving_a_key_updates_the_indicator_without_waiting_for_a_probe(self):
+        store = SlowStore()
+        tab, _ = self.tab(keychain=store)
+        tab.refresh()
+        tab._key_fields["mistral"].setStringValue_(SECRET)
+
+        with unittest.mock.patch("ui_alerts.show_alert"):
+            tab._save_key("mistral")
+
+        self.assertEqual(tab._key_indicators["mistral"].value, KEY_STORED)
+        self.assertEqual(tab._key_fields["mistral"].stringValue(), "")
+
+    def test_removing_a_key_updates_the_indicator_the_same_way(self):
+        store = SlowStore()
+        store.set(ITEM_BYOK_MISTRAL, SECRET)
+        tab, _ = self.tab(keychain=store)
+        tab.probe_key_states()
+
+        tab._remove_key("mistral")
+
+        self.assertEqual(tab._key_indicators["mistral"].value, KEY_NOT_STORED)
 
 
 class TabRegistrationTest(unittest.TestCase):

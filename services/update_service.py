@@ -60,9 +60,22 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+#: GitHub releases API for this repository, with no trailing segment.
+_RELEASES_API_URL = "https://api.github.com/repos/Mbr0/murmur/releases"
+
 #: Release feed. GitHub's "latest release" JSON; injectable for tests and for a
 #: future self-hosted appcast.
-DEFAULT_FEED_URL = "https://api.github.com/repos/Mbr0/murmur/releases/latest"
+DEFAULT_FEED_URL = f"{_RELEASES_API_URL}/latest"
+
+#: The ``beta`` channel's feed: the most recent releases, prereleases included.
+#: GitHub's "latest" endpoint never returns a prerelease, so beta needs the
+#: list endpoint instead, picked over for the newest tag in :meth:`UpdateFeed.fetch`.
+BETA_FEED_URL = f"{_RELEASES_API_URL}?per_page=10"
+
+#: Update channels the Account tab may write to ``update_channel``.
+CHANNEL_STABLE = "stable"
+CHANNEL_BETA = "beta"
+UPDATE_CHANNELS = (CHANNEL_STABLE, CHANNEL_BETA)
 
 #: Hosts a build may be downloaded from. The feed names the URL, so without
 #: this an attacker who can influence the feed picks the server we fetch from.
@@ -248,11 +261,27 @@ def _urlopen(url: str) -> Any:
 
 
 class UpdateFeed:
-    """A JSON release feed, shaped like the GitHub releases API."""
+    """A JSON release feed, shaped like the GitHub releases API.
 
-    def __init__(self, url: str = DEFAULT_FEED_URL, opener: Opener | None = None) -> None:
-        assert url, "feed url is required"
-        self.url = url
+    ``channel="stable"`` reads GitHub's "latest release" endpoint, which never
+    answers with a prerelease. ``channel="beta"`` reads the releases list
+    instead and picks the highest SemVer ``tag_name``, prereleases included,
+    drafts skipped — see :meth:`fetch`.
+    """
+
+    def __init__(
+        self,
+        url: str | None = None,
+        opener: Opener | None = None,
+        channel: str = CHANNEL_STABLE,
+    ) -> None:
+        if channel not in UPDATE_CHANNELS:
+            raise ValueError(
+                f"unknown update channel {channel!r}; expected one of {', '.join(UPDATE_CHANNELS)}"
+            )
+        self.channel = channel
+        self.url = url or (BETA_FEED_URL if channel == CHANNEL_BETA else DEFAULT_FEED_URL)
+        assert self.url, "feed url is required"
         self._opener = opener or _urlopen
 
     def fetch(self) -> UpdateInfo:
@@ -271,7 +300,34 @@ class UpdateFeed:
             payload = json.loads(raw)
         except json.JSONDecodeError as error:
             raise UpdateFeedError(f"release feed at {self.url} is not JSON: {error}") from error
+        if self.channel == CHANNEL_BETA:
+            return self._parse_list(payload)
         return self.parse(payload)
+
+    def _parse_list(self, payload: Any) -> UpdateInfo:
+        """The newest non-draft release in a GitHub releases list."""
+        if not isinstance(payload, list):
+            raise UpdateFeedError(
+                f"release feed at {self.url} must be a JSON array, got {type(payload).__name__}"
+            )
+        best: dict | None = None
+        best_key = None
+        for entry in payload:
+            if not isinstance(entry, dict) or entry.get("draft"):
+                continue
+            tag = str(entry.get("tag_name") or entry.get("version") or "").strip()
+            if not tag:
+                continue
+            try:
+                key = _version_key(tag)
+            except ValueError:
+                continue
+            if best_key is None or key > best_key:
+                best_key = key
+                best = entry
+        if best is None:
+            raise UpdateFeedError(f"release feed at {self.url} has no usable, non-draft release")
+        return self.parse(best)
 
     @staticmethod
     def parse(payload: Any) -> UpdateInfo:
@@ -764,10 +820,11 @@ class UpdateService:
         opener: Opener | None = None,
         download_dir: str | Path | None = None,
         expected_team: str | None = None,
+        channel: str = CHANNEL_STABLE,
     ) -> None:
         assert current_version, "current_version is required"
         self.current_version = current_version
-        self.feed = feed or UpdateFeed(opener=opener)
+        self.feed = feed or UpdateFeed(opener=opener, channel=channel)
         self._app_path = Path(app_path) if app_path else None
         self._runner = runner
         self._opener = opener
@@ -822,9 +879,13 @@ class UpdateService:
 
 __all__ = [
     "ALLOWED_DOWNLOAD_HOSTS",
+    "BETA_FEED_URL",
     "BUILD_INFO_NAME",
+    "CHANNEL_BETA",
+    "CHANNEL_STABLE",
     "DEFAULT_FEED_URL",
     "EXPECTED_TEAM_ID",
+    "UPDATE_CHANNELS",
     "PREVIOUS_SUFFIX",
     "TEAM_ID_ENV_VAR",
     "AllowlistRedirectHandler",

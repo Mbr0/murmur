@@ -1577,8 +1577,19 @@ class SettingsServicesTests(unittest.TestCase):
         "audio_dir",
     }
 
-    def _services(self, keychain=None):
-        app = SimpleNamespace(persistence=object(), _keychain=lambda: keychain)
+    def _services(self, keychain=None, config=None, loads=None):
+        snapshot = dict(config or {})
+
+        def runtime_config():
+            if loads is not None:
+                loads.append(dict(snapshot))
+            return dict(snapshot)
+
+        app = SimpleNamespace(
+            persistence=object(),
+            _keychain=lambda: keychain,
+            runtime_config=runtime_config,
+        )
         return MurmurApp._settings_services(app), app
 
     def test_every_key_the_window_documents_is_present(self):
@@ -1586,7 +1597,7 @@ class SettingsServicesTests(unittest.TestCase):
 
         self.assertEqual(set(services), self.KEYS)
         self.assertIs(services["persistence"], app.persistence)
-        self.assertIs(services["pro_gate"], pro_enabled)
+        self.assertIs(services["pro_gate"].func, pro_enabled)
         self.assertEqual(services["version"], APP_VERSION)
         self.assertEqual(services["audio_dir"], AUDIO_DIR)
         self.assertIsInstance(services["build_info"], dict)
@@ -1610,6 +1621,24 @@ class SettingsServicesTests(unittest.TestCase):
 
         self.assertIs(services["keychain"], store)
 
+    def test_the_pro_gate_reads_the_config_once_per_settings_open(self):
+        # Every gated control asks on every refresh; a gate that loads the file
+        # each time turns opening Settings into a burst of main-thread reads.
+        loads = []
+        services, _ = self._services(config={PRO_OVERRIDE_KEY: True}, loads=loads)
+        gate = services["pro_gate"]
+
+        self.assertTrue(gate("cloud_voice"))
+        self.assertTrue(gate("cleanup"))
+        self.assertEqual(len(loads), 1)
+
+    def test_the_pro_gate_answers_from_the_snapshot_it_was_bound_to(self):
+        off, _ = self._services(config={})
+        on, _ = self._services(config={PRO_OVERRIDE_KEY: True})
+
+        self.assertFalse(off["pro_gate"]("cloud_voice"))
+        self.assertTrue(on["pro_gate"]("cloud_voice"))
+
     def test_an_unreachable_keychain_reaches_the_tabs_as_none(self):
         class Unavailable:
             @property
@@ -1624,6 +1653,7 @@ class SettingsServicesTests(unittest.TestCase):
                 SimpleNamespace(
                     persistence=app.persistence,
                     _keychain=lambda: MurmurApp._keychain(app),
+                    runtime_config=dict,
                 )
             )
 
@@ -1643,6 +1673,26 @@ class KeychainProbeTests(unittest.TestCase):
 
         self.assertIsNone(store)
         self.assertTrue(app._keychain_probed)
+
+    def test_any_other_failure_from_the_backend_becomes_none_too(self):
+        # The ctypes backend raises ValueError and OSError as well as
+        # KeychainError; every one of them used to escape this probe and turn
+        # into "Could not open Settings".
+        for error in (ValueError("bad library path"), OSError("dlopen failed")):
+            with self.subTest(error=type(error).__name__):
+
+                class Exploding:
+                    @property
+                    def backend(self, _error=error):
+                        raise _error
+
+                app = SimpleNamespace(_keychain_probed=False, _keychain_store=None)
+                with patch("murmur.KeychainStore", Exploding):
+                    with self.assertLogs("murmur", level="WARNING") as captured:
+                        store = MurmurApp._keychain(app)
+
+                self.assertIsNone(store)
+                self.assertIn(type(error).__name__, "\n".join(captured.output))
 
     def test_the_keychain_is_asked_about_once(self):
         made = []
@@ -1795,6 +1845,22 @@ class _PlainAppService:
         self._status = 0
 
 
+class _RequiresApprovalAppService(_BridgedAppService):
+    """``register`` succeeds, but macOS waits for the user to allow the item.
+
+    ``SMAppServiceStatusRequiresApproval``. The registration is real and the
+    call reports no error, yet Murmur will not start at login until the user
+    switches it on in System Settings — so the switch must not claim it is on.
+    """
+
+    SM_STATUS_REQUIRES_APPROVAL = 3
+
+    def registerAndReturnError_(self, _error):
+        self.calls.append("register")
+        self._status = self.SM_STATUS_REQUIRES_APPROVAL
+        return (True, None)
+
+
 class LaunchAtLoginDecisionTests(unittest.TestCase):
     def test_turning_it_on_registers_the_login_item(self):
         service = _BridgedAppService()
@@ -1835,6 +1901,18 @@ class LaunchAtLoginDecisionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as caught:
             apply_launch_at_login(service, True)
         self.assertNotIsInstance(caught.exception, LaunchAtLoginUnavailable)
+
+    def test_a_registration_awaiting_approval_is_reported_as_not_on_yet(self):
+        service = _RequiresApprovalAppService()
+
+        self.assertFalse(apply_launch_at_login(service, True))
+        self.assertEqual(service.calls, ["register"])
+
+    def test_the_state_afterwards_is_read_back_rather_than_assumed(self):
+        service = _BridgedAppService(status=SM_STATUS_ENABLED)
+
+        self.assertFalse(apply_launch_at_login(service, False))
+        self.assertEqual(launch_at_login_enabled(service), False)
 
     def test_reading_the_current_state(self):
         self.assertFalse(launch_at_login_enabled(None))
@@ -1923,6 +2001,32 @@ class ArchivedSettingsWindowTests(unittest.TestCase):
         spec = (self.ROOT / "Murmur.spec").read_text(encoding="utf-8")
 
         self.assertNotIn("settings_window", spec)
+
+
+class ServiceManagementDependencyTests(unittest.TestCase):
+    """``login_item_service`` imports a framework that has to be shipped.
+
+    Nothing else in Murmur imports ``ServiceManagement``, so a missing wheel or
+    a missing hidden import shows up only as "Not available in this build" on a
+    checkbox nobody can prove wrong. These two lines are that proof.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    PACKAGE = "pyobjc-framework-ServiceManagement"
+
+    def test_the_framework_is_a_pinned_macos_dependency(self):
+        lines = (self.ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        pinned = [line for line in lines if line.strip().startswith(self.PACKAGE)]
+
+        self.assertEqual(len(pinned), 1, f"{self.PACKAGE} is imported but never installed")
+        self.assertIn("==", pinned[0])
+        self.assertIn('sys_platform == "darwin"', pinned[0])
+
+    def test_the_bundle_names_the_framework_as_a_hidden_import(self):
+        # PyInstaller cannot see an import made inside a function.
+        spec = (self.ROOT / "Murmur.spec").read_text(encoding="utf-8")
+
+        self.assertIn('"ServiceManagement"', spec)
 
 
 if __name__ == "__main__":

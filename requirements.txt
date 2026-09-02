@@ -7,6 +7,14 @@
 rumps==0.4.0 ; sys_platform == "darwin"
 quickmachotkey==2025.7.28 ; sys_platform == "darwin"
 
+# Launch at login (Wave 3). ``SMAppService`` lives in the ServiceManagement
+# framework, which PyObjC ships as its own wheel: rumps pulls in pyobjc-core and
+# the Cocoa frameworks, not this one. Without it the import in
+# ``murmur.login_item_service`` always fails and Settings offers the switch as
+# "Not available in this build" in every build, signed or not. Same version
+# family as the pyobjc-core the other wrappers pin.
+pyobjc-framework-ServiceManagement==12.2 ; sys_platform == "darwin"
+
 sounddevice==0.5.5
 numpy==2.4.6
 scipy==1.17.1

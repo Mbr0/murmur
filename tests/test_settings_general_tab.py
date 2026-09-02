@@ -7,6 +7,7 @@ AppKit.
 """
 
 import unittest
+from types import SimpleNamespace
 
 from engines import LANGUAGE_AUTO
 from engines.base import EngineInfo
@@ -18,12 +19,14 @@ from services.hotkey_service import (
     HotkeyBinding,
 )
 from services.persistence_service import DEFAULT_CONFIG
+from ui.settings.base import TabContext
 from ui.settings.general_tab import (
     APPEARANCE_MODES,
     CONFIG_APPEARANCE,
     CONFIG_LANGUAGE,
     CONFIG_LAUNCH_AT_LOGIN,
     FALLBACK_LANGUAGES,
+    LAUNCH_AT_LOGIN_NEEDS_APPROVAL,
     LAUNCH_AT_LOGIN_UNSUPPORTED,
     GeneralTab,
     GeneralTabModel,
@@ -281,6 +284,29 @@ class LanguageChoiceTests(unittest.TestCase):
         self.assertEqual(model.language_index, 0)
         self.assertEqual(len(model.language_titles), len(model.language_choices))
 
+    def test_set_engine_info_changes_the_choices_and_keeps_the_selection(self):
+        model = GeneralTabModel(
+            {**DEFAULT_CONFIG, CONFIG_LANGUAGE: "en"},
+            engine_info=self.engine_info("en", "fr"),
+        )
+        self.assertEqual(model.language_choices, (LANGUAGE_AUTO, "en", "fr"))
+
+        model.set_engine_info(self.engine_info("en", "de"))
+
+        self.assertEqual(model.language_choices, (LANGUAGE_AUTO, "de", "en"))
+        self.assertEqual(model.language_choices[model.language_index], "en")
+
+    def test_set_engine_info_keeps_a_configured_language_the_new_engine_lacks(self):
+        model = GeneralTabModel(
+            {**DEFAULT_CONFIG, CONFIG_LANGUAGE: "ja"},
+            engine_info=self.engine_info("en", "fr"),
+        )
+
+        model.set_engine_info(self.engine_info("en", "de"))
+
+        self.assertIn("ja", model.language_choices)
+        self.assertEqual(model.language_choices[model.language_index], "ja")
+
 
 class LaunchAtLoginTests(unittest.TestCase):
     """The checkbox may only be offered where something implements it.
@@ -331,6 +357,124 @@ class LaunchAtLoginTests(unittest.TestCase):
         self.assertFalse(supports_launch_at_login(None))
         self.assertFalse(supports_launch_at_login(object()))
         self.assertTrue(supports_launch_at_login(WithHook()))
+
+
+class LaunchAtLoginSwitchTests(unittest.TestCase):
+    """What the switch does, and what it says afterwards.
+
+    macOS may accept a registration and still refuse to act on it until the
+    user allows the login item in System Settings. The app reports the state it
+    read back, and the tab shows that state — never the state that was asked
+    for.
+    """
+
+    class FakeLabel:
+        def __init__(self):
+            self.text = None
+
+        def setStringValue_(self, value):
+            self.text = value
+
+    class SwitchTab(GeneralTab):
+        """The tab with its one AppKit call — setting the box — recorded."""
+
+        def __init__(self):
+            super().__init__()
+            self.checkbox_states = []
+
+        def _set_checkbox(self, on):
+            self.checkbox_states.append(on)
+
+    def setUp(self):
+        self.saved = []
+
+    def tab(self, app, *, supported=True, stored=False):
+        tab = self.SwitchTab()
+        config = dict(DEFAULT_CONFIG)
+        config[CONFIG_LAUNCH_AT_LOGIN] = stored
+        tab.context = TabContext(
+            config=config, save=self.saved.append, app=app, theme=object()
+        )
+        tab.model = GeneralTabModel(config, launch_at_login_supported=supported)
+        tab._launch_checkbox = object()
+        tab._launch_hint = self.FakeLabel()
+        return tab
+
+    @staticmethod
+    def app_returning(state):
+        class App:
+            def set_launch_at_login(self, enabled):
+                return state
+
+        return App()
+
+    def test_a_registration_that_took_is_written_and_shown_as_on(self):
+        tab = self.tab(self.app_returning(True))
+
+        tab.set_launch_at_login(True)
+
+        self.assertEqual(self.saved, [{CONFIG_LAUNCH_AT_LOGIN: True}])
+        self.assertEqual(tab.checkbox_states, [True])
+        self.assertEqual(tab._launch_hint.text, " ")
+
+    def test_a_registration_awaiting_approval_puts_the_box_back_and_explains(self):
+        tab = self.tab(self.app_returning(False))
+
+        tab.set_launch_at_login(True)
+
+        self.assertEqual(self.saved, [])  # nothing changed, so nothing written
+        self.assertEqual(tab.checkbox_states, [False])
+        self.assertEqual(tab._launch_hint.text, LAUNCH_AT_LOGIN_NEEDS_APPROVAL)
+        self.assertFalse(tab.model.launch_at_login)
+
+    def test_turning_it_off_writes_the_state_the_app_read_back(self):
+        tab = self.tab(self.app_returning(False), stored=True)
+
+        tab.set_launch_at_login(False)
+
+        self.assertEqual(self.saved, [{CONFIG_LAUNCH_AT_LOGIN: False}])
+        self.assertEqual(tab.checkbox_states, [False])
+        self.assertEqual(tab._launch_hint.text, " ")
+
+    def test_an_app_that_refuses_leaves_the_box_where_the_system_is(self):
+        class Refusing:
+            def set_launch_at_login(self, enabled):
+                raise RuntimeError("ServiceManagement is not available in this build")
+
+        tab = self.tab(Refusing())
+
+        with self.assertLogs("ui.settings.general_tab", level="WARNING"):
+            tab.set_launch_at_login(True)
+
+        self.assertEqual(tab.checkbox_states, [False])
+        self.assertEqual(tab._launch_hint.text, LAUNCH_AT_LOGIN_NEEDS_APPROVAL)
+        self.assertEqual(self.saved, [])
+
+    def test_an_app_that_answers_nothing_is_taken_at_its_word(self):
+        # ``app_call`` returns None for a method the app does not have; the
+        # checkbox is only offered where it does, so this is the honest read.
+        tab = self.tab(SimpleNamespace())
+
+        tab.set_launch_at_login(True)
+
+        self.assertEqual(self.saved, [{CONFIG_LAUNCH_AT_LOGIN: True}])
+        self.assertEqual(tab.checkbox_states, [True])
+
+    def test_without_a_running_app_the_request_is_logged_not_applied(self):
+        tab = self.tab(None)
+
+        with self.assertLogs("ui.settings.general_tab", level="INFO"):
+            tab.set_launch_at_login(True)
+
+        self.assertEqual(self.saved, [{CONFIG_LAUNCH_AT_LOGIN: True}])
+
+    def test_a_build_that_cannot_register_writes_nothing_at_all(self):
+        tab = self.tab(self.app_returning(True), supported=False)
+
+        tab.set_launch_at_login(True)
+
+        self.assertEqual(self.saved, [])
+        self.assertEqual(tab._launch_hint.text, LAUNCH_AT_LOGIN_UNSUPPORTED)
 
 
 class CaptureTeardownTests(unittest.TestCase):

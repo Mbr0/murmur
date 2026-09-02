@@ -117,6 +117,11 @@ hiddenimports = [
     "Foundation",
     "Quartz",
     "ApplicationServices",
+    # Launch at login. ``murmur.login_item_service`` imports SMAppService inside
+    # a function — it does not exist before macOS 13 — and PyInstaller cannot
+    # see an import made there, so the framework has to be named here or the
+    # checkbox reads "Not available in this build" in the bundle only.
+    "ServiceManagement",
     "ui_theme",
     "ui_alerts",
     "transcription_filters",

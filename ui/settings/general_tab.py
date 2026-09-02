@@ -54,6 +54,14 @@ CONFIG_LAUNCH_AT_LOGIN = "launch_at_login"
 #: Shown instead of a switch that would do nothing.
 LAUNCH_AT_LOGIN_UNSUPPORTED = "Not available in this build"
 
+#: Shown when the switch was turned on and the login item is registered, but
+#: macOS is not acting on it yet — ``SMAppServiceStatusRequiresApproval``, or a
+#: refusal from the framework. The box goes back off, because that is the truth.
+LAUNCH_AT_LOGIN_NEEDS_APPROVAL = (
+    "macOS has not allowed this yet. Turn Murmur on in System Settings › "
+    "General › Login Items."
+)
+
 #: Mirrors ``ui_theme.APPEARANCE_MODES``; kept here so the model needs no
 #: AppKit. ``tests/test_settings_general_tab.py`` fails if the two drift.
 APPEARANCE_MODES: tuple[str, ...] = ("system", "dark", "light")
@@ -152,6 +160,8 @@ class GeneralTabModel:
         # item does not get to write a key claiming it did.
         self.launch_at_login_supported: bool = bool(launch_at_login_supported)
         self.launch_at_login: bool = bool(config.get(CONFIG_LAUNCH_AT_LOGIN, False))
+        #: The user asked for the login item and macOS has not granted it yet.
+        self.launch_at_login_pending: bool = False
         self.engine_languages: tuple[str, ...] = language_codes(engine_info)
         self._permission_status = permission_status or permission_status_message
         self._original = self.as_config()
@@ -219,6 +229,15 @@ class GeneralTabModel:
         assert code, "a language code is required"
         self.language = code
 
+    def set_engine_info(self, engine_info: Any | None) -> None:
+        """Recompute the language choices for a newly-loaded engine.
+
+        Called after a live engine swap. The configured language stays
+        selected: :attr:`language_choices` already keeps a value the new
+        engine does not claim as its own row.
+        """
+        self.engine_languages = language_codes(engine_info)
+
     # -- appearance and login --------------------------------------------
 
     @property
@@ -233,15 +252,34 @@ class GeneralTabModel:
 
     @property
     def launch_at_login_hint(self) -> str | None:
-        """Why the checkbox is dead, or None when it works."""
-        return None if self.launch_at_login_supported else LAUNCH_AT_LOGIN_UNSUPPORTED
+        """Why the checkbox is dead or did not take, or None when all is well."""
+        if not self.launch_at_login_supported:
+            return LAUNCH_AT_LOGIN_UNSUPPORTED
+        if self.launch_at_login_pending:
+            return LAUNCH_AT_LOGIN_NEEDS_APPROVAL
+        return None
 
     def set_launch_at_login(self, enabled: bool) -> None:
-        assert isinstance(enabled, bool), f"expected a bool, got {enabled!r}"
+        """Record a state that is known to have taken effect."""
+        self.set_launch_at_login_state(enabled, enabled)
+
+    def set_launch_at_login_state(self, requested: bool, actual: bool) -> None:
+        """Record what the system actually did with the switch.
+
+        ``actual`` is what the login item reports *after* the call, which is not
+        always what was asked for: a registration can sit at
+        ``SMAppServiceStatusRequiresApproval`` until the user allows it. The
+        model keeps the real state — so nothing false is written to config —
+        and remembers that the request is outstanding, which is what
+        :attr:`launch_at_login_hint` then explains.
+        """
+        assert isinstance(requested, bool), f"expected a bool, got {requested!r}"
+        assert isinstance(actual, bool), f"expected a bool, got {actual!r}"
         if not self.launch_at_login_supported:
             logger.info("Launch at login is not available in this build; ignoring the switch")
             return
-        self.launch_at_login = enabled
+        self.launch_at_login = actual
+        self.launch_at_login_pending = requested and not actual
 
     # -- persistence -----------------------------------------------------
 
@@ -350,11 +388,10 @@ class GeneralTab:
             self._launch_changed,
         )
         self._launch_checkbox.setEnabled_(self.model.launch_at_login_supported)
-        self._launch_hint = (
-            make_hint(self.model.launch_at_login_hint, theme)
-            if self.model.launch_at_login_hint
-            else None
-        )
+        # Always made, even with nothing to say: the line has to be there to
+        # carry the "macOS has not allowed this yet" answer when the switch is
+        # flipped, and a row appearing under a checkbox would shift the layout.
+        self._launch_hint = make_hint(self.model.launch_at_login_hint or " ", theme)
         permissions_button = make_button(
             "Open Privacy Settings", theme, self._open_privacy_settings
         )
@@ -421,15 +458,12 @@ class GeneralTab:
         if self._mode_popup is not None:
             self._mode_popup.selectItemAtIndex_(self.model.hotkey_mode_index)
         if self._language_popup is not None:
+            self._language_popup.removeAllItems()
+            self._language_popup.addItemsWithTitles_(list(self.model.language_titles))
             self._language_popup.selectItemAtIndex_(self.model.language_index)
         if self._appearance_popup is not None:
             self._appearance_popup.selectItemAtIndex_(self.model.appearance_index)
-        if self._launch_checkbox is not None:
-            from Cocoa import NSOffState, NSOnState
-
-            self._launch_checkbox.setState_(
-                NSOnState if self.model.launch_at_login else NSOffState
-            )
+        self._show_launch_at_login()
         if self._permission_hint is not None:
             self._permission_hint.setStringValue_(self.model.permission_status)
 
@@ -466,13 +500,64 @@ class GeneralTab:
     def _launch_changed(self, sender) -> None:
         from ui.settings.base import checkbox_is_on
 
-        enabled = checkbox_is_on(sender)
-        self.model.set_launch_at_login(enabled)
-        self._commit()
-        if self.context.app is None:
-            logger.info("Launch at login set to %s; no running app to apply it", enabled)
+        self.set_launch_at_login(checkbox_is_on(sender))
+
+    def set_launch_at_login(self, requested: bool) -> None:
+        """Move the login item, then show and store what actually happened.
+
+        The app is asked first and its answer — the state it read back off
+        ``SMAppService`` — is what gets committed and what the checkbox is set
+        to. Writing ``launch_at_login: True`` before the call and ignoring the
+        result left the config, and the box, claiming something macOS had not
+        agreed to; a registration awaiting approval in System Settings is the
+        common way that happens.
+        """
+        assert self.context is not None and self.model is not None
+        if not self.model.launch_at_login_supported:
+            logger.info("Launch at login is not available in this build; ignoring the switch")
+            self._show_launch_at_login()
             return
-        self.context.app_call("set_launch_at_login", enabled)
+        self.model.set_launch_at_login_state(requested, self._request_launch_at_login(requested))
+        self._commit()
+        self._show_launch_at_login()
+
+    def _request_launch_at_login(self, requested: bool) -> bool:
+        """Ask the app to register or unregister; return the state afterwards.
+
+        A refusal — ``LaunchAtLoginUnavailable``, or anything else the
+        ServiceManagement bridge throws — means the switch did not move, so the
+        honest answer is the state it was not asked to be in.
+        """
+        if self.context.app is None:
+            logger.info("Launch at login set to %s; no running app to apply it", requested)
+            return requested
+        try:
+            state = self.context.app_call("set_launch_at_login", requested)
+        except Exception as error:  # noqa: BLE001 - the framework raises widely
+            logger.warning("The login item did not move: %s", error)
+            return not requested
+        # ``app_call`` answers None for an app without the method; the switch is
+        # only offered where it has one, so the request is taken at face value.
+        return state if isinstance(state, bool) else requested
+
+    def _show_launch_at_login(self) -> None:
+        """Put the model's real state on the checkbox and its hint line."""
+        if self.model is None:
+            return
+        if self._launch_checkbox is not None:
+            self._set_checkbox(self.model.launch_at_login)
+        if self._launch_hint is not None:
+            self._launch_hint.setStringValue_(self.model.launch_at_login_hint or " ")
+
+    def _set_checkbox(self, on: bool) -> None:
+        """The one AppKit call in the launch-at-login path, on its own.
+
+        Everything that decides *what* the box should say is plain Python above
+        it, and testable without a window server.
+        """
+        from Cocoa import NSOffState, NSOnState
+
+        self._launch_checkbox.setState_(NSOnState if on else NSOffState)
 
     def _open_privacy_settings(self, sender) -> None:
         from services.hotkey_service import open_privacy_settings

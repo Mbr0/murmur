@@ -103,6 +103,9 @@ STATUS_UNAVAILABLE = "Licence status unavailable"
 KEY_STORED = "Key stored"
 KEY_NOT_STORED = "No key stored"
 KEY_UNAVAILABLE = "Keychain unavailable"
+#: What the indicator says until the Keychain has answered. See
+#: :meth:`AccountTab.probe_key_states`.
+KEY_CHECKING = "Checking…"
 
 #: What one look-up can say about a provider's key, without reading it.
 KEY_STATE_STORED = "stored"
@@ -237,6 +240,15 @@ def _start_timer(delay_s: float, callback: Callable[[], None]) -> Any:
     timer.daemon = True
     timer.start()
     return timer
+
+
+def _run_in_thread(callback: Callable[[], None]) -> Any:
+    """Run one piece of work off the main thread. Replaced in tests by a call."""
+    import threading
+
+    thread = threading.Thread(target=callback, daemon=True, name="murmur-keychain-probe")
+    thread.start()
+    return thread
 
 
 class AccountTabModel:
@@ -711,7 +723,11 @@ class AccountTab:
         self._key_fields: dict[str, Any] = {}
         self._key_indicators: dict[str, Any] = {}
         self._key_buttons: dict[str, tuple[Any, ...]] = {}
+        #: Last known state per provider. Absent means "not asked yet", which is
+        #: what the indicator shows as :data:`KEY_CHECKING`.
+        self._key_states: dict[str, str] = {}
         self._dispatch: Callable[[Callable[[], None]], None] | None = None
+        self._background: Callable[[Callable[[], None]], Any] | None = None
 
     # -- building --------------------------------------------------------
 
@@ -785,6 +801,7 @@ class AccountTab:
         ).setActive_(True)
         self._view = container
         self.refresh()
+        self.probe_key_states()
         return container
 
     def _make_model(self, context: TabContext) -> AccountTabModel:
@@ -810,7 +827,9 @@ class AccountTab:
         from ui.settings.base import make_button, make_label, stack_horizontal
 
         field = _make_secure_field(theme)
-        indicator = make_label(self.model.key_indicator(provider), theme)
+        # Not ``key_indicator(provider)``: that reads the Keychain, and this
+        # runs while the window is being built. See :meth:`probe_key_states`.
+        indicator = make_label(KEY_CHECKING, theme)
         save = make_button(SAVE_KEY_BUTTON, theme, self._save_key_action(provider), width=80)
         remove = make_button(
             REMOVE_KEY_BUTTON, theme, self._remove_key_action(provider), width=90
@@ -839,9 +858,15 @@ class AccountTab:
         self._open_button.setEnabled_(model.is_linking and bool(model.verification_url))
         self._cancel_button.setEnabled_(model.is_linking)
         for provider, indicator in self._key_indicators.items():
-            state = model.key_state(provider)
-            indicator.setStringValue_(KEY_STATE_LABELS[state])
-            usable = state != KEY_STATE_UNAVAILABLE
+            # The cached answer from the last probe, never a fresh look-up: this
+            # runs on the main thread and the Keychain can put a dialog in the
+            # way of it. Nothing has been asked yet means "Checking…", with the
+            # controls dead until there is an answer to act on.
+            state = self._key_states.get(provider)
+            indicator.setStringValue_(
+                KEY_CHECKING if state is None else KEY_STATE_LABELS[state]
+            )
+            usable = state is not None and state != KEY_STATE_UNAVAILABLE
             for button in self._key_buttons.get(provider, ()):
                 button.setEnabled_(usable)
             field = self._key_fields.get(provider)
@@ -849,6 +874,55 @@ class AccountTab:
                 field.setEnabled_(usable)
         if self._channel_popup is not None:
             self._channel_popup.selectItemAtIndex_(model.channel_index())
+
+    # -- the keychain probe ----------------------------------------------
+
+    def probe_key_states(self) -> None:
+        """Ask the Keychain about every provider, off the main thread.
+
+        ``key_state`` is one ``SecItemCopyMatching``, and macOS answers it with
+        an access dialog whenever the ACL no longer matches the running binary
+        — the first launch after a re-signed build, most of all. Asked while the
+        tab is being built, that dialog blocks the main thread and Settings
+        simply never opens. So the indicator opens saying "Checking…", the
+        look-up happens on a worker thread, and the answer hops back to the main
+        thread to be drawn. Save and Remove stay synchronous: the user asked for
+        those, and a dialog in front of a click is a dialog they expect.
+        """
+        model = self.model
+        if model is None:
+            return
+        providers = tuple(self._key_indicators)
+        if not providers:
+            return
+
+        def probe() -> None:
+            states = {provider: model.key_state(provider) for provider in providers}
+            self._show_key_states(states)
+
+        (self._background or _run_in_thread)(probe)
+
+    def _show_key_states(self, states: dict[str, str]) -> None:
+        """Take probe results back onto the main thread and redraw."""
+
+        def show() -> None:
+            self._key_states.update(states)
+            self.refresh()
+
+        if self._dispatch is None:
+            show()
+            return
+        self._dispatch(show)
+
+    def _reread_key_state(self, provider: str) -> None:
+        """Re-read one provider after the user saved or removed its key.
+
+        Synchronous on purpose: the Keychain was just written to from this same
+        click, so there is no dialog left to wait behind.
+        """
+        if self.model is None:
+            return
+        self._key_states[provider] = self.model.key_state(provider)
 
     def _refresh_later(self) -> None:
         """Refresh from a timer thread, on the main thread."""
@@ -926,6 +1000,7 @@ class AccountTab:
             )
             return
         field.setStringValue_("")  # never leave a secret on screen
+        self._reread_key_state(provider)
         self.refresh()
         ui_alerts.show_alert(KEY_SAVED_TITLE, KEY_SAVED_BODY.format(provider=label))
 
@@ -943,6 +1018,7 @@ class AccountTab:
             )
             return
         self._key_fields[provider].setStringValue_("")
+        self._reread_key_state(provider)
         self.refresh()
 
     def _channel_changed(self, sender) -> None:
@@ -977,6 +1053,7 @@ __all__ = [
     "CONFIG_UPDATE_CHANNEL",
     "DEFAULT_POLL_INTERVAL_S",
     "DEFAULT_UPDATE_CHANNEL",
+    "KEY_CHECKING",
     "KEY_NOT_STORED",
     "KEY_STATE_ABSENT",
     "KEY_STATE_LABELS",

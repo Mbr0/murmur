@@ -6,9 +6,13 @@ An ``NSTabView`` shell and nothing else: it loads the config, builds one
 registered. Which controls exist, and what they write, is each tab's business.
 
 The window has no Save button. Tabs persist a change the moment it is made,
-through the ``save`` callable in the context, which merges the changed keys
-into the live config and writes the file. The tab the user was last on is
-remembered in ``settings_last_tab``.
+through the ``save`` callable in the context, which writes *only* the changed
+keys — merged into whatever is on disk now, not into the snapshot the window
+loaded — and brings the merged result back into the live config. The tab the
+user was last on is remembered in ``settings_last_tab``.
+
+Reopening re-reads the config and refreshes every tab: the controller outlives
+the window, and both the config and the tabs are as old as the first open.
 
 AppKit is imported inside the methods that need it, so the module — and
 ``initial_tab`` with it — stays importable headlessly.
@@ -132,12 +136,15 @@ class SettingsWindowController:
         theme: Any | None = None,
         services: dict | None = None,
         engine_info: Any | None = None,
+        load: Any | None = None,
     ) -> None:
         self.app = app if app is not None else murmur_app_instance()
-        self.config = config if config is not None else load_config()
-        self._save_config = save if save is not None else PERSISTENCE.save_config
+        self._load_config = load if load is not None else load_config
+        self.config = config if config is not None else self._load_config()
+        #: Called with only the keys that changed; returns the merged config.
+        self._save_config = save if save is not None else PERSISTENCE.update_config
         self._theme = theme
-        self._services = services or {}
+        self._services = dict(services) if services else {}
         self._engine_info = engine_info if engine_info is not None else engine_info_for(self.app)
         self.tabs: dict[str, Any] = {}
         self.identifiers: tuple[str, ...] = ()
@@ -152,12 +159,54 @@ class SettingsWindowController:
     # -- config ----------------------------------------------------------
 
     def save(self, changed: dict) -> None:
-        """Merge a tab's changed keys into the live config and persist it."""
+        """Write a tab's changed keys, and take back the merged config.
+
+        Only ``changed`` is handed to the writer. The window loads the config
+        once and then lives for the whole process, so by the time a tab saves,
+        the snapshot it is holding can be minutes old: the app may have written
+        ``engine_id`` and ``model_id`` after an engine reload, a cleanup toggle
+        from the menu bar, or the flag that says the history was deleted.
+        Writing that snapshot back reverted every one of them — hence
+        :meth:`PersistenceService.update_config`, which merges under the file
+        lock and hands back the result.
+
+        The merged result replaces the live config *in place*: every tab and the
+        one :class:`TabContext` hold this same dict, so rebinding it would leave
+        them reading the old one.
+        """
         assert changed is not None, "changed is required"
         if not changed:
             return
-        self.config.update(changed)
-        self._save_config(self.config)
+        merged = self._save_config(dict(changed))
+        if isinstance(merged, dict):
+            self.config.clear()
+            self.config.update(merged)
+        else:
+            # An injected writer that reports nothing back. The keys still have
+            # to reach the dict the tabs are reading.
+            self.config.update(changed)
+
+    def reload_config(self) -> dict:
+        """Re-read the stored config into the dict the tabs are holding."""
+        fresh = self._load_config()
+        if not isinstance(fresh, dict):
+            logger.warning("The config could not be re-read; keeping the one in hand")
+            return self.config
+        self.config.clear()
+        self.config.update(fresh)
+        return self.config
+
+    def update_services(self, services: dict | None) -> None:
+        """Take a freshly built ``services`` dict without swapping the object.
+
+        The app rebuilds it on every open — the Pro gate in it is bound to a
+        config snapshot — and the tabs read through the one context, so the
+        contents are replaced rather than the dict.
+        """
+        if not services:
+            return
+        self._services.clear()
+        self._services.update(services)
 
     @property
     def theme(self) -> Any:
@@ -221,10 +270,37 @@ class SettingsWindowController:
 
     # -- window ----------------------------------------------------------
 
+    def reopen(self) -> None:
+        """Bring a window that already exists back up to date.
+
+        The controller outlives the window: closing it tore the tabs down
+        through :meth:`close_tabs` but kept the objects, and the config it is
+        holding is as old as the first open. So a second open re-reads the file
+        and asks every tab to re-read it — otherwise Settings comes back
+        showing the model the user was on before they switched, over tabs whose
+        timers and monitors were handed back and never asked for again. What a
+        tab needs to re-arm — the General tab's event monitor, say — it re-arms
+        when it is next used, so nothing is claimed back here that is not needed.
+        """
+        self.reload_config()
+        self.refresh_tabs()
+
+    def refresh_tabs(self) -> None:
+        """Ask every built tab to re-read the config into its controls."""
+        for identifier, tab in self.tabs.items():
+            refresh = getattr(tab, "refresh", None)
+            if refresh is None:
+                continue
+            try:
+                refresh()
+            except Exception as error:  # noqa: BLE001 - one tab must not stop the rest
+                logger.warning("Settings tab %r could not refresh: %s", identifier, error)
+
     def show(self, tab: str | None = None) -> Any:
         """Create the window if needed, select a tab, and bring it forward."""
         from Cocoa import NSApp
 
+        self.reopen()
         if self.window is None:
             self.create_window()
         self.select_tab(initial_tab(self.config, self.identifiers, tab))
@@ -298,16 +374,7 @@ class SettingsWindowController:
         self._engine_info = info
         if self._live_context is not None:
             self._live_context.engine_info = info
-        for identifier, tab in self.tabs.items():
-            refresh = getattr(tab, "refresh", None)
-            if refresh is None:
-                continue
-            try:
-                refresh()
-            except Exception as error:  # noqa: BLE001 - one tab must not stop the rest
-                logger.warning(
-                    "Settings tab %r could not follow the engine swap: %s", identifier, error
-                )
+        self.refresh_tabs()
 
     # -- closing ---------------------------------------------------------
 
@@ -427,8 +494,13 @@ def open_settings(
     global _CONTROLLER
     if _CONTROLLER is None:
         _CONTROLLER = SettingsWindowController(app=app, services=services)
-    elif app is not None:
-        _CONTROLLER.app = app
+    else:
+        if app is not None:
+            _CONTROLLER.app = app
+        # The app builds these fresh on every open — the Pro gate among them is
+        # bound to a config snapshot — so a reopened window takes the new dict
+        # rather than answering out of the one it was created with.
+        _CONTROLLER.update_services(services)
     _CONTROLLER.show(tab)
     return _CONTROLLER
 

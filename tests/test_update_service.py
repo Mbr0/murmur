@@ -226,6 +226,40 @@ class FeedParsingTests(unittest.TestCase):
             feed.fetch()
 
 
+class ChannelFeedTests(unittest.TestCase):
+    def test_stable_channel_is_unchanged(self):
+        feed = UpdateFeed()
+        self.assertEqual(feed.channel, "stable")
+        self.assertEqual(feed.url, DEFAULT_FEED_URL)
+
+    def test_beta_channel_uses_the_releases_list_url(self):
+        feed = UpdateFeed(channel="beta")
+        self.assertEqual(feed.url, "https://api.github.com/repos/Mbr0/murmur/releases?per_page=10")
+
+    def test_an_invalid_channel_is_refused(self):
+        with self.assertRaises(ValueError):
+            UpdateFeed(channel="nightly")
+
+    def test_beta_picks_the_highest_prerelease(self):
+        releases = [
+            _release(tag="v1.4.0"),
+            _release(tag="v1.5.0-beta.2", asset_name="Murmur-1.5.0-beta.2.dmg"),
+            _release(tag="v1.5.0-beta.10", asset_name="Murmur-1.5.0-beta.10.dmg"),
+        ]
+        feed = UpdateFeed(channel="beta", opener=_json_opener(releases))
+        info = feed.fetch()
+        self.assertEqual(info.version, "1.5.0-beta.10")
+
+    def test_beta_skips_drafts(self):
+        releases = [
+            _release(tag="v1.4.0"),
+            _release(tag="v1.6.0-beta.1", asset_name="Murmur-1.6.0-beta.1.dmg", draft=True),
+        ]
+        feed = UpdateFeed(channel="beta", opener=_json_opener(releases))
+        info = feed.fetch()
+        self.assertEqual(info.version, "1.4.0")
+
+
 class CheckForUpdateTests(unittest.TestCase):
     def test_returns_info_when_the_feed_is_ahead(self):
         feed = UpdateFeed(opener=_json_opener(_release()))
@@ -591,6 +625,15 @@ class UpdateServiceTests(unittest.TestCase):
             service, _ = self._service(tmp, FakeRunner())
             info = service.check()
         self.assertEqual(info.version, "1.4.0")
+
+    def test_channel_is_used_to_build_the_default_feed(self):
+        service = UpdateService(current_version="1.0.0", channel="beta")
+        self.assertEqual(service.feed.channel, "beta")
+
+    def test_an_explicit_feed_overrides_the_channel(self):
+        feed = UpdateFeed(opener=_json_opener(_release()))
+        service = UpdateService(current_version="1.0.0", feed=feed, channel="beta")
+        self.assertIs(service.feed, feed)
 
     def test_happy_path_calls_download_verify_install_in_order(self):
         runner = FakeRunner()

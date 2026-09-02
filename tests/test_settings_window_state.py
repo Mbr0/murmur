@@ -35,14 +35,15 @@ from ui.settings.window import (
 )
 
 
-def stub_tab(identifier, title=None, close=None):
+def stub_tab(identifier, title=None, close=None, refresh=None):
     """A minimal class satisfying the SettingsTab protocol."""
     body = {
         "identifier": identifier,
         "title": title or identifier.title(),
         "build": lambda self, context: context,
-        "refresh": lambda self: None,
     }
+    if refresh is not False:  # False means "this tab has no refresh at all"
+        body["refresh"] = refresh or (lambda self: None)
     if close is not None:
         body["close"] = close
     return type(f"Stub{identifier.title()}Tab", (), body)
@@ -237,26 +238,85 @@ class InitialTabTests(unittest.TestCase):
 
 
 class ControllerConfigTests(unittest.TestCase):
-    """The controller's config half: merging a tab's changes and remembering
-    the open tab. No AppKit is touched by any of it."""
+    """The controller's config half: writing a tab's changes and remembering
+    the open tab. No AppKit is touched by any of it.
+
+    ``save`` stands in for :meth:`PersistenceService.update_config`: it is
+    handed only the keys that changed, merges them into what is "on disk", and
+    hands the merged result back.
+    """
 
     def controller(self, config=None):
+        config = dict(config if config is not None else {"language": "auto"})
+        self.stored = dict(config)
         self.saved = []
+
+        def save(changed):
+            self.saved.append(dict(changed))
+            self.stored.update(changed)
+            return dict(self.stored)
+
         return SettingsWindowController(
             app=object(),
-            config=config if config is not None else {"language": "auto"},
-            save=self.saved.append,
+            config=config,
+            save=save,
             theme=object(),
         )
 
-    def test_save_merges_changed_keys_into_the_live_config(self):
+    def test_save_writes_only_the_keys_that_changed(self):
         controller = self.controller()
 
         controller.save({"language": "fr", "appearance_mode": "dark"})
 
+        self.assertEqual(self.saved, [{"language": "fr", "appearance_mode": "dark"}])
         self.assertEqual(controller.config["language"], "fr")
         self.assertEqual(controller.config["appearance_mode"], "dark")
-        self.assertEqual(self.saved, [controller.config])
+
+    def test_a_key_the_app_wrote_while_settings_was_open_is_not_reverted(self):
+        """The window loads the config once and lives for the process.
+
+        Between then and a tab's next save the app can write ``engine_id``
+        after a reload, a cleanup toggle from the menu, or the flag that says
+        the history was deleted. Writing the window's own snapshot back would
+        undo every one of them.
+        """
+        controller = self.controller({"language": "auto", "engine_id": "whispercpp"})
+        self.stored["engine_id"] = "voxtral"  # the app swapped engines meanwhile
+
+        controller.save({"language": "fr"})
+
+        self.assertEqual(self.stored["engine_id"], "voxtral")
+        self.assertEqual(controller.config["engine_id"], "voxtral")
+        self.assertEqual(controller.config["language"], "fr")
+
+    def test_the_merged_result_lands_in_the_dict_the_tabs_are_holding(self):
+        controller = self.controller()
+        context = controller.context()
+        self.stored["onboarding_completed"] = True
+
+        controller.save({"language": "fr"})
+
+        self.assertIs(context.config, controller.config)
+        self.assertTrue(context.config["onboarding_completed"])
+
+    def test_a_writer_that_returns_nothing_still_updates_the_live_config(self):
+        written = []
+        controller = SettingsWindowController(
+            app=None,
+            config={"language": "auto"},
+            save=lambda changed: written.append(changed),
+            theme=object(),
+        )
+
+        controller.save({"language": "nl"})
+
+        self.assertEqual(written, [{"language": "nl"}])
+        self.assertEqual(controller.config["language"], "nl")
+
+    def test_the_default_writer_merges_rather_than_replacing_the_file(self):
+        controller = SettingsWindowController(app=None, config={}, theme=object())
+
+        self.assertEqual(controller._save_config, window_module.PERSISTENCE.update_config)
 
     def test_saving_nothing_writes_nothing(self):
         controller = self.controller()
@@ -389,6 +449,126 @@ class TabTeardownTests(unittest.TestCase):
         controller.close_tabs()  # no exception, nothing to give back
 
 
+class ReopeningTests(unittest.TestCase):
+    """The second open must show the world as it is now.
+
+    ``close_tabs`` already gave back the timers and monitors the tabs held, and
+    the config the window loaded is as old as the window. Reopening without
+    re-reading either shows a stale model selection over half-dead tabs.
+    """
+
+    def controller(self, stored, tabs=None, load=None):
+        self.loads = []
+
+        def default_load():
+            self.loads.append(True)
+            return dict(stored)
+
+        controller = SettingsWindowController(
+            app=None,
+            config={"language": "auto"},
+            save=lambda changed: None,
+            theme=object(),
+            load=load or default_load,
+        )
+        controller.tabs = dict(tabs or {})
+        controller.identifiers = tuple(controller.tabs)
+        return controller
+
+    def test_reopening_re_reads_the_config_into_the_dict_the_tabs_hold(self):
+        controller = self.controller({"language": "fr", "model_id": "voxtral-mini"})
+        context = controller.context()
+
+        controller.reopen()
+
+        self.assertEqual(self.loads, [True])
+        self.assertIs(context.config, controller.config)
+        self.assertEqual(context.config["language"], "fr")
+        self.assertEqual(context.config["model_id"], "voxtral-mini")
+
+    def test_a_key_that_is_gone_from_disk_is_gone_from_the_live_config(self):
+        controller = self.controller({"language": "fr"})
+        controller.config["stale"] = "left over from the last open"
+
+        controller.reopen()
+
+        self.assertNotIn("stale", controller.config)
+
+    def test_reopening_refreshes_every_tab(self):
+        refreshed = []
+        tabs = {
+            identifier: stub_tab(
+                identifier, refresh=lambda self, key=identifier: refreshed.append(key)
+            )()
+            for identifier in (TAB_GENERAL, TAB_ACCOUNT)
+        }
+        controller = self.controller({"language": "fr"}, tabs)
+
+        controller.reopen()
+
+        self.assertEqual(sorted(refreshed), sorted([TAB_GENERAL, TAB_ACCOUNT]))
+
+    def test_a_tab_without_a_refresh_is_skipped(self):
+        refreshed = []
+        controller = self.controller(
+            {"language": "fr"},
+            {
+                TAB_PRIVACY: stub_tab(TAB_PRIVACY, refresh=False)(),
+                TAB_ACCOUNT: stub_tab(
+                    TAB_ACCOUNT, refresh=lambda self: refreshed.append(TAB_ACCOUNT)
+                )(),
+            },
+        )
+
+        controller.reopen()
+
+        self.assertEqual(refreshed, [TAB_ACCOUNT])
+
+    def test_a_tab_that_fails_to_refresh_is_logged_and_the_rest_still_refresh(self):
+        refreshed = []
+
+        def boom(self):
+            raise RuntimeError("this tab cannot re-read itself")
+
+        controller = self.controller(
+            {"language": "fr"},
+            {
+                TAB_GENERAL: stub_tab(TAB_GENERAL, refresh=boom)(),
+                TAB_ACCOUNT: stub_tab(
+                    TAB_ACCOUNT, refresh=lambda self: refreshed.append(TAB_ACCOUNT)
+                )(),
+            },
+        )
+
+        with self.assertLogs("ui.settings.window", level="WARNING") as captured:
+            controller.reopen()
+
+        self.assertEqual(refreshed, [TAB_ACCOUNT])
+        self.assertIn(TAB_GENERAL, "\n".join(captured.output))
+
+    def test_a_loader_that_returns_nothing_leaves_the_config_alone(self):
+        controller = self.controller({}, load=lambda: None)
+
+        controller.reopen()
+
+        self.assertEqual(controller.config, {"language": "auto"})
+
+    def test_the_engine_swap_path_refreshes_the_same_tabs(self):
+        refreshed = []
+        controller = self.controller(
+            {"language": "fr"},
+            {TAB_GENERAL: stub_tab(TAB_GENERAL, refresh=lambda self: refreshed.append(1))()},
+        )
+        context = controller.context()
+        controller._live_context = context
+
+        controller.engine_reloaded("new-engine-info")
+
+        self.assertEqual(refreshed, [1])
+        self.assertEqual(context.engine_info, "new-engine-info")
+        self.assertEqual(self.loads, [])  # a swap is not a reopen
+
+
 class ServicesTests(unittest.TestCase):
     """A ``services`` dict must reach every tab's context, end to end."""
 
@@ -406,6 +586,53 @@ class ServicesTests(unittest.TestCase):
         )
 
         self.assertIs(controller.context().services["license"], provider)
+
+    def test_fresh_services_reach_the_context_the_tabs_already_hold(self):
+        """The app rebuilds the dict on every open — a Pro gate bound to a
+        config snapshot among them — so a reopened window must take the new one
+        without swapping the object its tabs read through."""
+        controller = SettingsWindowController(
+            app=None,
+            config={"language": "auto"},
+            save=lambda changed: None,
+            theme=object(),
+            services={"pro_gate": "stale"},
+        )
+        context = controller.context()
+
+        controller.update_services({"pro_gate": "fresh"})
+
+        self.assertEqual(context.service("pro_gate"), "fresh")
+
+    def test_update_services_with_nothing_keeps_what_the_window_has(self):
+        controller = SettingsWindowController(
+            app=None,
+            config={},
+            save=lambda changed: None,
+            theme=object(),
+            services={"pro_gate": "stale"},
+        )
+
+        controller.update_services(None)
+
+        self.assertEqual(controller.context().service("pro_gate"), "stale")
+
+    def test_open_settings_refreshes_the_services_of_the_window_it_reopens(self):
+        seen = {}
+
+        class StubController:
+            def update_services(self, services):
+                seen["services"] = services
+
+            def show(self, tab):
+                seen["tab"] = tab
+
+        window_module._CONTROLLER = StubController()
+
+        window_module.open_settings(app=None, tab="general", services={"keychain": "y"})
+
+        self.assertEqual(seen["services"], {"keychain": "y"})
+        self.assertEqual(seen["tab"], "general")
 
     def test_open_settings_forwards_services_to_a_new_controller(self):
         window_module._CONTROLLER = None
