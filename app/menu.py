@@ -23,7 +23,7 @@ from app.decisions import (
     MODE_MENU_AUTOMATIC,
     account_menu_title,
     cleanup_download_menu_enabled,
-    clear_mic_device_selection,
+    mic_selection_changes,
     mode_menu_state,
     resolve_mic_device,
     resolve_mic_device_index,
@@ -102,7 +102,7 @@ class MenuMixin:
             logger.info("Restored microphone device index %s (%s)", device_idx, device_name)
         except Exception as error:
             logger.error("Could not restore microphone device: %s", error)
-            self.persistence.save_config(clear_mic_device_selection(config))
+            self.persistence.update_config(mic_selection_changes(None, None))
             rumps.notification(
                 APP_NAME,
                 "Microphone unavailable",
@@ -110,10 +110,7 @@ class MenuMixin:
             )
 
     def _persist_microphone_selection(self, device_idx: int, device_name: str) -> None:
-        config = self.runtime_config()
-        config["mic_device_index"] = device_idx
-        config["mic_device_name"] = device_name
-        self.persistence.save_config(config)
+        self.persistence.update_config(mic_selection_changes(device_idx, device_name))
 
     def update_microphone_menu(self):
         """Update the microphone selection submenu"""

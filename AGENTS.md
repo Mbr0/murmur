@@ -33,7 +33,7 @@ Reload Cursor after pulling agent config: **Developer: Reload Window**.
 ## Tooling
 
 - **Package manager:** pip + venv (see [`scripts/setup.sh`](./scripts/setup.sh))
-- **Tests:** `python -m unittest discover -s tests -p "test_*.py" -v` · `./scripts/run.sh` (dev run) · `./scripts/build_pyinstaller.sh` (bundle)
+- **Tests:** `python -m unittest discover -s tests -p "test_*.py" -v` (unit) · `bash scripts/tools/run_integration.sh` (integration, macOS) · `./scripts/run.sh` (dev run) · `./scripts/build_pyinstaller.sh` (bundle)
 
 ---
 
@@ -51,7 +51,7 @@ Reload Cursor after pulling agent config: **Developer: Reload Window**.
 - Do not commit secrets (`.env`, credentials).
 - Do not skip plan approval for non-trivial code changes.
 - Do not log transcription text in production logs.
-- Do not send audio or text to the cloud — all processing is on-device.
+- Processing is local by default. Send audio or text to the cloud only when the user has chosen Murmur Cloud or Own key in Settings → Engine; even then, no telemetry.
 
 ---
 

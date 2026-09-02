@@ -694,6 +694,18 @@ def binding_matches_ns_key_up(binding: HotkeyBinding, keycode: int) -> bool:
 #: Keyword names a future quickmachotkey might use to expose kEventHotKeyReleased.
 _CARBON_KEY_UP_PARAMETERS = ("onKeyUp", "onRelease", "released", "eventKinds")
 
+#: Bindings whose "Carbon cannot deliver key-up" warning has already been
+#: logged in this process. The line describes a permanent property of the
+#: installed library, not an event: repeating it on every re-registration told
+#: the reader nothing new, and made a shortcut registered twice at launch look
+#: like normal startup noise instead of the bug it was.
+_KEY_UP_WARNED_BINDINGS: set[HotkeyBinding] = set()
+
+
+def reset_key_up_warnings() -> None:
+    """Forget which bindings have been warned about. For tests, not the app."""
+    _KEY_UP_WARNED_BINDINGS.clear()
+
 
 def carbon_supports_key_up() -> bool:
     """Whether the Carbon hotkey library can deliver key-up (``kEventHotKeyReleased``).
@@ -790,8 +802,13 @@ def _attach_carbon_key_up_fallback(
     See :func:`carbon_supports_key_up`. The degradation is logged, never silent: the
     user gets the shortcut either way, but hold and auto collapse into toggle
     behaviour when Accessibility is missing.
+
+    The library's limitation is stated once per binding per process. It cannot
+    change while the app runs, so a second line only ever meant the shortcut had
+    been registered twice — which is a bug, and one this warning used to hide.
     """
-    if logger is not None:
+    if logger is not None and binding not in _KEY_UP_WARNED_BINDINGS:
+        _KEY_UP_WARNED_BINDINGS.add(binding)
         logger.warning(
             "Carbon hotkeys cannot deliver key-up (quickmachotkey installs a "
             "kEventHotKeyPressed handler only). Using an NSEvent monitor for key-up "

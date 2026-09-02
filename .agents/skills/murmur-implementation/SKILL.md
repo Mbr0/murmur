@@ -42,7 +42,7 @@ This skill adds Murmur-specific resolution, hot files, and conventions.
 
 | Subagent | Scope |
 |----------|-------|
-| `/app-implementer` | `services/**`, root `*.py`, `tests/**`, `scripts/**`, `assets/**`, `Murmur.spec`, `requirements.txt`, `entitlements.plist` |
+| `/app-implementer` | `app/**`, `ui/**`, `cleanup/**`, `engines/**`, `services/**`, root `*.py`, `tests/**`, `scripts/**`, `assets/**`, `Murmur.spec`, `requirements.txt`, `entitlements.plist` |
 
 Generic phases R, X, V use global `/research-readonly`, `/overlap-auditor`, `/verifier`.
 
@@ -50,11 +50,14 @@ Generic phases R, X, V use global `/research-readonly`, `/overlap-auditor`, `/ve
 
 ## 4. Repo-wide hot files (never parallel-edit)
 
-- `murmur.py` — menu bar app orchestrator and lifecycle
+- `app/lifecycle.py` — app startup/teardown and menu bar orchestration
+- `app/pipeline.py` — record → transcribe → cleanup → paste pipeline
+- `app/services.py` — service wiring shared across the app
 - `Murmur.spec` — PyInstaller bundle definition
 - `requirements.txt` — pinned Python dependencies
 - `services/hotkey_service.py` — global shortcut registration
 - `services/text_insertion_service.py` — Accessibility paste-at-cursor
+- `.github/workflows/release.yml` — signed/notarized release CI
 
 Folder `MASTER.md` §7 or work folder skill may add more.
 
@@ -62,8 +65,8 @@ Folder `MASTER.md` §7 or work folder skill may add more.
 
 - [`AGENTS.md`](../../../AGENTS.md) first
 - **UI:** [STUDIO_DESIGN_MANIFEST.md](../../../docs/STUDIO_DESIGN_MANIFEST.md) + [`docs/design-manifest.md`](../../../docs/design-manifest.md)
-- Service layer in `services/`; UI modules at repo root (`settings_window.py`, `history_window.py`, etc.)
-- macOS menu bar app (rumps); local Whisper transcription only — no cloud
+- App orchestration in `app/`; UI modules in `ui/` (`ui/settings/`, `ui/history_window.py`, etc.); `murmur.py` stays a thin entry point
+- macOS menu bar app (rumps); local by default — cloud only when the user chooses Murmur Cloud or Own key
 - PyInstaller bundle via `Murmur.spec`; build scripts in `scripts/`
 - TDD with `unittest` in `tests/`; minimal diff; fail fast
 

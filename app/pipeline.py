@@ -52,6 +52,7 @@ from engines.model_store import models_for_engine
 from services.engine_router import (
     ENGINE_BYOK,
     ENGINE_CLOUD,
+    REMOTE_ENGINE_IDS,
     after_cloud_failure,
     route_engine,
 )
@@ -109,6 +110,7 @@ from app.decisions import (
     expand_gated_snippets,
     finalize_transcript,
     gated_vocabulary,
+    hints_notice_changes,
     hints_notice_message,
     history_origin_for,
     language_is_auto,
@@ -121,7 +123,6 @@ from app.decisions import (
     paste_and_settle,
     reapply_replacements,
     reload_engine_decision,
-    remember_hints_notice,
     remote_engine_key,
     resolve_engine_selection,
     run_cleanup,
@@ -421,12 +422,12 @@ class PipelineMixin:
             model_ids_for_engine=self._model_ids_for_engine,
         )
         if selection.needs_persist:
-            updated = {
-                **config,
-                CONFIG_ENGINE_ID: selection.engine_id,
-                CONFIG_MODEL_ID: selection.model_id,
-            }
-            self.persistence.save_config(updated)
+            self.persistence.update_config(
+                {
+                    CONFIG_ENGINE_ID: selection.engine_id,
+                    CONFIG_MODEL_ID: selection.model_id,
+                }
+            )
             if selection.from_legacy_model_key:
                 logger.info(
                     "Migrated legacy model setting to engine %s with model %s",
@@ -479,7 +480,9 @@ class PipelineMixin:
             has_terms=bool(vocabulary.terms),
         ):
             return
-        self.persistence.save_config(remember_hints_notice(self.runtime_config(), engine_id))
+        self.persistence.update_config(
+            hints_notice_changes(self.runtime_config(), engine_id)
+        )
         rumps.notification(
             APP_NAME, "Vocabulary", hints_notice_message(self._engine_display_name())
         )
@@ -1009,7 +1012,7 @@ class PipelineMixin:
         engine — the one the user chose and this app already loaded — so the
         fallback never quietly starts a second speech model.
         """
-        if engine_id in (ENGINE_CLOUD, ENGINE_BYOK):
+        if engine_id in REMOTE_ENGINE_IDS:
             return self._remote_engine_for(engine_id, config)
         return self.engine
 
@@ -1056,7 +1059,7 @@ class PipelineMixin:
         repeating it on every utterance would be nagging.
         """
         self._announce_route(route.notice)
-        hosted = route.engine_id in (ENGINE_CLOUD, ENGINE_BYOK)
+        hosted = route.engine_id in REMOTE_ENGINE_IDS
         try:
             transcript = self._run_engine(
                 route.engine_id,
@@ -1323,10 +1326,11 @@ class PipelineMixin:
         self._stream_thread = None
         pill = self._active_pill(config)
         # Only an engine that can stream gets the live feed; whisper.cpp shows
-        # state only, which is what the pill's phases are for.
-        streaming = pill is not None and bool(
-            getattr(self.engine, "supports_streaming", False)
-        )
+        # state only, which is what the pill's phases are for. Asked of the
+        # engine's own declared capability (``Engine.supports_streaming``),
+        # never of its id: a new streaming engine must not need a change here.
+        engine = self.engine
+        streaming = pill is not None and engine is not None and engine.supports_streaming
 
         try:
             logger.info(f"Starting audio capture with sample rate {SAMPLE_RATE}")
@@ -1461,7 +1465,7 @@ class PipelineMixin:
             if (
                 stream_text is not None
                 and language_is_auto(language)
-                and route.engine_id not in (ENGINE_CLOUD, ENGINE_BYOK)
+                and route.engine_id not in REMOTE_ENGINE_IDS
             ):
                 # The live decoder already produced the whole utterance while
                 # the user was speaking; running the file through the same

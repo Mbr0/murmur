@@ -85,9 +85,14 @@ Wave 4 (the licence and cloud clients) adds:
 No secret is ever a config key. The Boske lease and the own-key API keys live
 in the Keychain (``services/keychain.py``); nothing here holds a credential.
 
-Writers that own only a few keys must go through :meth:`PersistenceService.update_config`
-rather than saving a whole config they loaded earlier: a snapshot save silently
-reverts every key another part of the app wrote in the meantime.
+Every writer goes through :meth:`PersistenceService.update_config`, which merges
+the keys it is given into whatever is on disk *now*, under the file lock. Saving
+a whole config a caller loaded earlier silently reverts every key another part
+of the app wrote in the meantime — the bug that shipped in Wave 1 and again in
+Wave 3 — so the whole-config writer is private
+(:meth:`PersistenceService._save_config_snapshot`) and
+``tests/test_no_snapshot_writes.py`` fails the build if anything outside this
+module calls it.
 
 Two keys keep the names Murmur has always used rather than gaining synonyms:
 ``save_history`` is the history toggle and ``save_audio`` the keep-audio
@@ -406,9 +411,19 @@ class PersistenceService:
     def load_config(self, default: dict[str, Any]) -> dict[str, Any]:
         return self._load_json_with_default(self._paths.config_file, default)
 
-    def save_config(self, config: dict[str, Any]) -> None:
-        """Write the whole config. Prefer :meth:`update_config` from any caller
-        that owns only some of the keys."""
+    def _save_config_snapshot(self, config: dict[str, Any]) -> None:
+        """Write the whole config file. Private, and the only place that does.
+
+        Every caller outside this module owns some of the keys and none of the
+        rest, so the public writer is :meth:`update_config`. This one exists
+        because a merge still has to put a complete file down at the end of it,
+        and because the first-run defaults are genuinely a whole config.
+
+        It was public until Wave 5, and the same bug shipped twice through it:
+        a caller loaded the config, held it while the user thought, and saved
+        that snapshot back over everything written in between. Making it
+        private is what stops a third wave finding it by autocomplete.
+        """
         with _CONFIG_LOCK:
             self._save_json_file(self._paths.config_file, config)
 
@@ -431,7 +446,7 @@ class PersistenceService:
         with _CONFIG_LOCK:
             config = self.load_config(dict(base))
             config.update(changes)
-            self._save_json_file(self._paths.config_file, config)
+            self._save_config_snapshot(config)
             return config
 
     def load_history(self) -> list[dict[str, Any]]:
@@ -532,16 +547,24 @@ class PersistenceService:
 
         removed_keys: list[str] = []
         if config is not None:
+            # Only the cleared keys are written back. ``config`` is the Settings
+            # window's live dict, as old as the window: saving it whole would
+            # revert the engine the app swapped to while the user was reading
+            # the confirmation. It is still updated in place, because the tabs
+            # are holding this same object.
+            changes: dict[str, Any] = {}
             for key in USER_CONTENT_CONFIG_KEYS:
                 if key not in config:
                     continue
                 if key in DEFAULT_CONFIG:
                     config[key] = _fresh_default(key)
+                    changes[key] = _fresh_default(key)
                 else:
                     # Owned by a feature that documents no default of its own.
                     del config[key]
                 removed_keys.append(key)
-            self.save_config(config)
+            if changes:
+                self.update_config(changes)
 
         return DeletionSummary(
             history_entries=history_entries,

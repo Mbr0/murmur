@@ -154,12 +154,16 @@ def resolve_mic_device(
     raise ValueError(f"Microphone device index {saved_index} is not available")
 
 
-def clear_mic_device_selection(config: dict) -> dict:
-    """Return config with mic selection cleared (fail-fast; no stale device)."""
-    updated = dict(config)
-    updated["mic_device_index"] = None
-    updated["mic_device_name"] = None
-    return updated
+def mic_selection_changes(device_index: int | None, device_name: str | None) -> dict:
+    """The two config keys that record which microphone is in use.
+
+    A *changes* dict for :meth:`~services.persistence_service.PersistenceService.update_config`,
+    never a config: ``(None, None)`` clears the selection so a device that has
+    gone is not restored on the next launch, and a real pair records the one
+    actually in use. Returning the whole config here is what let a microphone
+    write revert an engine swap.
+    """
+    return {"mic_device_index": device_index, "mic_device_name": device_name}
 
 
 def skip_audio_user_message(duration_seconds: float, max_level: float) -> str:
@@ -338,13 +342,19 @@ def should_show_hints_notice(
     return not bool(shown.get(engine_id))
 
 
-def remember_hints_notice(config: dict, engine_id: str) -> dict:
-    """Return a copy of ``config`` marking the notice as shown for ``engine_id``."""
+def hints_notice_changes(config: dict, engine_id: str) -> dict:
+    """The one config key that marks the notice as shown for ``engine_id``.
+
+    A *changes* dict for :meth:`~services.persistence_service.PersistenceService.update_config`,
+    carrying the whole ``hints_notice_shown`` map (the other engines' answers
+    are kept) and nothing else. ``config`` is only read, for the map it already
+    holds.
+    """
     assert config is not None, "config is required"
     assert engine_id, "engine_id is required"
     shown = dict(config.get(HINTS_NOTICE_KEY) or {})
     shown[engine_id] = True
-    return {**config, HINTS_NOTICE_KEY: shown}
+    return {HINTS_NOTICE_KEY: shown}
 
 
 def hints_notice_message(engine_name: str) -> str:
@@ -368,6 +378,75 @@ def push_to_talk_degraded_message(mode: str) -> str | None:
         f"Push-to-talk “{mode}” needs Accessibility to see the key release. "
         "Until it is granted, the shortcut toggles recording on and off instead."
     )
+
+
+def hotkey_registration_key(binding, mode: str, *, key_up_available: bool = True) -> tuple:
+    """What a hotkey registration has to match to be left alone.
+
+    The binding and the press mode, plus the one fact that can make a live
+    registration wrong without either of them moving: whether the key-up the
+    mode needs is actually being delivered. ``toggle`` never asked for one, so
+    its absence is not a degradation.
+
+    Built twice — once for the registration in hand and once for the config —
+    and compared by :func:`should_reregister_hotkey`.
+    """
+    assert binding is not None, "binding is required"
+    assert mode, "mode is required"
+    satisfied = mode not in KEY_UP_MODES or bool(key_up_available)
+    return (binding, mode, satisfied)
+
+
+def should_reregister_hotkey(active_key, desired_key, *, registered: bool) -> bool:
+    """Whether ``reload_hotkey`` must tear the shortcut down and make it again.
+
+    Launch called it twice with the same answer. The 0.3 s startup timer and
+    ``applicationDidBecomeActive`` both reach it, so whichever ran second
+    unregistered a working Carbon hotkey and registered the identical one — two
+    registrations for one shortcut, the "Carbon cannot deliver key-up" warning
+    twice in every launch log, and a fresh :class:`PressController` dropped in
+    under a key that may already be held down.
+
+    So an unchanged binding over a live registration that is doing its job is a
+    no-op. Everything else registers: no registration, one the app has lost
+    track of, a binding or mode the user changed, and — the case that matters
+    after *Enable Shortcut Permission…* — a live registration that is missing
+    the key-up its mode needs.
+    """
+    if not registered or active_key is None:
+        return True
+    return active_key != desired_key
+
+
+#: What quitting does, in the order it has to do it. Every step frees something
+#: that outlives the process otherwise: a 2 GB ``llama-server`` child, a Carbon
+#: hotkey macOS keeps until the app dies, a floating panel, a loaded model.
+#:
+#: The order is the whole of it. The live decoders are told to stop *first*,
+#: because one of them is inside ``engine.stream()`` and unloading the model
+#: under it is a crash in native code rather than an exception. The engine goes
+#: after the pill, which is what a half-drawn partial is still writing into.
+QUIT_STEPS: tuple[str, ...] = (
+    "cancel_stream_workers",
+    "stop_cleanup_runtime",
+    "close_pill",
+    "unload_engine",
+    "unregister_hotkey",
+)
+
+#: The ceiling on everything a quit waits for, added up. A quit that takes
+#: longer than this reads as a hang, and the OS reaps what is left anyway: every
+#: worker is a daemon thread and the cleanup child is terminated, not joined.
+QUIT_BUDGET_S = 3.0
+
+
+def quit_time_remaining(elapsed_s: float, *, budget_s: float = QUIT_BUDGET_S) -> float:
+    """How long the next quit step may block: what is left of the budget.
+
+    Never negative, so a step that overran cannot hand the next one a wait that
+    means "forever" once it is passed to ``Thread.join``.
+    """
+    return max(0.0, float(budget_s) - float(elapsed_s))
 
 
 def finalize_transcript(

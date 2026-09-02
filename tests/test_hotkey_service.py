@@ -31,6 +31,7 @@ from services.hotkey_service import (
     parse_codesign_details,
     permission_status_message,
     register_global_hotkey,
+    reset_key_up_warnings,
     unregister_global_hotkey,
 )
 
@@ -442,6 +443,12 @@ class PressControllerTableTests(unittest.TestCase):
 
 
 class KeyUpDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        # The Carbon key-up warning is logged once per binding per process, so
+        # each test starts from a process that has said nothing yet.
+        reset_key_up_warnings()
+        self.addCleanup(reset_key_up_warnings)
+
     def test_key_up_matches_on_keycode_alone(self):
         binding = HotkeyBinding(keycode=SPACE_KEYCODE, option=True)
         # Modifiers are usually released first, so the key-up carries no flags.
@@ -478,6 +485,71 @@ class KeyUpDeliveryTests(unittest.TestCase):
                     self.assertIn("key-up", warnings)
                 finally:
                     unregister_global_hotkey(registration)
+
+    def test_the_carbon_key_up_limitation_is_stated_once_per_process(self):
+        """It is a property of the installed library, not an event. Printing it
+        again on every registration is how a shortcut registered twice at launch
+        hid in the log as ordinary startup noise."""
+        mock_ns = MagicMock()
+        mock_ns.addGlobalMonitorForEventsMatchingMask_handler_.return_value = object()
+        mock_ns.addLocalMonitorForEventsMatchingMask_handler_.return_value = object()
+        logger = MagicMock()
+
+        def register():
+            return register_global_hotkey(
+                DEFAULT_HOTKEY,
+                lambda: None,
+                lambda _e: None,
+                logger,
+                on_key_up=lambda: None,
+                mode=HOTKEY_MODE_HOLD,
+            )
+
+        with patch("services.hotkey_service.hotkey_permissions_ok", return_value=True):
+            with patch("services.hotkey_service.NSEvent", mock_ns):
+                first = register()
+                second = register()
+                try:
+                    said = [
+                        call
+                        for call in logger.warning.call_args_list
+                        if "cannot deliver key-up" in str(call.args[0])
+                    ]
+                    self.assertEqual(len(said), 1)
+                finally:
+                    unregister_global_hotkey(first)
+                    unregister_global_hotkey(second)
+
+    def test_a_different_binding_is_still_worth_saying_once(self):
+        mock_ns = MagicMock()
+        mock_ns.addGlobalMonitorForEventsMatchingMask_handler_.return_value = object()
+        mock_ns.addLocalMonitorForEventsMatchingMask_handler_.return_value = object()
+        logger = MagicMock()
+        other = HotkeyBinding(keycode=SPACE_KEYCODE, control=True)
+
+        with patch("services.hotkey_service.hotkey_permissions_ok", return_value=True):
+            with patch("services.hotkey_service.NSEvent", mock_ns):
+                registrations = [
+                    register_global_hotkey(
+                        binding,
+                        lambda: None,
+                        lambda _e: None,
+                        logger,
+                        on_key_up=lambda: None,
+                        mode=HOTKEY_MODE_HOLD,
+                    )
+                    for binding in (DEFAULT_HOTKEY, other)
+                ]
+                try:
+                    said = [
+                        call
+                        for call in logger.warning.call_args_list
+                        if "cannot deliver key-up" in str(call.args[0])
+                    ]
+                    self.assertEqual(len(said), 2)
+                finally:
+                    for registration in registrations:
+                        unregister_global_hotkey(registration)
 
     def test_carbon_toggle_mode_needs_no_key_up_monitor(self):
         mock_ns = MagicMock()

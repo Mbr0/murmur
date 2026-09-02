@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 from app.config import (
     APP_CATALOG,
     APP_VERSION,
@@ -44,6 +46,8 @@ from app.decisions import (
     NOTICE_KEY_RATE_LIMITED,
     NOTICE_KEY_REJECTED,
     NO_MODEL_STATUS,
+    QUIT_BUDGET_S,
+    QUIT_STEPS,
     RELOAD_BUSY,
     RELOAD_RECORDING,
     RELOAD_START,
@@ -61,7 +65,6 @@ from app.decisions import (
     cleanup_notice_kind,
     cleanup_plan,
     cleanup_skipped_message,
-    clear_mic_device_selection,
     code_transform_language,
     configured_mode_id,
     download_progress_status,
@@ -69,12 +72,15 @@ from app.decisions import (
     expand_gated_snippets,
     finalize_transcript,
     gated_vocabulary,
+    hints_notice_changes,
     hints_notice_message,
     history_origin_for,
+    hotkey_registration_key,
     language_is_auto,
     launch_at_login_enabled,
     lease_is_present,
     login_item_service,
+    mic_selection_changes,
     missing_model_action,
     mode_menu_state,
     model_integrity_message,
@@ -88,9 +94,9 @@ from app.decisions import (
     prompt_language,
     publish_entitlements,
     push_to_talk_degraded_message,
+    quit_time_remaining,
     reapply_replacements,
     reload_engine_decision,
-    remember_hints_notice,
     remote_engine_key,
     resolve_engine_selection,
     resolve_mic_device,
@@ -106,6 +112,7 @@ from app.decisions import (
     should_reject_toggle,
     should_reject_upload,
     should_relaunch_after_install,
+    should_reregister_hotkey,
     should_show_hints_notice,
     should_toggle_for_press_action,
     skip_audio_user_message,
@@ -167,6 +174,8 @@ from services.hotkey_service import (
     HOTKEY_MODE_AUTO,
     HOTKEY_MODE_HOLD,
     HOTKEY_MODE_TOGGLE,
+    SPACE_KEYCODE,
+    HotkeyBinding,
 )
 from ui.onboarding_window import CONFIG_KEY_COMPLETED, CONFIG_KEY_VERSION, ONBOARDING_VERSION
 
@@ -273,13 +282,19 @@ class MicDeviceConfigTests(unittest.TestCase):
         devices = {0: "Built-in Mic", 1: "USB Mic"}
         self.assertEqual(resolve_mic_device(1, None, devices), 1)
 
-    def test_clear_mic_device_selection(self):
-        cleared = clear_mic_device_selection(
-            {"mic_device_index": 2, "mic_device_name": "USB Mic", "model": "base"}
+    def test_mic_selection_changes_carry_only_the_two_mic_keys(self):
+        # A changes dict for update_config, not a config: writing a whole
+        # config here reverted whatever the app saved while the menu was open.
+        self.assertEqual(
+            mic_selection_changes(2, "USB Mic"),
+            {"mic_device_index": 2, "mic_device_name": "USB Mic"},
         )
-        self.assertIsNone(cleared["mic_device_index"])
-        self.assertIsNone(cleared["mic_device_name"])
-        self.assertEqual(cleared["model"], "base")
+
+    def test_mic_selection_changes_clear_a_device_that_is_gone(self):
+        self.assertEqual(
+            mic_selection_changes(None, None),
+            {"mic_device_index": None, "mic_device_name": None},
+        )
 
 
 class SkipAudioMessageTests(unittest.TestCase):
@@ -463,24 +478,409 @@ class HintsNoticeTests(unittest.TestCase):
         )
 
     def test_remembering_it_stops_the_second_showing(self):
-        config = remember_hints_notice({}, "voxtral_mlx")
+        changes = hints_notice_changes({}, "voxtral_mlx")
         self.assertFalse(
-            should_show_hints_notice(config, "voxtral_mlx", hints_applied=False, has_terms=True)
+            should_show_hints_notice(changes, "voxtral_mlx", hints_applied=False, has_terms=True)
         )
 
-    def test_remembering_is_per_engine_and_does_not_mutate(self):
+    def test_remembering_writes_one_key_and_does_not_mutate(self):
+        # Only ``hints_notice_shown`` comes back: this is handed to
+        # update_config, and a whole config here would revert the engine the
+        # app swapped to during the dictation that raised the notice.
         original = {"vocabulary_terms": ["Boske"]}
-        config = remember_hints_notice(original, "voxtral_mlx")
+        changes = hints_notice_changes(original, "voxtral_mlx")
+        self.assertEqual(changes, {"hints_notice_shown": {"voxtral_mlx": True}})
         self.assertNotIn("hints_notice_shown", original)
-        self.assertEqual(config["vocabulary_terms"], ["Boske"])
+
+    def test_remembering_is_per_engine_and_keeps_the_other_answers(self):
+        changes = hints_notice_changes({"hints_notice_shown": {"whispercpp": True}}, "voxtral_mlx")
+        self.assertEqual(
+            changes["hints_notice_shown"], {"whispercpp": True, "voxtral_mlx": True}
+        )
         self.assertTrue(
-            should_show_hints_notice(config, "whispercpp", hints_applied=False, has_terms=True)
+            should_show_hints_notice(
+                {"hints_notice_shown": {"voxtral_mlx": True}},
+                "whispercpp",
+                hints_applied=False,
+                has_terms=True,
+            )
         )
 
     def test_notice_names_the_engine_and_nothing_else(self):
         message = hints_notice_message("whisper.cpp")
         self.assertIn("whisper.cpp", message)
         self.assertIn("Vocabulary hints", message)
+
+
+class HotkeyRegistrationIdempotenceTests(unittest.TestCase):
+    """Registering the same shortcut twice is a bug, not a refresh.
+
+    Launch used to do it every single time: the 0.3 s startup timer and
+    ``applicationDidBecomeActive`` both reach ``reload_hotkey``, so whichever
+    landed second tore down a working Carbon registration and made the very
+    same one again — two registrations, the "cannot deliver key-up" warning
+    twice in every log, and the press controller's state dropped underneath a
+    key that might already be down.
+    """
+
+    HOLD = HotkeyBinding(keycode=SPACE_KEYCODE, option=True)
+    OTHER = HotkeyBinding(keycode=SPACE_KEYCODE, control=True)
+
+    def test_nothing_registered_yet_always_registers(self):
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO)
+        self.assertTrue(should_reregister_hotkey(None, desired, registered=False))
+
+    def test_a_live_registration_of_the_same_binding_and_mode_is_left_alone(self):
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO, key_up_available=True)
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO)
+        self.assertFalse(should_reregister_hotkey(active, desired, registered=True))
+
+    def test_a_changed_binding_registers_again(self):
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO, key_up_available=True)
+        desired = hotkey_registration_key(self.OTHER, HOTKEY_MODE_AUTO)
+        self.assertTrue(should_reregister_hotkey(active, desired, registered=True))
+
+    def test_a_changed_mode_registers_again(self):
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_TOGGLE, key_up_available=True)
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_HOLD)
+        self.assertTrue(should_reregister_hotkey(active, desired, registered=True))
+
+    def test_a_degraded_registration_is_retried(self):
+        """Enable Shortcut Permission… grants Accessibility and reloads. The
+        binding has not moved, but the registration is missing the key-up the
+        mode needs, so this is the one unchanged binding worth registering
+        again."""
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_HOLD, key_up_available=False)
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_HOLD)
+        self.assertTrue(should_reregister_hotkey(active, desired, registered=True))
+
+    def test_toggle_never_counts_as_degraded(self):
+        # ``toggle`` never asked for key-up, so its absence changes nothing.
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_TOGGLE, key_up_available=False)
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_TOGGLE)
+        self.assertFalse(should_reregister_hotkey(active, desired, registered=True))
+
+    def test_a_registration_the_app_lost_track_of_registers_again(self):
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO)
+        self.assertTrue(should_reregister_hotkey(None, desired, registered=True))
+
+    def test_a_registration_that_went_away_registers_again(self):
+        active = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO, key_up_available=True)
+        desired = hotkey_registration_key(self.HOLD, HOTKEY_MODE_AUTO)
+        self.assertTrue(should_reregister_hotkey(active, desired, registered=False))
+
+
+class QuitOrderTests(unittest.TestCase):
+    """Quitting is bounded, and the order is the whole of it.
+
+    Every step frees something that outlives the process if it is skipped — a
+    2 GB child, a Carbon hotkey, a floating panel — and one of them can block.
+    So the order is a table and the waiting has a ceiling.
+    """
+
+    def test_the_order_is_the_one_the_teardown_needs(self):
+        self.assertEqual(
+            QUIT_STEPS,
+            (
+                "cancel_stream_workers",
+                "stop_cleanup_runtime",
+                "close_pill",
+                "unload_engine",
+                "unregister_hotkey",
+            ),
+        )
+
+    def test_the_stream_workers_are_told_to_stop_before_the_engine_is_unloaded(self):
+        # A live decoder is inside engine.stream(). Unloading under it is a
+        # crash in native code, not an exception.
+        steps = list(QUIT_STEPS)
+        self.assertLess(steps.index("cancel_stream_workers"), steps.index("unload_engine"))
+
+    def test_the_whole_quit_is_bounded(self):
+        self.assertLessEqual(QUIT_BUDGET_S, 3.0)
+
+    def test_the_budget_is_what_is_left_of_it(self):
+        self.assertAlmostEqual(quit_time_remaining(0.0), QUIT_BUDGET_S)
+        self.assertAlmostEqual(quit_time_remaining(1.0), QUIT_BUDGET_S - 1.0)
+
+    def test_a_spent_budget_never_waits_again(self):
+        self.assertEqual(quit_time_remaining(QUIT_BUDGET_S), 0.0)
+        self.assertEqual(quit_time_remaining(600.0), 0.0)
+
+
+class ReloadHotkeyTests(unittest.TestCase):
+    """``reload_hotkey`` wired to the decision, not just the decision.
+
+    Both launch callers reach it within the first second, so the skip has to
+    happen in the method itself; the log cannot show it, because the line that
+    would say so is below the level a release build records.
+    """
+
+    def _app(self, config=None):
+        app = SimpleNamespace(
+            _hotkey_registration=None,
+            _registered_hotkey=None,
+            _press_controller=None,
+            _hotkey_permission_notified=False,
+            _push_to_talk_degraded_notified=False,
+            runtime_config=lambda: dict(config or {"hotkey_mode": HOTKEY_MODE_AUTO}),
+            run_on_main_thread=lambda func: func(),
+            _stop_hotkey_retry=lambda: None,
+        )
+        app._live_hotkey_key = lambda binding, mode: MurmurApp._live_hotkey_key(
+            app, binding, mode
+        )
+        app._apply_key_up_availability = lambda mode: MurmurApp._apply_key_up_availability(
+            app, mode
+        )
+        app.reload_hotkey = lambda **kwargs: MurmurApp.reload_hotkey(app, **kwargs)
+        return app
+
+    def _registration(self, *, key_up_available=True):
+        from services.hotkey_service import HotkeyRegistration
+
+        return HotkeyRegistration(
+            unregister_fn=lambda: None, key_up_available=key_up_available
+        )
+
+    def test_the_second_launch_caller_does_not_register_the_same_shortcut_again(self):
+        app = self._app()
+        with patch(
+            "app.lifecycle.register_global_hotkey", return_value=self._registration()
+        ) as register:
+            with patch("app.lifecycle.unregister_global_hotkey") as unregister:
+                app.reload_hotkey(prompt=True)  # the 0.3 s startup timer
+                app.reload_hotkey(prompt=False)  # applicationDidBecomeActive
+        self.assertEqual(register.call_count, 1)
+        # And the working registration was never torn down to be remade.
+        self.assertEqual(
+            [call for call in unregister.call_args_list if call.args[0] is not None], []
+        )
+
+    def test_a_changed_shortcut_still_replaces_the_old_one(self):
+        app = self._app()
+        with patch(
+            "app.lifecycle.register_global_hotkey", return_value=self._registration()
+        ) as register:
+            with patch("app.lifecycle.unregister_global_hotkey") as unregister:
+                app.reload_hotkey()
+                app.runtime_config = lambda: {
+                    "hotkey_mode": HOTKEY_MODE_AUTO,
+                    "hotkey_keycode": 11,
+                }
+                app.reload_hotkey()
+        self.assertEqual(register.call_count, 2)
+        self.assertTrue(unregister.called)
+
+    def test_a_degraded_shortcut_is_registered_again_once_accessibility_lands(self):
+        """What Enable Shortcut Permission… is for: the binding has not moved,
+        but the registration is missing the key-up that ``auto`` needs."""
+        app = self._app()
+        registrations = [
+            self._registration(key_up_available=False),
+            self._registration(key_up_available=True),
+        ]
+        with patch(
+            "app.lifecycle.register_global_hotkey", side_effect=registrations
+        ) as register:
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                with patch("app.lifecycle.rumps.notification"):
+                    app.reload_hotkey()
+                    app.reload_hotkey()
+        self.assertEqual(register.call_count, 2)
+
+
+class WizardCaptureInterlockTests(unittest.TestCase):
+    """The wizard and the pipeline cannot both hold the microphone.
+
+    ``_record_test_sentence`` is the onboarding wizard's own five seconds. It
+    runs the same microphone and the same engine as a dictation, so the two
+    are kept apart by the flags the rest of the app already reads: it refuses
+    to start while one is in flight, and it marks the app busy for its whole
+    duration so a hotkey press during the wizard is refused rather than opening
+    a second input stream — or unloading the engine mid-transcription.
+    """
+
+    def _app(self, *, is_recording=False, is_processing=False, transcribe=None):
+        engine = SimpleNamespace(
+            is_loaded=True,
+            transcribe=transcribe or (lambda path, language=None: SimpleNamespace(text="hi")),
+        )
+        return SimpleNamespace(
+            is_recording=is_recording,
+            is_processing=is_processing,
+            engine=engine,
+            _engine_lock=threading.Lock(),
+        )
+
+    def _capture(self, chunks, *, on_start=None):
+        class FakeCapture:
+            def __init__(self, sample_rate=None, logger=None):
+                self.chunks = chunks
+
+            def start(self):
+                if on_start is not None:
+                    on_start()
+
+            def stop(self):
+                pass
+
+        return FakeCapture
+
+    def test_it_refuses_while_a_dictation_is_recording(self):
+        app = self._app(is_recording=True)
+        with patch("app.lifecycle.AudioCaptureService") as capture:
+            with self.assertRaises(RuntimeError):
+                MurmurApp._record_test_sentence(app)
+        self.assertFalse(capture.called)  # the second stream is never opened
+
+    def test_it_refuses_while_a_transcription_is_running(self):
+        app = self._app(is_processing=True)
+        with patch("app.lifecycle.AudioCaptureService") as capture:
+            with self.assertRaises(RuntimeError):
+                MurmurApp._record_test_sentence(app)
+        self.assertFalse(capture.called)
+
+    def test_it_marks_the_app_busy_for_its_whole_duration(self):
+        app = self._app()
+        busy_while_capturing = []
+        capture = self._capture(
+            [np.zeros(16, dtype=np.float32)],
+            on_start=lambda: busy_while_capturing.append(app.is_processing),
+        )
+        with patch("app.lifecycle.AudioCaptureService", capture):
+            with patch("app.lifecycle.time.sleep", lambda _s: None):
+                self.assertEqual(MurmurApp._record_test_sentence(app), "hi")
+        # A hotkey press landing here is refused by the flag the wizard set.
+        self.assertEqual(busy_while_capturing, [True])
+        self.assertTrue(
+            should_reject_toggle(loading=False, is_processing=True, model_ready=True)
+        )
+        self.assertFalse(app.is_processing)  # and released afterwards
+
+    def test_the_busy_flag_is_released_when_the_engine_raises(self):
+        def boom(_path, language=None):
+            raise EngineError("no")
+
+        app = self._app(transcribe=boom)
+        capture = self._capture([np.zeros(16, dtype=np.float32)])
+        with patch("app.lifecycle.AudioCaptureService", capture):
+            with patch("app.lifecycle.time.sleep", lambda _s: None):
+                with self.assertRaises(EngineError):
+                    MurmurApp._record_test_sentence(app)
+        self.assertFalse(app.is_processing)
+
+    def test_an_unloaded_engine_is_refused_before_the_microphone_opens(self):
+        app = self._app()
+        app.engine = None
+        with patch("app.lifecycle.AudioCaptureService") as capture:
+            with self.assertRaises(RuntimeError):
+                MurmurApp._record_test_sentence(app)
+        self.assertFalse(capture.called)
+        self.assertFalse(app.is_processing)
+
+
+class QuitTeardownTests(unittest.TestCase):
+    """``quit_app`` walks the table, and one broken step does not stop it."""
+
+    def _app(self, *, seen, engine=None, breaks=()):
+        cancelled = threading.Event()
+        app = SimpleNamespace(
+            engine=engine,
+            _engine_lock=threading.Lock(),
+            _stream_lock=threading.Lock(),
+            _stream_cancelled=cancelled,
+            _stream_workers=[],
+            _stream_thread=None,
+            _stream_token=None,
+            _hotkey_registration=object(),
+            _registered_hotkey=("binding", "auto", True),
+        )
+
+        def step(name):
+            def run():
+                seen.append(name)
+                if name in breaks:
+                    raise RuntimeError(f"{name} failed")
+
+            return run
+
+        app.cleanup_runtime = SimpleNamespace(stop=step("stop_cleanup_runtime"))
+        app.pill = SimpleNamespace(close=step("close_pill"))
+        app._cancel_stream_workers_for_quit = lambda started: (
+            seen.append("cancel_stream_workers"),
+            MurmurApp._cancel_stream_workers_for_quit(app, started),
+        )
+        app._unload_engine_for_quit = lambda: (
+            seen.append("unload_engine"),
+            MurmurApp._unload_engine_for_quit(app),
+        )
+        app._unregister_hotkey_for_quit = lambda: (
+            seen.append("unregister_hotkey"),
+            MurmurApp._unregister_hotkey_for_quit(app),
+        )
+        return app, cancelled
+
+    def test_every_step_runs_in_the_table_order(self):
+        seen = []
+        app, cancelled = self._app(seen=seen)
+        with patch("app.lifecycle.rumps.quit_application") as quit_application:
+            with patch("app.lifecycle.unregister_global_hotkey") as unregister:
+                MurmurApp.quit_app(app, None)
+        self.assertEqual(seen, list(QUIT_STEPS))
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(unregister.called)
+        self.assertTrue(quit_application.called)
+
+    def test_a_step_that_raises_does_not_strand_the_ones_after_it(self):
+        seen = []
+        app, _ = self._app(seen=seen, breaks=("stop_cleanup_runtime", "close_pill"))
+        with patch("app.lifecycle.rumps.quit_application") as quit_application:
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                MurmurApp.quit_app(app, None)
+        self.assertEqual(seen, list(QUIT_STEPS))
+        self.assertTrue(quit_application.called)
+
+    def test_the_model_is_given_back(self):
+        unloaded = []
+        engine = SimpleNamespace(unload=lambda: unloaded.append(True))
+        app, _ = self._app(seen=[], engine=engine)
+        with patch("app.lifecycle.rumps.quit_application"):
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                MurmurApp.quit_app(app, None)
+        self.assertEqual(unloaded, [True])
+        self.assertIsNone(app.engine)
+
+    def test_a_busy_engine_is_left_to_the_exiting_process(self):
+        """The engine lock is held for a whole transcription. Waiting for it
+        here is what a user reads as "Quit did nothing"."""
+        unloaded = []
+        engine = SimpleNamespace(unload=lambda: unloaded.append(True))
+        app, _ = self._app(seen=[], engine=engine)
+        app._engine_lock.acquire()
+        try:
+            with patch("app.lifecycle.rumps.quit_application"):
+                with patch("app.lifecycle.unregister_global_hotkey"):
+                    MurmurApp.quit_app(app, None)
+        finally:
+            app._engine_lock.release()
+        self.assertEqual(unloaded, [])
+
+    def test_a_decoder_that_will_not_stop_is_abandoned_inside_the_budget(self):
+        forever = threading.Event()
+        worker = threading.Thread(target=forever.wait, daemon=True)
+        worker.start()
+        try:
+            app, _ = self._app(seen=[])
+            app._stream_workers = [worker]
+            started = time.monotonic()
+            with patch("app.lifecycle.rumps.quit_application"):
+                with patch("app.lifecycle.unregister_global_hotkey"):
+                    MurmurApp.quit_app(app, None)
+            self.assertLess(time.monotonic() - started, QUIT_BUDGET_S + 1.0)
+        finally:
+            forever.set()
+            worker.join(1.0)
 
 
 class AboutAndUpdateCopyTests(unittest.TestCase):

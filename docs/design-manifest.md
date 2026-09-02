@@ -30,4 +30,4 @@ Current brand green is slightly brighter than Boske moss — low-priority harmon
 
 ## For agents
 
-AppKit/Cocoa styling only. Keep local-only trust copy aligned with `MANIFEST.md`. Theme constants live in `ui/theme.py`.
+AppKit/Cocoa styling only. Keep local-only trust copy aligned with `README.md`. Theme constants live in [`ui/theme.py`](../ui/theme.py); alerts in [`ui/alerts.py`](../ui/alerts.py); Settings tabs in [`ui/settings/`](../ui/settings/); other windows in [`ui/pill_window.py`](../ui/pill_window.py) and [`ui/onboarding_window.py`](../ui/onboarding_window.py).

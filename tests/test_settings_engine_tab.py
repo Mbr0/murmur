@@ -14,7 +14,7 @@ from services.model_profile_service import (
     CHIP_INTEL,
     VOXTRAL_MIN_RAM_GB,
 )
-from ui.download_sheet import CONFIG_ENGINE_ID, CONFIG_MODEL_ID
+from ui.download_sheet import CONFIG_ENGINE_ID, CONFIG_MODEL_ID, DownloadController
 from ui.settings.engine_tab import (
     BYOK_PROVIDERS,
     CLOUD_DOWNGRADED_NOTICE,
@@ -631,6 +631,81 @@ class TabIdentityTests(unittest.TestCase):
     def test_the_tab_names_itself(self):
         self.assertEqual(EngineTab.identifier, "engine")
         self.assertEqual(EngineTab.title, "Engine")
+
+
+class _FakeSheet:
+    """Just enough NSPanel for ``_end_sheet`` to put it away."""
+
+    def __init__(self):
+        self.ordered_out = False
+
+    def orderOut_(self, _sender):
+        self.ordered_out = True
+
+
+class _FakeStore:
+    """A ModelStore that never gets as far as a byte."""
+
+    def download(self, model_id, progress=None, cancel=None):  # pragma: no cover
+        raise AssertionError("the worker is never started in these tests")
+
+
+class CloseTests(unittest.TestCase):
+    """Closing Settings hands back the download in flight.
+
+    A 1.6 GB model takes minutes. Closing the window left the worker thread
+    running against a sheet whose window had gone: it drew progress into views
+    nobody could see, and finished into a tab that was no longer on screen.
+    Cancelling is not destructive — the ``.part`` file stays, so starting the
+    same download again resumes from where it stopped.
+    """
+
+    def _tab(self):
+        tab = EngineTab()
+        controller = DownloadController(
+            _FakeStore(),
+            dispatch=lambda run: None,  # the UI thread is not here
+            spawn=lambda run: None,  # and neither is the worker
+        )
+        tab._downloads = controller
+        return tab, controller
+
+    def test_a_download_in_flight_is_cancelled(self):
+        tab, controller = self._tab()
+        controller.start("whispercpp-turbo", total_bytes=1_600_000_000)
+        self.assertTrue(controller.is_running)
+
+        tab.close()
+
+        self.assertTrue(controller._cancel.is_set())
+
+    def test_the_sheet_is_taken_down(self):
+        tab, controller = self._tab()
+        controller.start("whispercpp-turbo")
+        sheet = _FakeSheet()
+        tab._sheet = sheet
+        tab._sheet_status = object()
+        tab._sheet_bar = object()
+        tab._downloading_id = "whispercpp-turbo"
+
+        tab.close()
+
+        self.assertTrue(sheet.ordered_out)
+        self.assertIsNone(tab._sheet)
+        self.assertIsNone(tab._sheet_status)
+        self.assertIsNone(tab._sheet_bar)
+        self.assertIsNone(tab._downloading_id)
+
+    def test_closing_a_tab_with_nothing_open_is_a_no_op(self):
+        # The window closes tabs whether or not they were ever built.
+        EngineTab().close()
+
+    def test_closing_twice_is_safe(self):
+        tab, controller = self._tab()
+        controller.start("whispercpp-turbo")
+        tab._sheet = _FakeSheet()
+        tab.close()
+        tab.close()
 
 
 if __name__ == "__main__":

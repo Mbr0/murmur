@@ -5,7 +5,9 @@ Pure logic over the app's config dict: no AppKit, no network, no files. The
 service is handed a ``config_store`` — any object with ``load() -> dict`` and
 ``save(dict)``, which the app satisfies by wrapping
 :meth:`services.persistence_service.PersistenceService.load_config` and
-``save_config`` — and a ``clock`` returning a :class:`~datetime.datetime`.
+``update_config`` (see :class:`app.services.UsageConfigStore`, which narrows the
+save to this service's own ten keys) — and a ``clock`` returning a
+:class:`~datetime.datetime`.
 
 Config keys (merge :data:`USAGE_DEFAULTS` into the app's ``DEFAULT_CONFIG``):
 

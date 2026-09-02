@@ -38,6 +38,7 @@ from services.hotkey_service import (
     hotkey_from_config,
     hotkey_mode_from_config,
     hotkey_permissions_ok,
+    hotkey_registration_active,
     is_bundled_app,
     log_hotkey_diagnostics,
     open_privacy_settings,
@@ -68,15 +69,20 @@ from app.config import (
     logger,
 )
 from app.decisions import (
+    QUIT_BUDGET_S,
+    QUIT_STEPS,
     SIGN_IN_MENU_TITLE,
     about_menu_title,
     account_menu_title,
     download_progress_status,
     engine_is_ready,
     history_origin_for,
+    hotkey_registration_key,
     login_item_service,
     push_to_talk_degraded_message,
+    quit_time_remaining,
     should_relaunch_after_install,
+    should_reregister_hotkey,
     should_toggle_for_press_action,
     update_available_message,
     update_installed_message,
@@ -325,6 +331,10 @@ class MurmurApp(MenuMixin, ServicesMixin, PipelineMixin, rumps.App):
 
         # Register global shortcut after the run loop is active.
         self._hotkey_registration = None
+        #: The binding, mode and key-up availability the live registration was
+        #: made for, so an unchanged shortcut is not registered twice. See
+        #: :func:`~app.decisions.should_reregister_hotkey`.
+        self._registered_hotkey = None
         self._hotkey_retry_timer = None
         self._hotkey_permission_notified = False
         self._push_to_talk_degraded_notified = False
@@ -655,12 +665,32 @@ class MurmurApp(MenuMixin, ServicesMixin, PipelineMixin, rumps.App):
         self.reload_hotkey(prompt=True)
 
     def reload_hotkey(self, *, prompt: bool = False):
-        """Apply the shortcut from settings, replacing any previous registration."""
+        """Apply the shortcut from settings, replacing any previous registration.
+
+        A shortcut that is already registered exactly as configured — and is
+        actually delivering what its mode needs — is left alone. Two callers
+        reach this within the first second of every launch (the 0.3 s startup
+        timer and ``applicationDidBecomeActive``), and re-registering the same
+        binding cost a duplicate Carbon hotkey, a duplicate warning in the log,
+        and a press controller reset under a key that might be held down.
+        """
         config = self.runtime_config()
         binding = hotkey_from_config(config)
         mode = hotkey_mode_from_config(config)
+        desired = hotkey_registration_key(binding, mode)
+        if not should_reregister_hotkey(
+            self._registered_hotkey,
+            desired,
+            registered=hotkey_registration_active(self._hotkey_registration),
+        ):
+            logger.info(
+                "Shortcut %s is already registered as configured; leaving it alone",
+                format_hotkey(binding),
+            )
+            return
         unregister_global_hotkey(self._hotkey_registration)
         self._hotkey_registration = None
+        self._registered_hotkey = None
         self._press_controller = PressController(mode)
 
         def trigger_key_down():
@@ -683,6 +713,7 @@ class MurmurApp(MenuMixin, ServicesMixin, PipelineMixin, rumps.App):
                 mode=mode,
             )
             self._apply_key_up_availability(mode)
+            self._registered_hotkey = self._live_hotkey_key(binding, mode)
             self._stop_hotkey_retry()
             self._hotkey_permission_notified = False
             if is_bundled_app():
@@ -732,6 +763,7 @@ class MurmurApp(MenuMixin, ServicesMixin, PipelineMixin, rumps.App):
                 mode=mode,
             )
             self._apply_key_up_availability(mode)
+            self._registered_hotkey = self._live_hotkey_key(binding, mode)
             self._stop_hotkey_retry()
             self._hotkey_permission_notified = False
         except Exception as error:
@@ -757,6 +789,22 @@ class MurmurApp(MenuMixin, ServicesMixin, PipelineMixin, rumps.App):
                     message,
                 )
     
+    def _live_hotkey_key(self, binding, mode):
+        """What the registration in hand is, key-up availability included.
+
+        Compared against the configured one on the next reload: a registration
+        that is missing the key-up its mode needs is worth making again once
+        Accessibility is granted, and an identical working one is not.
+        """
+        registration = self._hotkey_registration
+        return hotkey_registration_key(
+            binding,
+            mode,
+            key_up_available=bool(
+                registration is not None and registration.key_up_available
+            ),
+        )
+
     def _apply_key_up_availability(self, mode):
         """Tell the press controller whether key-up will really be delivered.
 
@@ -819,18 +867,90 @@ class MurmurApp(MenuMixin, ServicesMixin, PipelineMixin, rumps.App):
             logger.info("History cleared")
 
     def quit_app(self, _):
-        """Quit the application.
+        """Quit the application: free what outlives the process, then go.
 
-        The cleanup server is a child process holding a 2 GB model; leaving it
-        behind would keep that resident after Murmur is gone. Neither shutdown
-        may block the quit, so both are best effort.
+        Five things outlive a quit if nobody hands them back — a live decoder
+        inside ``engine.stream()``, the ``llama-server`` child holding a 2 GB
+        model, the floating pill's panel, the loaded model itself, and the
+        Carbon hotkey macOS keeps until the app dies. The order is
+        :data:`~app.decisions.QUIT_STEPS` and it is not arbitrary: the decoders
+        are told to stop before the engine is unloaded, because unloading a
+        model out from under a running decode is a crash in native code rather
+        than an exception.
+
+        Nothing here may hang. Every step is best effort, and the one thing
+        that waits at all — joining the live decoders — shares a single
+        :data:`~app.decisions.QUIT_BUDGET_S` budget across the whole quit. Past
+        it, the threads are abandoned: every one of them is a daemon, so the
+        interpreter takes them with it.
         """
-        try:
-            self.cleanup_runtime.stop()
-        except Exception as error:
-            logger.warning("Could not stop the cleanup server: %s", error)
-        try:
-            self.pill.close()
-        except Exception as error:
-            logger.warning("Could not close the pill: %s", error)
+        started = time.monotonic()
+        steps = {
+            "cancel_stream_workers": lambda: self._cancel_stream_workers_for_quit(started),
+            "stop_cleanup_runtime": self.cleanup_runtime.stop,
+            "close_pill": self.pill.close,
+            "unload_engine": self._unload_engine_for_quit,
+            "unregister_hotkey": self._unregister_hotkey_for_quit,
+        }
+        for name in QUIT_STEPS:
+            try:
+                steps[name]()
+            except Exception as error:  # noqa: BLE001 - a quit always finishes
+                logger.warning("Quit step %s did not finish cleanly: %s", name, error)
+        logger.info("Quit teardown took %.2fs", time.monotonic() - started)
         rumps.quit_application()
+
+    def _cancel_stream_workers_for_quit(self, started):
+        """Tell every live decoder to stop, then wait out what is left of the budget.
+
+        The cancel Event is what a worker checks between partials, so setting it
+        is the whole of the ask; the join only exists so the engine is not
+        unloaded while one is still inside it. A worker that ignores the budget
+        is abandoned rather than waited on — it is a daemon thread, and the
+        model it is holding is about to go with the process anyway.
+        """
+        with self._stream_lock:
+            cancelled, self._stream_cancelled = self._stream_cancelled, None
+            workers = [worker for worker in self._stream_workers if worker.is_alive()]
+            self._stream_workers = []
+            self._stream_thread = None
+            self._stream_token = None
+        if cancelled is not None:
+            cancelled.set()
+        for worker in workers:
+            remaining = quit_time_remaining(time.monotonic() - started)
+            if remaining <= 0:
+                break
+            worker.join(remaining)
+        still_running = [worker for worker in workers if worker.is_alive()]
+        if still_running:
+            logger.warning(
+                "%d live decoder(s) still running after %.0fs; quitting without them",
+                len(still_running),
+                QUIT_BUDGET_S,
+            )
+
+    def _unload_engine_for_quit(self):
+        """Give the model back, without ever waiting for the engine lock.
+
+        The lock is held for the whole of a transcription. Blocking on it here
+        would make a quit during a slow decode look like a hang, and the memory
+        is freed by the exiting process either way — so a busy engine is simply
+        left to it.
+        """
+        engine, self.engine = self.engine, None
+        if engine is None:
+            return
+        if not self._engine_lock.acquire(blocking=False):
+            logger.info("The engine is busy; leaving it to the exiting process")
+            return
+        try:
+            engine.unload()
+        finally:
+            self._engine_lock.release()
+
+    def _unregister_hotkey_for_quit(self):
+        """Hand the Carbon hotkey back; macOS holds it for the life of the process."""
+        registration, self._hotkey_registration = self._hotkey_registration, None
+        self._registered_hotkey = None
+        unregister_global_hotkey(registration)

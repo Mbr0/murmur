@@ -1013,6 +1013,28 @@ class EngineTab:
         self._end_sheet()
         self.refresh()
 
+    # -- closing ---------------------------------------------------------
+
+    def close(self) -> None:
+        """Hand back the download in flight when Settings goes away.
+
+        Asked for by :meth:`ui.settings.window.SettingsWindowController.close_tabs`
+        however the window was closed. A 1.6 GB model takes minutes, and without
+        this the worker thread carried on against a sheet whose window had gone:
+        it pushed progress into views nobody could see and finished into a tab
+        that was no longer on screen.
+
+        Cancelling is not throwing the download away. The store keeps the
+        ``.part`` file, so starting the same model again resumes from where this
+        stopped — which is why closing the window is allowed to do it silently.
+        """
+        downloads = self._downloads
+        if downloads is not None and downloads.is_running:
+            logger.info("Settings closed during a download; cancelling it")
+            downloads.cancel()
+        self._downloading_id = None
+        self._end_sheet()
+
     def _end_sheet(self) -> None:
         if self._sheet is None:
             return

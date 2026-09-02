@@ -114,7 +114,7 @@ class PersistenceServiceTests(unittest.TestCase):
             self.assertFalse(legacy_history.exists())
             self.assertFalse(legacy_audio.exists())
 
-    def test_save_config_sets_restrictive_file_permissions(self):
+    def test_update_config_sets_restrictive_file_permissions(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Path(tmp_dir) / "config.json"
             history = Path(tmp_dir) / "history.json"
@@ -123,7 +123,7 @@ class PersistenceServiceTests(unittest.TestCase):
                 logger=TestLogger(),
             )
 
-            service.save_config({"model": "small", "save_audio": False})
+            service.update_config({"model": "small", "save_audio": False})
 
             mode = stat.S_IMODE(config.stat().st_mode)
             self.assertEqual(mode, 0o600)
@@ -142,7 +142,7 @@ class PersistenceServiceTests(unittest.TestCase):
             mode = stat.S_IMODE(history.stat().st_mode)
             self.assertEqual(mode, 0o600)
 
-    def test_save_config_creates_file_with_owner_only_mode_atomically(self):
+    def test_update_config_creates_file_with_owner_only_mode_atomically(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Path(tmp_dir) / "config.json"
             history = Path(tmp_dir) / "history.json"
@@ -155,7 +155,7 @@ class PersistenceServiceTests(unittest.TestCase):
                 "services.persistence_service.os.open",
                 wraps=os.open,
             ) as mock_open:
-                service.save_config({"model": "small", "save_audio": False})
+                service.update_config({"model": "small", "save_audio": False})
 
             mock_open.assert_called()
             _path, flags, mode = mock_open.call_args.args[:3]
@@ -267,7 +267,7 @@ class PersistenceServiceTests(unittest.TestCase):
     def test_update_config_writes_only_the_given_keys(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = self._service(tmp_dir)
-            service.save_config({**DEFAULT_CONFIG, "language": "fr", "engine_id": "whispercpp"})
+            service.update_config({**DEFAULT_CONFIG, "language": "fr", "engine_id": "whispercpp"})
 
             merged = service.update_config({"language": "nl"})
 
@@ -280,7 +280,7 @@ class PersistenceServiceTests(unittest.TestCase):
         Save reverted whatever the app wrote while the window was up."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = self._service(tmp_dir)
-            service.save_config({**DEFAULT_CONFIG, "engine_id": None, "model_id": None})
+            service.update_config({**DEFAULT_CONFIG, "engine_id": None, "model_id": None})
 
             snapshot = service.load_config(dict(DEFAULT_CONFIG))  # window opens
             service.update_config({"engine_id": "whispercpp", "model_id": "turbo"})  # app writes
@@ -389,7 +389,7 @@ class PersistenceServiceTests(unittest.TestCase):
             # Fails loudly if DEFAULT_CONFIG gains a key this fixture forgot.
             self.assertEqual(set(full_config.keys()), set(DEFAULT_CONFIG.keys()))
 
-            service.save_config(full_config)
+            service.update_config(full_config)
             loaded = service.load_config(DEFAULT_CONFIG)
 
             self.assertEqual(loaded, full_config)
@@ -846,12 +846,33 @@ class DeleteAllDataTests(unittest.TestCase):
             audio_dir.mkdir()
             service = _service(tmp_dir)
             config = self._seeded_config()
+            service.update_config(config)
 
             service.delete_all_data(str(audio_dir), config, legacy_paths=())
             reloaded = service.load_config(dict(DEFAULT_CONFIG))
 
             self.assertEqual(reloaded["vocabulary_terms"], [])
             self.assertEqual(reloaded["engine_id"], "whispercpp")
+
+    def test_delete_all_data_keeps_a_key_written_while_the_dialog_was_up(self):
+        """The Privacy tab hands in the window's live config, which is as old as
+        the window. Saving that snapshot back reverted the engine the app had
+        swapped to while the user read the confirmation."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_dir = Path(tmp_dir) / "audio"
+            audio_dir.mkdir()
+            service = _service(tmp_dir)
+            config = self._seeded_config()
+            service.update_config(config)
+            # The app writes behind the open window.
+            service.update_config({"engine_id": "voxtral_mlx", "model_id": "voxtral-4bit"})
+
+            service.delete_all_data(str(audio_dir), config, legacy_paths=())
+            reloaded = service.load_config(dict(DEFAULT_CONFIG))
+
+            self.assertEqual(reloaded["engine_id"], "voxtral_mlx")
+            self.assertEqual(reloaded["model_id"], "voxtral-4bit")
+            self.assertEqual(reloaded["vocabulary_terms"], [])
 
     def test_delete_all_data_without_config_only_touches_files(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
