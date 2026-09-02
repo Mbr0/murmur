@@ -333,6 +333,68 @@ class EntitlementsTests(LicenseTestCase):
         self.assertFalse(entitlements.in_grace)
 
 
+class TrialMinutesTests(LicenseTestCase):
+    """``ent.trial_minutes``: the free cloud trial rides on a lease (D6)."""
+
+    def free_account_claims(self, minutes=60, **overrides):
+        ent = {"pro": False, "cloud_voice": False, "msm_minutes": 0}
+        if minutes is not None:
+            ent["trial_minutes"] = minutes
+        return claims(ent=ent, plan=None, **overrides)
+
+    def test_a_free_account_lease_carries_sixty_trial_minutes(self):
+        lease = self.verify(self.token(self.free_account_claims()))
+        self.assertEqual(lease.trial_minutes, 60)
+        self.assertFalse(lease.cloud_voice)
+        self.assertFalse(lease.pro)
+
+    def test_the_claim_is_optional_and_absent_means_zero(self):
+        lease = self.verify(self.token(self.free_account_claims(minutes=None)))
+        self.assertEqual(lease.trial_minutes, 0)
+
+    def test_a_paid_lease_carries_no_trial(self):
+        self.assertEqual(self.verify(self.token()).trial_minutes, 0)
+
+    def test_a_malformed_trial_claim_is_rejected(self):
+        for bad in ("60", 60.5, True, -1, [60], {"minutes": 60}):
+            with self.subTest(trial_minutes=bad):
+                payload = claims(
+                    ent={
+                        "pro": False,
+                        "cloud_voice": False,
+                        "msm_minutes": 0,
+                        "trial_minutes": bad,
+                    }
+                )
+                with self.assertRaises(LeaseError) as caught:
+                    self.verify(self.token(payload))
+                self.assertIn("trial_minutes", str(caught.exception))
+
+    def test_zero_is_a_legal_trial(self):
+        lease = self.verify(self.token(self.free_account_claims(minutes=0)))
+        self.assertEqual(lease.trial_minutes, 0)
+
+    def test_entitlements_carry_the_trial(self):
+        lease = self.verify(self.token(self.free_account_claims()))
+        entitlements = entitlements_from_lease(lease, NOW)
+        self.assertEqual(entitlements.trial_minutes, 60)
+        self.assertFalse(entitlements.cloud_voice)
+
+    def test_the_trial_stops_with_the_lease_like_every_other_cloud_minute(self):
+        payload = self.free_account_claims(
+            iat=NOW - 30 * SECONDS_PER_DAY, exp=NOW - SECONDS_PER_DAY
+        )
+        with self.assertRaises(LeaseExpired) as caught:
+            self.verify(self.token(payload))
+        entitlements = entitlements_from_lease(caught.exception.lease, NOW)
+        self.assertEqual(entitlements.trial_minutes, 0)
+
+    def test_no_lease_means_no_trial_at_all(self):
+        # There is no anonymous cloud endpoint: signing in is what starts the
+        # trial, so the free tier without a lease carries nothing.
+        self.assertEqual(Entitlements.none().trial_minutes, 0)
+
+
 class DeviceLinkTests(LicenseTestCase):
     def code_response(self, **overrides):
         payload = {
@@ -698,6 +760,41 @@ class LicenseServiceTests(LicenseTestCase):
         service, _store, _clock = self.build()
         with self.assertRaises(LinkError):
             service.poll_link()
+
+    # -- current_lease_token: what the cloud engine is handed --------------
+
+    def test_current_lease_token_returns_the_verified_token(self):
+        service, _store, _clock = self.build(token=self.token())
+        self.assertEqual(service.current_lease_token(), self.token())
+
+    def test_current_lease_token_is_none_without_a_lease(self):
+        service, _store, _clock = self.build()
+        self.assertIsNone(service.current_lease_token())
+
+    def test_current_lease_token_refuses_a_forged_token(self):
+        service, _store, _clock = self.build(token=make_token(self.other_key))
+        with self.assertLogs("services.license_service", level="WARNING"):
+            self.assertIsNone(service.current_lease_token())
+
+    def test_current_lease_token_refuses_an_expired_lease_even_in_grace(self):
+        # Grace is a Pro concession, not a cloud one: sending an expired lease
+        # to the proxy can only come back 401.
+        expired = self.token(claims(iat=NOW - 30 * SECONDS_PER_DAY, exp=NOW - SECONDS_PER_DAY))
+        service, _store, _clock = self.build(token=expired)
+        self.assertTrue(service.current_entitlements().in_grace)
+        with self.assertLogs("services.license_service", level="WARNING"):
+            self.assertIsNone(service.current_lease_token())
+
+    def test_current_lease_token_refuses_another_devices_lease(self):
+        service, _store, _clock = self.build(token=self.token(), device_id="dev_other")
+        with self.assertLogs("services.license_service", level="WARNING"):
+            self.assertIsNone(service.current_lease_token())
+
+    def test_current_lease_token_follows_a_sign_out(self):
+        service, _store, _clock = self.build(token=self.token())
+        self.assertIsNotNone(service.current_lease_token())
+        service.sign_out()
+        self.assertIsNone(service.current_lease_token())
 
 
 def entitlements(pro, cloud_voice, in_grace=False):

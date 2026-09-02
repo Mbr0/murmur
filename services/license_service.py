@@ -27,13 +27,21 @@ A lease is a compact JWS: ``base64url(header).base64url(payload).signature``.
                    Keychain grants nothing here
   ``iat``          issued-at, seconds since the epoch
   ``exp``          expiry, seconds since the epoch; required
-  ``ent``          ``{"pro": bool, "cloud_voice": bool, "msm_minutes": int}``
+  ``ent``          ``{"pro": bool, "cloud_voice": bool, "msm_minutes": int,
+                   "trial_minutes": int (optional, default 0)}``
   ``plan``         optional plan name, for display only
   ===============  ==========================================================
 
 ``msm_minutes`` is the monthly cloud-voice minute allowance. ``ent`` is
 mandatory and fully typed: a missing or mistyped flag is an error, never a
 silently-false default.
+
+``trial_minutes`` is the one exception that may be absent, and only because a
+paid lease has no use for it: it is the free cloud trial Boske grants a
+signed-in free account (``cloud_voice=false``, ``trial_minutes=60``). It is the
+reason the trial needs a Boske sign-in at all — there is no anonymous cloud
+endpoint, so the trial travels on a lease like everything else. Absent reads as
+zero; present but not a non-negative integer is an error like any other claim.
 
 Storage and logging rules
 -------------------------
@@ -200,6 +208,9 @@ class Lease:
     cloud_voice: bool
     msm_minutes: int
     plan: str | None = None
+    #: Free cloud trial the issuing account carries, in minutes. Zero on a paid
+    #: lease, which has ``cloud_voice`` instead.
+    trial_minutes: int = 0
 
     @property
     def lifetime_s(self) -> float:
@@ -228,10 +239,15 @@ class Entitlements:
     expires_at: float | None
     in_grace: bool
     source: str  # "lease" | "none"
+    #: Free cloud trial this account carries, in minutes. The router lets a
+    #: lease with ``cloud_voice=False`` reach Murmur Cloud while the usage
+    #: service still has trial seconds left; without a lease there is no trial,
+    #: because there is no anonymous cloud endpoint (decision D6).
+    trial_minutes: int = 0
 
     @classmethod
     def none(cls) -> "Entitlements":
-        """No license at all: free tier."""
+        """No license at all: free tier, and no trial without a sign-in."""
         return cls(
             pro=False,
             cloud_voice=False,
@@ -239,6 +255,7 @@ class Entitlements:
             expires_at=None,
             in_grace=False,
             source="none",
+            trial_minutes=0,
         )
 
 
@@ -318,7 +335,24 @@ def _require_number(claims: dict, name: str) -> float:
     return float(value)
 
 
-def _entitlement_claims(claims: dict) -> tuple[bool, bool, int, str | None]:
+def _trial_minutes_claim(ent: dict) -> int:
+    """``ent.trial_minutes``: optional, but a non-negative integer when present.
+
+    Absent means zero — a paid lease has no trial. Present and wrong (a string,
+    a float, a bool, a negative) raises, because a trial that reads as "some
+    minutes, we are not sure how many" would hand out free cloud time.
+    """
+    raw = ent.get("trial_minutes")
+    if raw is None:
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise LeaseError(
+            "lease entitlement 'trial_minutes' is not a non-negative integer"
+        )
+    return raw
+
+
+def _entitlement_claims(claims: dict) -> tuple[bool, bool, int, str | None, int]:
     ent = claims.get("ent")
     if not isinstance(ent, dict):
         raise LeaseError("lease claim 'ent' is missing or not an object")
@@ -329,10 +363,11 @@ def _entitlement_claims(claims: dict) -> tuple[bool, bool, int, str | None]:
         raise LeaseError("lease entitlement flags are missing or not booleans")
     if isinstance(msm_minutes, bool) or not isinstance(msm_minutes, int):
         raise LeaseError("lease entitlement 'msm_minutes' is missing or not an integer")
+    trial_minutes = _trial_minutes_claim(ent)
     plan = claims.get("plan")
     if plan is not None and not isinstance(plan, str):
         raise LeaseError("lease claim 'plan' is not a string")
-    return pro, cloud_voice, msm_minutes, plan
+    return pro, cloud_voice, msm_minutes, plan, trial_minutes
 
 
 def verify_lease(
@@ -395,7 +430,7 @@ def verify_lease(
     if "exp" not in claims:
         raise LeaseError("lease has no 'exp' claim")
     expires_at = _require_number(claims, "exp")
-    pro, cloud_voice, msm_minutes, plan = _entitlement_claims(claims)
+    pro, cloud_voice, msm_minutes, plan, trial_minutes = _entitlement_claims(claims)
 
     lease = Lease(
         issuer=issuer,
@@ -408,6 +443,7 @@ def verify_lease(
         cloud_voice=cloud_voice,
         msm_minutes=msm_minutes,
         plan=plan,
+        trial_minutes=trial_minutes,
     )
     if lease.is_expired(now):
         raise LeaseExpired("lease has expired", lease)
@@ -422,8 +458,8 @@ def entitlements_from_lease(
     """Turn a verified lease into entitlements, applying the grace window.
 
     Pro survives ``grace_days`` past ``exp`` (flagged ``in_grace`` so the UI
-    can nag); cloud voice and its minute allowance stop at ``exp`` itself,
-    because every cloud minute costs us money.
+    can nag); cloud voice, its minute allowance and the free trial stop at
+    ``exp`` itself, because every cloud minute costs us money.
     """
     expired = lease.is_expired(now)
     within_grace = now < lease.grace_ends_at(grace_days)
@@ -435,6 +471,7 @@ def entitlements_from_lease(
         expires_at=lease.expires_at,
         in_grace=pro and expired,
         source="lease",
+        trial_minutes=lease.trial_minutes if not expired else 0,
     )
 
 
@@ -658,6 +695,35 @@ class LicenseService:
     def device_id(self) -> str:
         """This Mac's device id; minted and stored on the first call."""
         return str(self._device_id_provider())
+
+    # -- the lease itself --------------------------------------------------
+
+    def current_lease_token(self) -> str | None:
+        """The stored lease token, but only when it still verifies.
+
+        This is what :class:`engines.cloud.CloudEngine` is handed as its
+        ``lease_provider``, so it is deliberately stricter than
+        :meth:`current_entitlements`: a token that is expired, tampered with or
+        issued to another Mac returns ``None`` rather than being sent to the
+        proxy as a bearer credential that can only come back 401. The grace
+        window is a *Pro* concession, not a cloud one.
+
+        Never logs the token, only the shape of the failure.
+        """
+        token = self._secret_store.get(LEASE_SECRET_NAME)
+        if not token:
+            return None
+        try:
+            verify_lease(
+                token,
+                public_key_pem=self._public_key_pem,
+                now=self._clock(),
+                device_id=self.device_id(),
+            )
+        except LeaseError as error:
+            self._logger.warning("Stored lease not usable for cloud: %s", error)
+            return None
+        return token
 
     # -- entitlements ------------------------------------------------------
 

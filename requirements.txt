@@ -32,3 +32,17 @@ pyperclip==1.11.0
 # 2026-09-02.
 mlx==0.32.2 ; platform_machine == "arm64"
 mlx-audio==0.5.1 ; platform_machine == "arm64"
+
+# License and cloud clients (Wave 4).
+#
+# cryptography verifies the Ed25519 signature on a Boske lease offline
+# (services/license_service.py). It is not macOS-only: the Linux CI job runs
+# the lease test vectors, which sign with a throwaway key.
+cryptography==50.0.1
+
+# The Keychain store (services/keychain.py) prefers PyObjC's Security bindings
+# and falls back to raw ctypes when they are absent, which is what it does on
+# every machine today. Pinned to the same family as the installed pyobjc-core
+# (12.2): mixing PyObjC framework versions across a major is how you get an
+# import that succeeds and a selector that does not.
+pyobjc-framework-Security==12.2 ; sys_platform == "darwin"
