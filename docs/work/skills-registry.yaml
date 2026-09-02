@@ -12,3 +12,7 @@ folders:
     plan: MASTER.md
     path: docs/work/active/2026-07-22-audit-followup-waves
 
+  2026-09-02-murmur-v2:
+    skill: murmur-v2
+    plan: MASTER.md
+    path: docs/work/active/2026-09-02-murmur-v2
