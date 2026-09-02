@@ -1,0 +1,194 @@
+# Competitive analysis, pricing and Boske reuse
+
+**Status:** Research — no code changes. Date: 2026-09-02.
+
+**Purpose:** Decide whether and how to price Murmur, what to build to reach parity with Superwhisper and the 2026 dictation market, and how Murmur fits into Boske.
+
+Sources are listed at the end. Items marked *(unverified)* could not be checked against a primary source from this environment (superwhisper.com is not reachable from the research sandbox).
+
+---
+
+## 1. Summary
+
+- Murmur 1.0.0 (June 2026) is a clean, private, single-purpose dictation utility. It has no AI cleanup, no vocabulary, no modes, no push-to-talk, no streaming, no auto-update, no licensing. It runs on `openai-whisper` + torch, which makes the bundle heavy and cold start slow.
+- The market has split in two. Cloud apps (Wispr Flow, Willow, Aqua, Typeless, Monologue) charge $12–15/month, cap free use at 1–8k words/week, and compete on AI formatting and context. Local apps (Superwhisper, MacWhisper, VoiceInk, BetterDictation, Voibe, Spokenly, Handy) sell one-time licenses of $25–149 or cheap subscriptions of $7–10/month, and compete on privacy.
+- Superwhisper is the benchmark for a local-first app. Its summer 2026 releases added on-device LLM cleanup with tone control (S1 / S1-mini), Parakeet models, Cohere Transcribe, coding-agent integration (Claude Code, OpenCode, Grok), CSV vocabulary import and a redesigned modes UI. Pricing: free local tier, Pro $8.49/month or $84.99/year, lifetime $249.99 *(unverified, some sources cite a rise to ~$849)*.
+- Apple's on-device SpeechAnalyzer in macOS 26 and Windows Voice Access make raw dictation free. Paid value now sits in AI cleanup, context awareness, vocabulary, modes and agent integration, not in transcription itself.
+- Recommended pricing: keep local dictation free and unlimited, sell a one-time Pro license around $49 for the smart layer, and include Pro in every Boske seat. Word caps make no sense for a local app.
+- Recommended reuse: bundle and cross-license Murmur with Boske first (low effort), point Murmur at Boske's existing whisper-server second, and defer a full port into the Electron desktop app.
+
+---
+
+## 2. Murmur today
+
+### Implemented (v1.0.0 plus PR #1 and #2)
+
+| Area | State |
+|------|-------|
+| Trigger | Toggle only (⌥Space default, configurable). Carbon hotkey first, NSEvent fallback. No push-to-talk. |
+| Engine | `openai-whisper` on MPS or CPU, tiny→large, model picked by RAM. Model change needs restart. |
+| Language | Auto-detect only, no picker, no `initial_prompt`. |
+| Insertion | Copy → synthetic ⌘V → restore clipboard after 0.4s. |
+| Post-processing | Rule-based only: skip clips < 1s or near-silent, drop known Whisper hallucination strings. |
+| History / audio | Optional local JSON history (100 entries) and WAV retention, both off by default. History window with playback. |
+| Extras | File transcription (clipboard only), mic picker, single-instance lock, manual update check against GitHub Releases, dark/light/system. |
+| Privacy | No telemetry, no cloud, no transcript logging. Files 0600/0700. |
+| Packaging | PyInstaller + DMG. Ad-hoc signed by default, Developer ID + notarization only when CI secrets exist. No Sparkle. |
+| Tests | ~93 unit tests on pure logic. No UI or end-to-end tests. |
+| Monetization | None. MIT license. No account, license, or feature-flag code. |
+
+### Gaps versus the market
+
+1. No AI cleanup or formatting (every competitor above the free tier has it).
+2. No custom vocabulary or replacements (cheapest possible win via Whisper `initial_prompt`).
+3. No app-aware modes or context (selected text, active app).
+4. No push-to-talk, no streaming or live text.
+5. Cold start and bundle size from torch + openai-whisper. Competitors run whisper.cpp, Parakeet on MLX, or Apple SpeechAnalyzer.
+6. No signed/notarized default build and no auto-update. Both are prerequisites for charging money.
+7. No onboarding wizard for permissions.
+8. No licensing or entitlement mechanism.
+
+---
+
+## 3. Superwhisper's 2026 update
+
+Continuous 2.x point releases, not a single relaunch. Notable items May–Aug 2026:
+
+| Date | Change |
+|------|--------|
+| ~Apr 2026 | Claude Code / OpenCode integration: voice piped into agent sessions. |
+| Jul 29 (2.17.0) | Cohere Transcribe as cloud ASR. Grok added as a coding agent. |
+| Aug 4 | Auto language detection for Cohere. Rebrand to "Superwhisper". |
+| Aug 6 | "S1" model family announced. Short silent clips skipped before transcription. |
+| Aug 17 (2.17.3) | Tone control for Message / Mail / Notes modes. Redesigned model sheet with download sizes. |
+| Aug 19 (2.18.0) | S1-mini: on-device LLM with tone control, no network. Local Mode auto-suggested for English keyboards. |
+| Undated 2026 | Redesigned Modes UI, GPT-5.5 BYOK, CSV vocabulary import, live waveform gating, Shortcuts deep links for start/stop. |
+
+Feature set: local Whisper (Fast/Nano/Standard/Pro/Ultra), local Parakeet V2/V3, cloud ASR (Cohere, Deepgram, ElevenLabs Scribe); modes with LLM rewrite (local S1 or cloud BYOK); context awareness from selected text, active window and clipboard; vocabulary; meeting mode; file transcription; Windows and iOS companions.
+
+Pricing: Free (small local models, 3 custom modes, meeting recording, 15-minute Pro trial), Pro $8.49/month or $84.99/year, lifetime $249.99 *(unverified)*, enterprise custom, 40% student discount, 30-day refund.
+
+Criticisms: proper-noun accuracy, audio saved by default, API keys in plaintext JSON, overwhelming settings, expensive lifetime tier, Windows and iOS lag behind Mac.
+
+---
+
+## 4. Competitor landscape
+
+| App | Processing | Engine | AI cleanup | Free tier | Paid |
+|-----|-----------|--------|------------|-----------|------|
+| Superwhisper | Local + optional cloud | whisper.cpp, Parakeet, Cohere, Deepgram | Yes, local S1 or cloud | Unlimited small local models | $8.49/mo, $84.99/yr, lifetime $249.99 *(unverified)* |
+| Wispr Flow | Cloud | Proprietary | Yes, context aware | 2,000 words/wk | $15/mo, $144/yr. Raised $280M at $2B (Aug 2026). |
+| Willow Voice | Cloud | Proprietary | Yes | 2,000 words/wk | $15/mo, $144/yr, team $10/user/mo |
+| Aqua Voice | Cloud | Proprietary | Yes, voice commands | 1,000 words | Pro $8/mo annual, Max $24/mo annual |
+| Typeless | Cloud | Proprietary | Yes | 8,000 words/wk | $30/mo or $144/yr |
+| Monologue (Every) | Hybrid | Local + cloud | Yes | 1,000 words once | $15/mo, $144/yr |
+| MacWhisper | Local | whisper.cpp | Optional (Pro) | tiny/base | €59 lifetime (Gumroad); $6.99/mo, $29.99/yr, $99.99 lifetime (App Store) |
+| VoiceInk | Local, GPL | whisper.cpp | Optional local LLM | Free from source | $25 / $39 / $49 one-time by device count |
+| BetterDictation | Local | Whisper on ANE | Pro tier | Limited | $39 lifetime, $49 + $2/mo Pro, $149 studio |
+| Voibe | Local or zero-retention cloud | Undisclosed | Limited | Refund only | $7.50/mo, $59/yr, $149 lifetime |
+| Spokenly | Local free, cloud Pro | Whisper, Parakeet, GPT-4o, Deepgram | Yes (Pro) | Unlimited local | $9.99/mo, BYOK |
+| Handy (open source) | Local | Whisper, Parakeet, Moonshine | No | Free | Donations |
+| Apple Dictation (macOS 26) | Local | SpeechAnalyzer | Apple Intelligence | Free | Free |
+
+### Pricing patterns
+
+- Cloud apps converge on $15/month or $144/year with 1–2k free words per week.
+- Local apps converge on $25–60 one-time for the basic app, $100–250 for premium lifetime, or $7–10/month when a subscription exists.
+- Free local tiers are unlimited. Word caps are only used where inference costs the vendor money.
+- Privacy is the top complaint category (Wispr Flow screenshot controversy), which is Murmur's strongest existing asset.
+- The built-in dictation from Apple and Microsoft is now good enough that "raw transcription" cannot be the paid feature.
+
+---
+
+## 5. Pricing proposal for Murmur
+
+### Constraints
+
+- Murmur is MIT. Anyone can fork the whole app. Feature gating only works if the gated code is not in the public repo or if the value is in signed binaries, models, services and support rather than code. VoiceInk (GPL + paid packaged builds) and MacWhisper prove that people pay for the convenient build even when source is open.
+- Local inference costs nothing per user, so a usage cap would only annoy people and push them to Handy or Apple Dictation.
+- Boske already prices per seat at €19–65/month and markets "Voice-ready". Murmur is a cheap, credible way to make that claim concrete.
+
+### Proposed ladder
+
+| Tier | Price | Contents |
+|------|-------|----------|
+| Free | $0, unlimited | Local Whisper/Parakeet dictation, toggle and push-to-talk, history, file transcription, vocabulary (basic), signed and notarized build, auto-update. |
+| Pro | $49 one-time per person, or included in any Boske seat | Local AI cleanup with modes and tone (Message, Mail, Notes, Code), context awareness, unlimited custom vocabulary and replacements with CSV import, snippets, coding-agent mode, priority support. Family/team pack at $99 for 3 Macs. |
+| Cloud add-on | $6/month or BYOK, billed through Boske | Cloud LLM cleanup and cloud ASR via Boske's llm-proxy for people who want the best accuracy. Only tier with per-use cost, so only tier that is metered. |
+
+Positioning: cheaper than Superwhisper lifetime by 5x, in line with VoiceInk and BetterDictation, and the only one bundled into a private AI workspace. Optional launch discount and 40% student pricing to match Superwhisper.
+
+Do not launch pricing before items 5, 6 and 8 in section 2 are done. An ad-hoc signed app with no auto-update cannot be sold.
+
+---
+
+## 6. Roadmap to reach parity
+
+### Phase 0 — foundation (required before selling)
+
+1. Replace `openai-whisper` + torch with whisper.cpp (matches Boske's existing `whisper-server`) or Parakeet via MLX. Cuts bundle size and cold start dramatically. Evaluate Apple SpeechAnalyzer on macOS 26 as a zero-download default.
+2. Add push-to-talk alongside toggle.
+3. Language picker and `initial_prompt` custom vocabulary. Small change, large accuracy gain on names.
+4. Developer ID signing + notarization by default, Sparkle auto-update, first-run permission wizard.
+5. Licensing: reuse Boske's `LicenseService` and Ed25519 lease tokens, offline-friendly.
+
+### Phase 1 — the smart layer (Pro)
+
+6. Local LLM cleanup: small GGUF model via llama.cpp (the same runtime Boske ships) with modes and tone control. This is Superwhisper's S1-mini equivalent. Keep it strictly offline by default.
+7. Context awareness: active app bundle id, window title, selected text, clipboard, used to pick the mode automatically.
+8. Vocabulary and replacements UI with CSV import. Snippets (voice command → text template).
+9. Streaming or partial live text with whisper.cpp stream mode or Parakeet.
+10. Coding-agent mode: dictation optimized for terminals and editors, and a Claude Code / Cursor integration.
+
+### Phase 2 — reach
+
+11. Meeting mode with system-audio capture and summary through Boske.
+12. Shortcuts deep links, menu-bar quick actions.
+13. iOS companion keyboard, Windows build (Boske desktop is Electron and cross-platform, which is another reason to converge).
+
+---
+
+## 7. Reuse in Boske
+
+Facts established from the Boske repo:
+
+- Boske desktop is Electron 39 with a `ServiceSupervisor` that already runs whisper.cpp `whisper-server` (10-model catalog, HF download, OpenAI-compatible `/v1/audio/transcriptions`), llama.cpp for LLMs, and Piper for TTS.
+- The companion feature already has global hotkeys (`Alt+Space`, `Alt+Shift+Space`), a tray icon, clipboard save/restore and macOS Accessibility permission handling.
+- The one primitive Boske lacks is injecting text into another app (Murmur's CGEvent ⌘V). Everything else Murmur does exists in some form.
+- Boske's `AGENTS.md` forbids Python on the desktop, so Murmur cannot be embedded as-is.
+- Both apps already share the Canopy Studio identity (`com.canopystudio.murmur`), and the design manifest targets Boske moss `#387033`.
+- Boske backend has an STT entitlement gate, rate limits, licensing service and voice usage metering in `llm-proxy`.
+
+Options, ranked by effort:
+
+| Option | Effort | Value | Recommendation |
+|--------|--------|-------|----------------|
+| A. Bundle: Murmur Pro included in every Boske seat, license issued by Boske's `LicenseService` | Low | Marketing claim becomes real, upsell path from free Murmur to Boske | Do first |
+| D. Shared account and licensing (Murmur validates the same lease tokens) | Low–medium | One purchase, one identity | Do with A |
+| C. Murmur uses Boske's running `whisper-server` and `llama-server` when Boske is installed | Medium | No duplicate models or processes, shared AI cleanup | After A and D; needs port discovery |
+| B. Port dictation-anywhere into Boske Electron (hotkey, tray, capture, whisper-server, text injection via nut-js or osascript, filters ported to TS) | High | Native cross-platform feature, no second app | Separate plan later |
+
+Portable as specifications, not code: `transcription_filters.py`, `transcription_service.py` resolution logic, `persistence_service.py` schemas, `model_profile_service.py` RAM tiering. Not portable: hotkey, audio capture, text insertion, `murmur.py` orchestration.
+
+---
+
+## 8. Open questions
+
+- Confirm Superwhisper's current lifetime price on superwhisper.com before quoting it anywhere.
+- Decide whether Pro code stays out of the MIT repo (closed module) or the repo moves to a source-available license. This decides how feature gating is enforced.
+- Decide the engine direction: whisper.cpp (aligns with Boske) versus Parakeet/MLX (fastest on Apple Silicon) versus Apple SpeechAnalyzer (no download, macOS 26 only).
+- The gitignored maintainer files (`MANIFEST.md`, `SHIPPING.md`, `LAUNCH_READINESS.md`) were not available in this checkout and may already answer some of this.
+
+---
+
+## Sources
+
+- Superwhisper changelog and docs: https://superwhisper.com/changelog · https://superwhisper.com/docs/models/voice · https://x.com/superwhisper/status/2041887677536952749 · https://news.ycombinator.com/item?id=47936169
+- Superwhisper pricing (secondary): https://spokenly.app/blog/superwhisper-pricing · https://www.getvoibe.com/resources/superwhisper-pricing/ · https://usevoicy.com/blog/superwhisper-pricing
+- Wispr Flow funding: https://techcrunch.com/2026/08/17/wispr-raises-280m-at-2b-valuation-as-it-looks-beyond-dictation/
+- Wispr Flow / MacWhisper / VoiceInk / Dragon pricing: https://www.getvoibe.com/resources/wispr-flow-pricing/ · https://www.getvoibe.com/resources/macwhisper-pricing/ · https://www.getvoibe.com/resources/voiceink-pricing/ · https://www.getvoibe.com/resources/dragon-pricing/
+- Willow / Aqua / Typeless: https://usevoicy.com/blog/willow-voice-pricing · https://aquavoice.com/pricing · https://usevoicy.com/blog/typeless-pricing
+- Monologue: https://www.monologue.to/pricing · Voibe: https://www.getvoibe.com/pricing/ · Spokenly: https://spokenly.app/pricing
+- Handy: https://github.com/OpenWhispr/openwhispr · VoiceInk: https://github.com/Beingpax/VoiceInk
+- Apple SpeechAnalyzer: https://9to5mac.com/2025/06/18/apple-devices-offer-amazing-speech-to-text-transcription-in-developer-betas-shows-test/
+- Nothing Essential Voice: https://techcrunch.com/2026/04/24/nothing-introduces-an-ai-powered-dictation-tool/
