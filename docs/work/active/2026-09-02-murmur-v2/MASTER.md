@@ -1,6 +1,6 @@
 # MASTER: Murmur v2
 
-**Status:** ✅ approved 2026-09-02 · Waves 0–2 merged (PRs #4–#6) · Wave 3 swap and Wave 4 wiring in progress
+**Status:** ✅ approved 2026-09-02 · Waves 0–3 merged (PRs #4–#7) · Wave 4 wiring in progress
 **Base branch:** `main` (after PR #2)
 **Source:** study in `../2026-09-02-competitive-analysis/`, Part II "What should change"
 
@@ -117,10 +117,10 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 | E3f (serial) | `murmur.py`, `settings_window.py` → `_archive/` | Swap the window; archive the old file with `git mv`. |
 
 **Done when**
-- [ ] All twelve existing config keys still round-trip; new keys documented in `persistence_service.py`
-- [ ] "What leaves the Mac" text matches the engine actually selected (tested per configuration)
-- [ ] No secret in JSON; Keychain read/write tested
-- [ ] Suite green
+- [x] All twelve existing config keys still round-trip; new keys documented in `persistence_service.py` (39 keys, completeness test)
+- [x] "What leaves the Mac" text matches the engine actually selected (tested per configuration, 10 configurations)
+- [x] No secret in JSON; Keychain read/write tested (fake backend + real Security.framework smoke on this Mac)
+- [x] Suite green (1235 tests, 2026-09-02)
 
 ## Wave 4 — License and cloud clients (PARALLEL, then serial wiring)
 
