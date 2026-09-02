@@ -350,6 +350,7 @@ class PersistenceServiceTests(unittest.TestCase):
                 "include_selection": True,
                 "cleanup_model_id": "ministral-3-3b-instruct-2512-q4_k_m",
                 "pill_enabled": False,
+                "cleanup_prewarm": False,
             }
             # Fails loudly if DEFAULT_CONFIG gains a key this fixture forgot.
             self.assertEqual(set(full_config.keys()), set(DEFAULT_CONFIG.keys()))
