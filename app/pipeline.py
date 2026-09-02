@@ -1329,8 +1329,16 @@ class PipelineMixin:
         # state only, which is what the pill's phases are for. Asked of the
         # engine's own declared capability (``Engine.supports_streaming``),
         # never of its id: a new streaming engine must not need a change here.
+        # Read through getattr even though the base class defines it: this line
+        # runs before the microphone is opened, so an engine that somehow does
+        # not carry the attribute would cost the whole recording rather than
+        # just the live pill.
         engine = self.engine
-        streaming = pill is not None and engine is not None and engine.supports_streaming
+        streaming = (
+            pill is not None
+            and engine is not None
+            and bool(getattr(engine, "supports_streaming", False))
+        )
 
         try:
             logger.info(f"Starting audio capture with sample rate {SAMPLE_RATE}")

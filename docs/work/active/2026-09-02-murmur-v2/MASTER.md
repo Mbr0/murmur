@@ -1,6 +1,6 @@
 # MASTER: Murmur v2
 
-**Status:** ✅ approved 2026-09-02 · Waves 0–4 merged (PRs #4–#8) · Wave 5 in progress
+**Status:** ✅ approved 2026-09-02 · Waves 0–5 delivered (PRs #4–#9) · open items: real-recording bake-off, CI runner pass, clean-account wizard run, Boske-side D6
 **Base branch:** `main` (after PR #2)
 **Source:** study in `../2026-09-02-competitive-analysis/`, Part II "What should change"
 
@@ -84,7 +84,7 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 - [x] Language and vocabulary hints reach both local engines; CSV round-trips (Voxtral reports hints_applied=False; whisper.cpp applies them)
 - [x] Model switch without restart; download progress visible; sha256 verified (also verified before every activation)
 - [x] CI produces a signed, notarized DMG when secrets exist; updater installs a signed build; bundle no longer contains torch (local build 220 MB DMG; CI path not yet exercised with real secrets)
-- [ ] Wizard completes on a clean macOS user account (state machine tested; needs a manual run on a clean account)
+- [ ] Wizard completes on a clean macOS user account (state machine tested; all five steps build headlessly; needs a manual run on a clean account)
 - [x] Suite green (536 tests, 2026-09-02)
 
 ## Wave 2 — Smart layer, what Pro sells (PARALLEL, then serial wiring)
@@ -145,9 +145,9 @@ Moves happen only in Wave 5. Waves 0–4 add new packages next to the existing f
 | E5 | `murmur.py`, `app/**`, `ui/**`, `services/**`, `tests/**` | Move the state machine, menu and lifecycle out of `murmur.py` into `app/`. `git mv` old UI files into `ui/`. Integration tests: fixture audio through each local engine end to end (skipped when the runtime is absent), paste flow with a fake pasteboard. CI runs unit on Linux and integration on macOS. |
 
 **Done when**
-- [ ] `murmur.py` under 100 lines
-- [ ] Integration suite green on the macOS runner
-- [ ] `pip-audit` clean
+- [x] `murmur.py` under 100 lines (43; `app/` holds config, decisions, services, pipeline, menu, windows, lifecycle)
+- [ ] Integration suite green on the macOS runner (green locally: 11 tests, whisper.cpp ×4 languages, Voxtral batch + streaming, llama-server cleanup, paste flow; CI job added, not yet observed on a runner)
+- [x] `pip-audit` clean (2026-09-02, local; also a CI step)
 
 ---
 

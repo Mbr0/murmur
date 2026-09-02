@@ -7,6 +7,7 @@ disk. The tab is handed a catalog plus two callables (``installed`` and
 
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from engines.model_store import ModelFile, ModelSpec
 from services.model_profile_service import (
@@ -14,7 +15,12 @@ from services.model_profile_service import (
     CHIP_INTEL,
     VOXTRAL_MIN_RAM_GB,
 )
-from ui.download_sheet import CONFIG_ENGINE_ID, CONFIG_MODEL_ID, DownloadController
+from ui.download_sheet import (
+    CONFIG_ENGINE_ID,
+    CONFIG_MODEL_ID,
+    DownloadController,
+    DownloadSheetState,
+)
 from ui.settings.engine_tab import (
     BYOK_PROVIDERS,
     CLOUD_DOWNGRADED_NOTICE,
@@ -651,13 +657,14 @@ class _FakeStore:
 
 
 class CloseTests(unittest.TestCase):
-    """Closing Settings hands back the download in flight.
+    """Closing Settings takes the sheet down and leaves the download alone.
 
-    A 1.6 GB model takes minutes. Closing the window left the worker thread
-    running against a sheet whose window had gone: it drew progress into views
-    nobody could see, and finished into a tab that was no longer on screen.
-    Cancelling is not destructive — the ``.part`` file stays, so starting the
-    same download again resumes from where it stopped.
+    A 1.6 GB model takes minutes, and the user who started it wants it whether
+    or not the window is still up — killing it because they closed Settings is
+    the regression this class exists for. What must go is the *sheet*: the
+    worker used to push progress into views nobody could see. So the sheet is
+    detached, the controller runs to completion, and its callbacks tolerate
+    having no sheet to draw into. Only the sheet's own Cancel button cancels.
     """
 
     def _tab(self):
@@ -670,12 +677,21 @@ class CloseTests(unittest.TestCase):
         tab._downloads = controller
         return tab, controller
 
-    def test_a_download_in_flight_is_cancelled(self):
+    def test_a_download_in_flight_is_left_running(self):
         tab, controller = self._tab()
         controller.start("whispercpp-turbo", total_bytes=1_600_000_000)
         self.assertTrue(controller.is_running)
 
         tab.close()
+
+        self.assertFalse(controller._cancel.is_set())
+        self.assertTrue(controller.is_running)
+
+    def test_only_the_cancel_button_cancels(self):
+        tab, controller = self._tab()
+        controller.start("whispercpp-turbo")
+
+        tab._cancel_clicked(None)
 
         self.assertTrue(controller._cancel.is_set())
 
@@ -694,6 +710,28 @@ class CloseTests(unittest.TestCase):
         self.assertIsNone(tab._sheet)
         self.assertIsNone(tab._sheet_status)
         self.assertIsNone(tab._sheet_bar)
+        # The id stays: the download is still running and the model it
+        # installs still has to be put to work when it lands.
+        self.assertEqual(tab._downloading_id, "whispercpp-turbo")
+
+    def test_a_download_that_finishes_after_the_close_is_still_installed(self):
+        tab, controller = self._tab()
+        finished = []
+        tab.model = SimpleNamespace(
+            on_download_finished=lambda model_id: finished.append(model_id)
+        )
+        controller.start("whispercpp-turbo")
+        tab._sheet = _FakeSheet()
+        tab._sheet_status = object()
+        tab._sheet_bar = object()
+        tab._downloading_id = "whispercpp-turbo"
+
+        tab.close()
+        state = DownloadSheetState("whispercpp-turbo")
+        state.mark_done()
+        tab._download_changed(state)  # the worker's last hop, sheet long gone
+
+        self.assertEqual(finished, ["whispercpp-turbo"])
         self.assertIsNone(tab._downloading_id)
 
     def test_closing_a_tab_with_nothing_open_is_a_no_op(self):

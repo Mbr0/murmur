@@ -106,6 +106,7 @@ written before Wave 3 read back as ``origin="local"``.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -431,6 +432,8 @@ class PersistenceService:
         self,
         changes: dict[str, Any],
         default: dict[str, Any] | None = None,
+        *,
+        remove: Iterable[str] = (),
     ) -> dict[str, Any]:
         """Merge ``changes`` into the config on disk and return the merged result.
 
@@ -440,12 +443,23 @@ class PersistenceService:
         touched and it writing back the snapshot it loaded when the window
         opened — which used to revert ``engine_id``, ``onboarding_completed``
         and anything else the app had written while the window was up.
+
+        ``remove`` names keys that must stop existing, which a merge cannot
+        express: every value in ``changes`` writes something, so a caller with
+        a key to *delete* had no way to say so and deleted it from its own copy
+        instead — leaving the key on disk while reporting it gone. The keys are
+        dropped after the merge, under the same lock. Removing one that is not
+        there is not an error, and removing one that has an entry in
+        ``DEFAULT_CONFIG`` returns it to that default rather than making it
+        vanish: the defaults are merged back in on the next load.
         """
         assert changes is not None, "changes is required"
         base = DEFAULT_CONFIG if default is None else default
         with _CONFIG_LOCK:
             config = self.load_config(dict(base))
             config.update(changes)
+            for key in remove:
+                config.pop(key, None)
             self._save_config_snapshot(config)
             return config
 
@@ -552,7 +566,15 @@ class PersistenceService:
             # revert the engine the app swapped to while the user was reading
             # the confirmation. It is still updated in place, because the tabs
             # are holding this same object.
+            #
+            # Two shapes of clearing, and both have to reach the file. A key
+            # with a documented default is *reset* to it and written back; one
+            # owned by a feature that documents none is *deleted*, which a
+            # merge cannot say — so it goes through ``remove``. Dropping it
+            # from this dict alone is what let ``removed_keys`` report a key as
+            # gone while it was still on disk.
             changes: dict[str, Any] = {}
+            removals: list[str] = []
             for key in USER_CONTENT_CONFIG_KEYS:
                 if key not in config:
                     continue
@@ -562,9 +584,10 @@ class PersistenceService:
                 else:
                     # Owned by a feature that documents no default of its own.
                     del config[key]
+                    removals.append(key)
                 removed_keys.append(key)
-            if changes:
-                self.update_config(changes)
+            if changes or removals:
+                self.update_config(changes, remove=tuple(removals))
 
         return DeletionSummary(
             history_entries=history_entries,

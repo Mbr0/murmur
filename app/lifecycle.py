@@ -69,7 +69,6 @@ from app.config import (
     logger,
 )
 from app.decisions import (
-    QUIT_BUDGET_S,
     QUIT_STEPS,
     SIGN_IN_MENU_TITLE,
     about_menu_title,
@@ -114,6 +113,21 @@ class _HotkeyActivationObserver(NSObject):
 
     def applicationDidBecomeActive_(self, _notification):
         self._callback()
+
+
+def _hand_back(owner, method_name):
+    """Call ``owner.method_name()`` when there is one, and say so when there is not.
+
+    The quit table names things :meth:`MurmurApp.__init__` builds in order, and
+    a quit can arrive before it has built them — the menu bar exists from the
+    first ``rumps`` call, the pill and the cleanup runtime a few lines later.
+    Missing is therefore "nothing to hand back", not an error: the resource
+    this step exists to free was never taken in the first place.
+    """
+    if owner is None:
+        logger.info("Nothing to %s: it was never started", method_name)
+        return
+    getattr(owner, method_name)()
 
 
 def _activate_existing_instance():
@@ -635,8 +649,19 @@ class MurmurApp(MenuMixin, ServicesMixin, PipelineMixin, rumps.App):
         self.reload_hotkey(prompt=False)
 
     def _on_application_active(self):
-        """Pick up Accessibility grants as soon as the user returns to Murmur."""
-        if hotkey_permissions_ok() and self._hotkey_registration is None:
+        """Pick up Accessibility grants as soon as the user returns to Murmur.
+
+        Whether anything is actually re-registered is
+        :func:`~app.decisions.should_reregister_hotkey`'s call, not this
+        method's. Asking only when there was *no* registration at all was the
+        bug: Carbon registers happily without Accessibility, so the app came
+        back from the permission trip holding a registration that could not
+        see key-up — and ``hold`` and ``auto`` stayed degraded to toggle until
+        the next launch. A working registration is still left alone, because
+        the decision compares the key-up the mode needs against the one the
+        live registration has.
+        """
+        if hotkey_permissions_ok():
             self.reload_hotkey(prompt=False)
 
     def _schedule_hotkey_retry(self):
@@ -878,36 +903,52 @@ class MurmurApp(MenuMixin, ServicesMixin, PipelineMixin, rumps.App):
         model out from under a running decode is a crash in native code rather
         than an exception.
 
-        Nothing here may hang. Every step is best effort, and the one thing
-        that waits at all — joining the live decoders — shares a single
-        :data:`~app.decisions.QUIT_BUDGET_S` budget across the whole quit. Past
-        it, the threads are abandoned: every one of them is a daemon, so the
-        interpreter takes them with it.
+        Nothing here may hang. Every step is best effort and every step is
+        handed what is left of the single :data:`~app.decisions.QUIT_BUDGET_S`
+        budget. Only one of them can actually block — joining the live
+        decoders — and it is the only one that reads its argument; the other
+        four are non-blocking hand-backs (a ``terminate``, an ``orderOut_``, a
+        ``free``, an ``UnregisterEventHotKey``) with nothing to bound. Past the
+        budget the decoder threads are abandoned: every one of them is a
+        daemon, so the interpreter takes them with it.
+
+        The steps are bound lazily, and that is not a style choice. Reaching
+        ``self.cleanup_runtime.stop`` while building the table raised
+        ``AttributeError`` before ``rumps.quit_application()`` on any quit that
+        arrived before ``__init__`` had finished making them — which is to say
+        Quit did nothing at all.
         """
         started = time.monotonic()
         steps = {
-            "cancel_stream_workers": lambda: self._cancel_stream_workers_for_quit(started),
-            "stop_cleanup_runtime": self.cleanup_runtime.stop,
-            "close_pill": self.pill.close,
-            "unload_engine": self._unload_engine_for_quit,
-            "unregister_hotkey": self._unregister_hotkey_for_quit,
+            "cancel_stream_workers": self._cancel_stream_workers_for_quit,
+            "stop_cleanup_runtime": lambda _budget: _hand_back(
+                getattr(self, "cleanup_runtime", None), "stop"
+            ),
+            "close_pill": lambda _budget: _hand_back(getattr(self, "pill", None), "close"),
+            "unload_engine": lambda _budget: self._unload_engine_for_quit(),
+            "unregister_hotkey": lambda _budget: self._unregister_hotkey_for_quit(),
         }
         for name in QUIT_STEPS:
             try:
-                steps[name]()
+                steps[name](quit_time_remaining(time.monotonic() - started))
             except Exception as error:  # noqa: BLE001 - a quit always finishes
                 logger.warning("Quit step %s did not finish cleanly: %s", name, error)
         logger.info("Quit teardown took %.2fs", time.monotonic() - started)
         rumps.quit_application()
 
-    def _cancel_stream_workers_for_quit(self, started):
-        """Tell every live decoder to stop, then wait out what is left of the budget.
+    def _cancel_stream_workers_for_quit(self, budget_s):
+        """Tell every live decoder to stop, then wait out ``budget_s`` for them.
 
         The cancel Event is what a worker checks between partials, so setting it
         is the whole of the ask; the join only exists so the engine is not
         unloaded while one is still inside it. A worker that ignores the budget
         is abandoned rather than waited on — it is a daemon thread, and the
         model it is holding is about to go with the process anyway.
+
+        An abandoned worker stays in ``_stream_workers``. Emptying the list
+        unconditionally is what let :meth:`_unload_engine_for_quit`, one step
+        later, believe the engine was idle while a decoder was still reading
+        the model.
         """
         with self._stream_lock:
             cancelled, self._stream_cancelled = self._stream_cancelled, None
@@ -917,29 +958,43 @@ class MurmurApp(MenuMixin, ServicesMixin, PipelineMixin, rumps.App):
             self._stream_token = None
         if cancelled is not None:
             cancelled.set()
+        deadline = time.monotonic() + max(0.0, float(budget_s))
         for worker in workers:
-            remaining = quit_time_remaining(time.monotonic() - started)
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             worker.join(remaining)
         still_running = [worker for worker in workers if worker.is_alive()]
         if still_running:
+            with self._stream_lock:
+                self._stream_workers = still_running
             logger.warning(
-                "%d live decoder(s) still running after %.0fs; quitting without them",
+                "%d live decoder(s) still running after %.1fs; quitting without them",
                 len(still_running),
-                QUIT_BUDGET_S,
+                float(budget_s),
             )
 
     def _unload_engine_for_quit(self):
-        """Give the model back, without ever waiting for the engine lock.
+        """Give the model back, unless something is still reading it.
 
-        The lock is held for the whole of a transcription. Blocking on it here
-        would make a quit during a slow decode look like a hang, and the memory
-        is freed by the exiting process either way — so a busy engine is simply
-        left to it.
+        Two holders, and neither is waited for. The engine lock is held for the
+        whole of a transcription, so blocking on it here would make a quit
+        during a slow decode look like a hang. A live decoder holds no lock at
+        all — the streaming path deliberately takes none — so it has to be
+        asked about by name: past the quit budget its thread was abandoned, and
+        it is still inside ``engine.stream()``. Calling ``unload()`` there
+        frees the model under native code that is reading it, which is a crash
+        rather than an exception.
+
+        Either way the memory goes with the exiting process a moment later, so
+        the model is simply left to it. Leaking at exit is not a bug; crashing
+        on the way out is.
         """
         engine, self.engine = self.engine, None
         if engine is None:
+            return
+        if self._stream_worker_alive():
+            logger.info("A live decoder still holds the engine; leaving the model to exit")
             return
         if not self._engine_lock.acquire(blocking=False):
             logger.info("The engine is busy; leaving it to the exiting process")

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from cleanup.llama_server import CLEANUP_MODEL_ID
 from engines.factory import DEFAULT_CLOUD_BASE_URL
 from services.usage_service import USAGE_DEFAULTS
+from services import persistence_service
 from services.persistence_service import (
     CLEANUP_ENABLED_KEY,
     CLOUD_MODE_MURMUR,
@@ -301,6 +302,27 @@ class PersistenceServiceTests(unittest.TestCase):
             self.assertTrue(merged["onboarding_completed"])
             self.assertEqual(merged["language"], DEFAULT_CONFIG["language"])
             self.assertEqual(set(merged), set(DEFAULT_CONFIG))
+
+    def test_update_config_deletes_the_keys_it_is_told_to_remove(self):
+        """A merge cannot express "this key should stop existing", so deletion
+        is asked for by name and applied under the same lock as the merge."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self._service(tmp_dir)
+            service.update_config({"language": "fr", "scratch_notes": ["a"]})
+
+            merged = service.update_config({"language": "nl"}, remove=("scratch_notes",))
+
+            self.assertNotIn("scratch_notes", merged)
+            self.assertNotIn("scratch_notes", service.load_config(dict(DEFAULT_CONFIG)))
+            self.assertEqual(merged["language"], "nl")
+
+    def test_update_config_ignores_a_removal_of_a_key_that_is_not_there(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self._service(tmp_dir)
+
+            merged = service.update_config({"language": "fr"}, remove=("never_written",))
+
+            self.assertEqual(merged["language"], "fr")
 
     def test_add_history_entry_keeps_latest_100(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -873,6 +895,52 @@ class DeleteAllDataTests(unittest.TestCase):
             self.assertEqual(reloaded["engine_id"], "voxtral_mlx")
             self.assertEqual(reloaded["model_id"], "voxtral-4bit")
             self.assertEqual(reloaded["vocabulary_terms"], [])
+
+    def test_delete_all_data_removes_a_key_that_has_no_default(self):
+        """``USER_CONTENT_CONFIG_KEYS`` may name a key owned by a feature that
+        documents no default of its own. Those are dropped rather than reset —
+        and the drop has to reach the file. It used to be applied to the
+        caller's dict alone while the key was still reported as removed, so the
+        summary said one thing and the config on disk said another."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_dir = Path(tmp_dir) / "audio"
+            audio_dir.mkdir()
+            service = _service(tmp_dir)
+            config = self._seeded_config()
+            config["scratch_notes"] = ["something the user said"]
+            service.update_config(config)
+
+            with patch.object(
+                persistence_service,
+                "USER_CONTENT_CONFIG_KEYS",
+                (*USER_CONTENT_CONFIG_KEYS, "scratch_notes"),
+            ):
+                summary = service.delete_all_data(str(audio_dir), config, legacy_paths=())
+
+            reloaded = service.load_config(dict(DEFAULT_CONFIG))
+            self.assertNotIn("scratch_notes", reloaded)
+            self.assertNotIn("scratch_notes", config)
+            self.assertIn("scratch_notes", summary.config_keys)
+            # And the preferences beside it are still there.
+            self.assertEqual(reloaded["engine_id"], "whispercpp")
+
+    def test_delete_all_data_removes_a_defaultless_key_on_its_own(self):
+        """The same, with nothing else to write: the removal must not depend on
+        another key happening to need a reset in the same pass."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_dir = Path(tmp_dir) / "audio"
+            audio_dir.mkdir()
+            service = _service(tmp_dir)
+            config = {**DEFAULT_CONFIG, "scratch_notes": ["said out loud"]}
+            service.update_config(config)
+
+            with patch.object(
+                persistence_service, "USER_CONTENT_CONFIG_KEYS", ("scratch_notes",)
+            ):
+                summary = service.delete_all_data(str(audio_dir), config, legacy_paths=())
+
+            self.assertNotIn("scratch_notes", service.load_config(dict(DEFAULT_CONFIG)))
+            self.assertEqual(summary.config_keys, ("scratch_notes",))
 
     def test_delete_all_data_without_config_only_touches_files(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

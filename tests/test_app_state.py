@@ -634,6 +634,7 @@ class ReloadHotkeyTests(unittest.TestCase):
             app, mode
         )
         app.reload_hotkey = lambda **kwargs: MurmurApp.reload_hotkey(app, **kwargs)
+        app._on_application_active = lambda: MurmurApp._on_application_active(app)
         return app
 
     def _registration(self, *, key_up_available=True):
@@ -674,7 +675,14 @@ class ReloadHotkeyTests(unittest.TestCase):
 
     def test_a_degraded_shortcut_is_registered_again_once_accessibility_lands(self):
         """What Enable Shortcut Permission… is for: the binding has not moved,
-        but the registration is missing the key-up that ``auto`` needs."""
+        but the registration is missing the key-up that ``auto`` needs.
+
+        The upgrade has to arrive through the production trigger — the user
+        granting Accessibility and coming back to Murmur — and not through a
+        hand-called ``reload_hotkey``. ``_on_application_active`` used to skip
+        every registration it already had, so a Carbon-only shortcut stayed
+        stuck on toggle until the next launch.
+        """
         app = self._app()
         registrations = [
             self._registration(key_up_available=False),
@@ -685,9 +693,32 @@ class ReloadHotkeyTests(unittest.TestCase):
         ) as register:
             with patch("app.lifecycle.unregister_global_hotkey"):
                 with patch("app.lifecycle.rumps.notification"):
-                    app.reload_hotkey()
-                    app.reload_hotkey()
+                    with patch("app.lifecycle.hotkey_permissions_ok", return_value=True):
+                        app.reload_hotkey()  # launch: Carbon, no key-up
+                        app._on_application_active()  # the grant lands
         self.assertEqual(register.call_count, 2)
+
+    def test_returning_to_murmur_leaves_a_working_shortcut_alone(self):
+        """The other half of the same guard: activation happens constantly, and
+        re-registering a healthy shortcut costs a duplicate Carbon hotkey and a
+        press controller reset under a key that may be held down."""
+        app = self._app()
+        with patch(
+            "app.lifecycle.register_global_hotkey", return_value=self._registration()
+        ) as register:
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                with patch("app.lifecycle.hotkey_permissions_ok", return_value=True):
+                    app.reload_hotkey()
+                    app._on_application_active()
+                    app._on_application_active()
+        self.assertEqual(register.call_count, 1)
+
+    def test_returning_without_the_permission_registers_nothing(self):
+        app = self._app()
+        with patch("app.lifecycle.register_global_hotkey") as register:
+            with patch("app.lifecycle.hotkey_permissions_ok", return_value=False):
+                app._on_application_active()
+        self.assertFalse(register.called)
 
 
 class WizardCaptureInterlockTests(unittest.TestCase):
@@ -807,9 +838,10 @@ class QuitTeardownTests(unittest.TestCase):
 
         app.cleanup_runtime = SimpleNamespace(stop=step("stop_cleanup_runtime"))
         app.pill = SimpleNamespace(close=step("close_pill"))
-        app._cancel_stream_workers_for_quit = lambda started: (
+        app._stream_worker_alive = lambda: MurmurApp._stream_worker_alive(app)
+        app._cancel_stream_workers_for_quit = lambda budget_s: (
             seen.append("cancel_stream_workers"),
-            MurmurApp._cancel_stream_workers_for_quit(app, started),
+            MurmurApp._cancel_stream_workers_for_quit(app, budget_s),
         )
         app._unload_engine_for_quit = lambda: (
             seen.append("unload_engine"),
@@ -881,6 +913,127 @@ class QuitTeardownTests(unittest.TestCase):
         finally:
             forever.set()
             worker.join(1.0)
+
+    def test_an_abandoned_decoder_stays_on_the_books(self):
+        """The cancel step used to empty ``_stream_workers`` whether or not the
+        workers had stopped, so the unload step that follows it could no longer
+        tell that one was still inside ``engine.stream()``."""
+        forever = threading.Event()
+        worker = threading.Thread(target=forever.wait, daemon=True)
+        worker.start()
+        try:
+            app, _ = self._app(seen=[])
+            app._stream_workers = [worker]
+            # Budget already spent: nothing is joined, everything is abandoned.
+            MurmurApp._cancel_stream_workers_for_quit(app, 0.0)
+            self.assertTrue(app._stream_worker_alive())
+        finally:
+            forever.set()
+            worker.join(1.0)
+
+    def test_the_model_is_not_unloaded_under_an_abandoned_decoder(self):
+        """Past the budget a decoder is abandoned, not stopped — it is still
+        reading the model. ``unload()`` there is a crash in native code;
+        leaking a model the exiting process is about to free is not."""
+        unloaded = []
+        engine = SimpleNamespace(unload=lambda: unloaded.append(True))
+        app, _ = self._app(seen=[], engine=engine)
+        app._stream_worker_alive = lambda: True
+        MurmurApp._unload_engine_for_quit(app)
+        self.assertEqual(unloaded, [])
+        self.assertIsNone(app.engine)
+
+    def test_an_idle_engine_is_still_unloaded(self):
+        unloaded = []
+        engine = SimpleNamespace(unload=lambda: unloaded.append(True))
+        app, _ = self._app(seen=[], engine=engine)
+        app._stream_worker_alive = lambda: False
+        MurmurApp._unload_engine_for_quit(app)
+        self.assertEqual(unloaded, [True])
+
+    def test_a_quit_before_the_app_finished_starting_still_quits(self):
+        """The steps table bound ``self.cleanup_runtime.stop`` and
+        ``self.pill.close`` eagerly, so a quit before ``__init__`` had made
+        either of them raised ``AttributeError`` while the table was being
+        built — before ``rumps.quit_application()``. The menu's Quit did
+        nothing at all."""
+        seen = []
+        app, _ = self._app(seen=seen)
+        del app.cleanup_runtime
+        del app.pill
+        with patch("app.lifecycle.rumps.quit_application") as quit_application:
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                MurmurApp.quit_app(app, None)
+        self.assertTrue(quit_application.called)
+        # The steps that could run, ran.
+        self.assertIn("cancel_stream_workers", seen)
+        self.assertIn("unregister_hotkey", seen)
+
+    def test_the_blocking_step_is_handed_what_is_left_of_the_budget(self):
+        budgets = []
+        app, _ = self._app(seen=[])
+        app._cancel_stream_workers_for_quit = lambda budget_s: budgets.append(budget_s)
+        with patch("app.lifecycle.rumps.quit_application"):
+            with patch("app.lifecycle.unregister_global_hotkey"):
+                MurmurApp.quit_app(app, None)
+        self.assertEqual(len(budgets), 1)
+        self.assertGreater(budgets[0], 0.0)
+        self.assertLessEqual(budgets[0], QUIT_BUDGET_S)
+
+
+class StreamingCapabilityTests(unittest.TestCase):
+    """``start_recording`` asks the engine whether it can stream — defensively.
+
+    The capability is read off the engine object rather than its id, and the
+    read has to survive an engine that predates the attribute: raising here
+    happens *before* the microphone is opened, so it costs the whole recording
+    rather than just the live pill.
+    """
+
+    def _app(self, engine, *, pill_enabled=True):
+        opened = []
+        pill = SimpleNamespace(listening=lambda: opened.append("listening"))
+        app = SimpleNamespace(
+            engine=engine,
+            pill=pill,
+            is_recording=False,
+            recording_start_time=0.0,
+            _stream_thread=object(),
+            runtime_config=lambda: {"pill_enabled": pill_enabled},
+            _set_menu_bar_state=lambda state: opened.append(f"state:{state}"),
+            start_stop_item=SimpleNamespace(title=""),
+            upload_item=SimpleNamespace(set_callback=lambda callback: None),
+            audio_capture=SimpleNamespace(
+                enable_streaming=lambda enabled: opened.append(f"streaming:{enabled}"),
+                start=lambda: opened.append("start"),
+            ),
+        )
+        app._active_pill = lambda config=None: MurmurApp._active_pill(app, config)
+        app._start_stream_worker = lambda pill_, language=None, hints=None: opened.append(
+            "worker"
+        )
+        return app, opened
+
+    def test_an_engine_without_the_attribute_still_opens_the_microphone(self):
+        app, opened = self._app(SimpleNamespace(is_loaded=True))
+        MurmurApp.start_recording(app)
+        self.assertIn("streaming:False", opened)
+        self.assertIn("start", opened)
+        self.assertNotIn("worker", opened)
+        self.assertTrue(app.is_recording)
+
+    def test_an_engine_that_says_no_gets_no_live_decode(self):
+        app, opened = self._app(SimpleNamespace(is_loaded=True, supports_streaming=False))
+        MurmurApp.start_recording(app)
+        self.assertIn("streaming:False", opened)
+        self.assertNotIn("worker", opened)
+
+    def test_an_engine_that_says_yes_gets_one(self):
+        app, opened = self._app(SimpleNamespace(is_loaded=True, supports_streaming=True))
+        with patch("app.pipeline.front_app_bundle_id", return_value=None):
+            MurmurApp.start_recording(app)
+        self.assertIn("streaming:True", opened)
+        self.assertIn("worker", opened)
 
 
 class AboutAndUpdateCopyTests(unittest.TestCase):
