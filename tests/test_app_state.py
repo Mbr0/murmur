@@ -1,7 +1,29 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from murmur import (
+    APP_CATALOG,
+    CLEANUP_MODEL_MISSING_REASON,
+    CLEANUP_OFF_DISABLED,
+    CLEANUP_OFF_PASSTHROUGH,
+    CLEANUP_OFF_PRO,
+    CLEANUP_PREPARING_STATUS,
+    CLEANUP_START_FAILED_REASON,
+    CLEANUP_UNSTABLE_REASON,
+    MODE_MENU_AUTOMATIC,
+    PRO_OVERRIDE_KEY,
+    CleanupPlan,
+    CleanupRuntime,
+    cleanup_model_missing_message,
+    cleanup_plan,
+    cleanup_skipped_message,
+    code_transform_language,
+    mode_menu_state,
+    pro_enabled,
+    prompt_language,
+    run_cleanup,
+    tone_menu_state,
     MISSING_MODEL_ONBOARDING,
     MISSING_MODEL_SETTINGS,
     NO_MODEL_STATUS,
@@ -37,7 +59,12 @@ from murmur import (
     update_relaunch_failed_message,
     verify_model_before_load,
 )
-from engines.model_store import ModelIntegrityError
+from cleanup.context import AppContext
+from cleanup.llama_server import CLEANUP_MODEL_SPEC, CleanupResult, LlamaServerError
+from cleanup.modes import MODE_IDS, TONE_IDS
+from cleanup.vocabulary import vocabulary_from_config
+from engines.model_store import CATALOG, ModelIntegrityError
+from services.persistence_service import DEFAULT_CONFIG
 from services.hotkey_service import (
     ACTION_START,
     ACTION_STOP,
@@ -528,6 +555,581 @@ class VerifyModelBeforeLoadTests(unittest.TestCase):
         message = model_integrity_message("Whisper large-v3-turbo")
         self.assertIn("Whisper large-v3-turbo", message)
         self.assertIn("Settings", message)
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: the cleanup pipeline
+# ---------------------------------------------------------------------------
+
+
+def _context(bundle_id=None):
+    return AppContext(
+        bundle_id=bundle_id, app_name=None, window_title=None, selected_text=None
+    )
+
+
+def _config(**overrides):
+    """A config that has cleanup fully switched on, minus the overrides."""
+    base = {
+        **DEFAULT_CONFIG,
+        PRO_OVERRIDE_KEY: True,
+        "cleanup_enabled": True,
+        "context_awareness": False,
+    }
+    base.update(overrides)
+    return base
+
+
+class ProGateTests(unittest.TestCase):
+    """One gate, one place. Wave 4 swaps the body; the call sites do not move."""
+
+    def test_off_by_default(self):
+        self.assertFalse(pro_enabled("cleanup", dict(DEFAULT_CONFIG)))
+
+    def test_the_dev_override_unlocks_every_feature(self):
+        config = {PRO_OVERRIDE_KEY: True}
+        self.assertTrue(pro_enabled("cleanup", config))
+        self.assertTrue(pro_enabled("coding_mode", config))
+
+    def test_an_unnamed_feature_is_a_programming_error(self):
+        with self.assertRaises(AssertionError):
+            pro_enabled("", {})
+
+    def test_the_override_is_not_a_user_facing_default(self):
+        # It must never appear in a user's config file.
+        self.assertNotIn(PRO_OVERRIDE_KEY, DEFAULT_CONFIG)
+
+
+class LanguageNormalisationTests(unittest.TestCase):
+    def test_auto_becomes_none_for_the_prompt(self):
+        self.assertIsNone(prompt_language("auto"))
+        self.assertIsNone(prompt_language(None))
+        self.assertIsNone(prompt_language(""))
+        self.assertIsNone(prompt_language("  AUTO "))
+
+    def test_a_real_language_is_passed_through(self):
+        self.assertEqual(prompt_language("fr"), "fr")
+        self.assertEqual(prompt_language(" nl "), "nl")
+
+    def test_the_code_transform_falls_back_to_english(self):
+        self.assertEqual(code_transform_language("auto"), "en")
+        self.assertEqual(code_transform_language(None), "en")
+        self.assertEqual(code_transform_language("en"), "en")
+        self.assertEqual(code_transform_language("fr"), "fr")
+        self.assertEqual(code_transform_language("fr-CA"), "fr")
+
+    def test_an_unsupported_language_never_reaches_the_transform(self):
+        # transform_spoken_code raises on anything but en/fr, and losing a
+        # transcript to that would be absurd.
+        self.assertEqual(code_transform_language("de"), "en")
+        self.assertEqual(code_transform_language("nl"), "en")
+
+
+class CleanupPlanTests(unittest.TestCase):
+    def test_all_three_gates_open(self):
+        plan = cleanup_plan(_config(cleanup_mode="message"), _context())
+
+        self.assertTrue(plan.enabled)
+        self.assertEqual(plan.mode_id, "message")
+        self.assertEqual(plan.tone_id, "neutral")
+        self.assertIsNone(plan.reason)
+
+    def test_without_pro_nothing_runs(self):
+        plan = cleanup_plan(
+            _config(cleanup_mode="message", **{PRO_OVERRIDE_KEY: False}), _context()
+        )
+
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.reason, CLEANUP_OFF_PRO)
+
+    def test_the_user_switch_is_honoured(self):
+        plan = cleanup_plan(
+            _config(cleanup_mode="message", cleanup_enabled=False), _context()
+        )
+
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.reason, CLEANUP_OFF_DISABLED)
+
+    def test_an_undecided_switch_asks_the_machine_and_is_not_assumed_on(self):
+        config = _config(cleanup_mode="message", cleanup_enabled=None)
+        with patch(
+            "cleanup.llama_server.cleanup_default_for_current_machine", return_value=False
+        ):
+            plan = cleanup_plan(config, _context())
+
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.reason, CLEANUP_OFF_DISABLED)
+
+    def test_dictation_is_verbatim_by_definition(self):
+        plan = cleanup_plan(_config(cleanup_mode="dictation"), _context())
+
+        self.assertFalse(plan.enabled)
+        self.assertEqual(plan.reason, CLEANUP_OFF_PASSTHROUGH)
+
+    def test_the_front_app_picks_the_mode_when_context_is_on(self):
+        plan = cleanup_plan(
+            _config(cleanup_mode="dictation", context_awareness=True),
+            _context("com.apple.mail"),
+        )
+
+        self.assertEqual(plan.mode_id, "mail")
+        self.assertTrue(plan.enabled)
+
+    def test_a_per_app_override_beats_the_table(self):
+        plan = cleanup_plan(
+            _config(
+                cleanup_mode="dictation",
+                context_awareness=True,
+                mode_by_app={"com.apple.mail": "notes"},
+            ),
+            _context("com.apple.mail"),
+        )
+
+        self.assertEqual(plan.mode_id, "notes")
+
+    def test_the_tone_comes_from_config(self):
+        plan = cleanup_plan(_config(cleanup_mode="mail", cleanup_tone="formal"), _context())
+        self.assertEqual(plan.tone_id, "formal")
+
+
+class _RecordingCleanup:
+    """Stands in for ``CleanupRuntime.cleanup``; records what it was asked."""
+
+    def __init__(self, result=None):
+        self.calls = []
+        self._result = result
+
+    def __call__(self, text, system_prompt):
+        self.calls.append((text, system_prompt))
+        if self._result is None:
+            return CleanupResult(text=f"cleaned: {text}", elapsed_s=0.5)
+        return self._result
+
+
+class RunCleanupTests(unittest.TestCase):
+    def test_a_disabled_plan_never_calls_the_model(self):
+        call = _RecordingCleanup()
+        plan = CleanupPlan("dictation", "neutral", False, CLEANUP_OFF_PASSTHROUGH)
+
+        outcome = run_cleanup("hello there", plan, cleanup=call)
+
+        self.assertEqual(outcome.text, "hello there")
+        self.assertFalse(outcome.ran)
+        self.assertIsNone(outcome.skipped_reason)
+        self.assertEqual(call.calls, [])
+
+    def test_the_cleaned_text_replaces_the_transcript(self):
+        call = _RecordingCleanup()
+        plan = CleanupPlan("message", "warm", True)
+
+        outcome = run_cleanup("um so like hello", plan, cleanup=call)
+
+        self.assertEqual(outcome.text, "cleaned: um so like hello")
+        self.assertTrue(outcome.ran)
+        self.assertEqual(outcome.elapsed_s, 0.5)
+
+    def test_the_prompt_carries_mode_tone_language_and_vocabulary(self):
+        rendered = []
+
+        def render(mode, tone, language, vocabulary):
+            rendered.append((mode, tone, language, vocabulary))
+            return "SYSTEM"
+
+        call = _RecordingCleanup()
+        run_cleanup(
+            "hello",
+            CleanupPlan("mail", "formal", True),
+            cleanup=call,
+            language="fr",
+            vocabulary_terms=("Murmur", "Boske"),
+            render=render,
+        )
+
+        self.assertEqual(rendered, [("mail", "formal", "fr", ("Murmur", "Boske"))])
+        self.assertEqual(call.calls[0][1], "SYSTEM")
+
+    def test_auto_reaches_the_prompt_as_none(self):
+        rendered = []
+        run_cleanup(
+            "hello",
+            CleanupPlan("notes", "neutral", True),
+            cleanup=_RecordingCleanup(),
+            language="auto",
+            render=lambda *args: rendered.append(args) or "SYSTEM",
+        )
+
+        self.assertIsNone(rendered[0][2])
+
+    def test_code_mode_runs_the_rule_pass_before_the_model(self):
+        order = []
+        call = _RecordingCleanup()
+
+        def transform(text, *, language):
+            order.append(("transform", text, language))
+            return "git commit --force"
+
+        run_cleanup(
+            "git commit dash dash force",
+            CleanupPlan("code", "terse", True),
+            cleanup=call,
+            language="auto",
+            transform_code=transform,
+            render=lambda *args: "SYSTEM",
+        )
+
+        self.assertEqual(order[0][1], "git commit dash dash force")
+        self.assertEqual(order[0][2], "en")
+        # The model sees real code tokens, not the words for them.
+        self.assertEqual(call.calls[0][0], "git commit --force")
+
+    def test_other_modes_leave_the_words_alone(self):
+        def transform(text, *, language):
+            raise AssertionError("only code mode transforms spoken punctuation")
+
+        run_cleanup(
+            "open paren",
+            CleanupPlan("message", "neutral", True),
+            cleanup=_RecordingCleanup(),
+            transform_code=transform,
+            render=lambda *args: "SYSTEM",
+        )
+
+    def test_a_skipped_result_keeps_the_transcript_and_carries_the_reason(self):
+        call = _RecordingCleanup(
+            CleanupResult(text="original", skipped=True, reason="timed out after 3s")
+        )
+
+        outcome = run_cleanup(
+            "original", CleanupPlan("message", "neutral", True), cleanup=call
+        )
+
+        self.assertEqual(outcome.text, "original")
+        self.assertFalse(outcome.ran)
+        self.assertEqual(outcome.skipped_reason, "timed out after 3s")
+
+    def test_a_skip_after_the_code_pass_keeps_the_transformed_text(self):
+        call = _RecordingCleanup(
+            CleanupResult(text="ignored", skipped=True, reason="unreachable")
+        )
+
+        outcome = run_cleanup(
+            "git commit dash dash force",
+            CleanupPlan("code", "neutral", True),
+            cleanup=call,
+            transform_code=lambda text, *, language: "git commit --force",
+            render=lambda *args: "SYSTEM",
+        )
+
+        # The rule pass is deterministic and already correct; a model that did
+        # not answer must not undo it.
+        self.assertEqual(outcome.text, "git commit --force")
+        self.assertEqual(outcome.skipped_reason, "unreachable")
+
+    def test_a_reasonless_skip_still_says_something(self):
+        call = _RecordingCleanup(CleanupResult(text="original", skipped=True))
+
+        outcome = run_cleanup(
+            "original", CleanupPlan("mail", "neutral", True), cleanup=call
+        )
+
+        self.assertTrue(outcome.skipped_reason)
+
+    def test_the_notice_names_the_reason_and_reassures(self):
+        message = cleanup_skipped_message("timed out after 3s")
+        self.assertIn("timed out after 3s", message)
+        self.assertIn("unchanged", message)
+
+
+class PipelineOrderTests(unittest.TestCase):
+    """Hallucination filter, then replacements, then cleanup, then paste."""
+
+    def test_the_filter_reads_the_engine_words_and_cleanup_reads_the_replacements(self):
+        seen = []
+        vocabulary = vocabulary_from_config(
+            {
+                "vocabulary_replacements": [
+                    {"from": "murmer", "to": "Murmur", "match_case": False}
+                ]
+            }
+        )
+
+        def detect(text):
+            seen.append(("filter", text))
+            return False
+
+        text, hallucination = finalize_transcript(
+            "murmer is running", vocabulary, detect_hallucination=detect
+        )
+        self.assertEqual(seen, [("filter", "murmer is running")])
+        self.assertEqual(text, "Murmur is running")
+        self.assertFalse(hallucination)
+
+        call = _RecordingCleanup()
+        outcome = run_cleanup(
+            text, CleanupPlan("message", "neutral", True), cleanup=call
+        )
+
+        # Cleanup receives the corrected term, so the model never "fixes" a
+        # replacement the user asked for.
+        self.assertEqual(call.calls[0][0], "Murmur is running")
+        self.assertEqual(outcome.text, "cleaned: Murmur is running")
+
+    def test_a_hallucination_never_reaches_cleanup(self):
+        text, hallucination = finalize_transcript(
+            "Thank you", vocabulary_from_config({})
+        )
+        self.assertTrue(hallucination)
+        # The app's branch is `if text and not is_hallucination`, so cleanup is
+        # simply not called; asserted here as the contract the wiring relies on.
+        self.assertEqual(text, "Thank you")
+
+
+class ModeAndToneMenuTests(unittest.TestCase):
+    def test_the_configured_mode_is_the_ticked_one(self):
+        state = mode_menu_state(_config(cleanup_mode="notes"))
+
+        self.assertTrue(state["notes"])
+        self.assertEqual([mode for mode in MODE_IDS if state[mode]], ["notes"])
+
+    def test_every_mode_has_an_entry(self):
+        state = mode_menu_state(_config())
+        for mode_id in MODE_IDS:
+            self.assertIn(mode_id, state)
+
+    def test_automatic_reflects_context_awareness(self):
+        self.assertTrue(
+            mode_menu_state(_config(context_awareness=True))[MODE_MENU_AUTOMATIC]
+        )
+        self.assertFalse(
+            mode_menu_state(_config(context_awareness=False))[MODE_MENU_AUTOMATIC]
+        )
+
+    def test_automatic_and_a_mode_can_both_be_ticked(self):
+        # The table decides per app; the ticked mode covers everywhere else.
+        state = mode_menu_state(_config(cleanup_mode="mail", context_awareness=True))
+        self.assertTrue(state["mail"])
+        self.assertTrue(state[MODE_MENU_AUTOMATIC])
+
+    def test_the_default_config_ticks_dictation_and_automatic(self):
+        state = mode_menu_state(dict(DEFAULT_CONFIG))
+        self.assertTrue(state["dictation"])
+        self.assertTrue(state[MODE_MENU_AUTOMATIC])
+
+    def test_exactly_one_tone_is_ticked(self):
+        state = tone_menu_state(_config(cleanup_tone="terse"))
+        self.assertEqual([tone for tone in TONE_IDS if state[tone]], ["terse"])
+
+    def test_an_unknown_tone_falls_back_to_the_default(self):
+        state = tone_menu_state(_config(cleanup_tone="sarcastic"))
+        self.assertEqual([tone for tone in TONE_IDS if state[tone]], ["neutral"])
+
+
+class FakeLlamaServer:
+    """A llama-server whose life is scripted by the test."""
+
+    def __init__(self, model_path, *, start_error=None):
+        self.model_path = model_path
+        self.starts = 0
+        self.stops = 0
+        self.alive = False
+        self.start_error = start_error
+
+    def start(self):
+        self.starts += 1
+        if self.start_error is not None:
+            raise self.start_error
+        self.alive = True
+
+    def stop(self):
+        self.stops += 1
+        self.alive = False
+
+    @property
+    def is_running(self):
+        return self.alive
+
+    def die(self):
+        """The child was killed under us (an OOM kill on an 8 GB Mac)."""
+        self.alive = False
+
+
+class FakeCleanupClient:
+    def __init__(self, server, replies=None):
+        self.server = server
+        self.calls = []
+        self._replies = list(replies or [])
+
+    def cleanup(self, text, system_prompt):
+        self.calls.append(text)
+        if not self.server.is_running:
+            raise LlamaServerError("llama-server exited (code 137)")
+        if self._replies:
+            return self._replies.pop(0)
+        return CleanupResult(text=f"cleaned: {text}")
+
+
+class _RuntimeFixture:
+    """A CleanupRuntime over fake factories, plus what they produced."""
+
+    def __init__(self, model_path="/models/cleanup.gguf", start_errors=(), replies=None):
+        self.servers = []
+        self.clients = []
+        self.statuses = []
+        self._start_errors = list(start_errors)
+        self._replies = replies
+        self.model_path = model_path
+        self.runtime = CleanupRuntime(
+            lambda: self.model_path,
+            server_factory=self._server,
+            client_factory=self._client,
+            on_status=self.statuses.append,
+        )
+
+    def _server(self, model_path):
+        error = self._start_errors.pop(0) if self._start_errors else None
+        server = FakeLlamaServer(model_path, start_error=error)
+        self.servers.append(server)
+        return server
+
+    def _client(self, server):
+        client = FakeCleanupClient(server, replies=self._replies)
+        self.clients.append(client)
+        return client
+
+
+class CleanupRuntimeTests(unittest.TestCase):
+    def test_nothing_starts_until_the_first_request(self):
+        fixture = _RuntimeFixture()
+
+        self.assertFalse(fixture.runtime.is_started)
+        self.assertEqual(fixture.servers, [])
+
+    def test_the_first_request_starts_the_server_and_says_so(self):
+        fixture = _RuntimeFixture()
+
+        result = fixture.runtime.cleanup("hello", "SYSTEM")
+
+        self.assertEqual(result.text, "cleaned: hello")
+        self.assertEqual(len(fixture.servers), 1)
+        self.assertEqual(fixture.servers[0].starts, 1)
+        self.assertEqual(fixture.servers[0].model_path, "/models/cleanup.gguf")
+        self.assertEqual(fixture.statuses, [CLEANUP_PREPARING_STATUS])
+
+    def test_the_server_is_kept_for_the_session(self):
+        fixture = _RuntimeFixture()
+
+        fixture.runtime.cleanup("one", "SYSTEM")
+        fixture.runtime.cleanup("two", "SYSTEM")
+
+        self.assertEqual(len(fixture.servers), 1)
+        self.assertEqual(fixture.statuses, [CLEANUP_PREPARING_STATUS])
+        self.assertEqual(fixture.clients[0].calls, ["one", "two"])
+
+    def test_a_missing_model_skips_visibly_and_starts_nothing(self):
+        fixture = _RuntimeFixture()
+        fixture.model_path = None
+
+        result = fixture.runtime.cleanup("hello", "SYSTEM")
+
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.reason, CLEANUP_MODEL_MISSING_REASON)
+        self.assertEqual(result.text, "hello")  # the transcript survives
+        self.assertEqual(fixture.servers, [])
+
+    def test_a_crashed_child_is_replaced_and_the_request_retried(self):
+        fixture = _RuntimeFixture()
+        fixture.runtime.cleanup("one", "SYSTEM")
+        fixture.servers[0].die()
+
+        result = fixture.runtime.cleanup("two", "SYSTEM")
+
+        self.assertEqual(result.text, "cleaned: two")
+        self.assertEqual(len(fixture.servers), 2)
+        self.assertEqual(fixture.servers[0].stops, 1)  # the corpse was reaped
+        self.assertEqual(fixture.servers[1].starts, 1)
+
+    def test_a_server_that_will_not_start_skips_rather_than_raising(self):
+        fixture = _RuntimeFixture(start_errors=[LlamaServerError("no binary")])
+
+        result = fixture.runtime.cleanup("hello", "SYSTEM")
+
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.reason, CLEANUP_START_FAILED_REASON)
+        self.assertEqual(result.text, "hello")
+        self.assertFalse(fixture.runtime.is_started)
+
+    def test_a_server_that_keeps_dying_gives_up_after_one_retry(self):
+        fixture = _RuntimeFixture()
+        # Every client call finds a dead server: start, die, retry, die.
+        original = FakeLlamaServer.start
+
+        def start_then_die(server):
+            original(server)
+            server.alive = False
+
+        with patch.object(FakeLlamaServer, "start", start_then_die):
+            result = fixture.runtime.cleanup("hello", "SYSTEM")
+
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.reason, CLEANUP_UNSTABLE_REASON)
+        self.assertEqual(result.text, "hello")
+        self.assertEqual(len(fixture.servers), 2)  # one restart, not a loop
+
+    def test_stop_shuts_the_child_down_and_is_idempotent(self):
+        fixture = _RuntimeFixture()
+        fixture.runtime.cleanup("hello", "SYSTEM")
+
+        fixture.runtime.stop()
+        fixture.runtime.stop()
+
+        self.assertEqual(fixture.servers[0].stops, 1)
+        self.assertFalse(fixture.runtime.is_started)
+
+    def test_stop_before_anything_started_is_harmless(self):
+        fixture = _RuntimeFixture()
+        fixture.runtime.stop()
+        self.assertEqual(fixture.servers, [])
+
+    def test_a_stop_failure_still_forgets_the_server(self):
+        fixture = _RuntimeFixture()
+        fixture.runtime.cleanup("hello", "SYSTEM")
+
+        def explode():
+            raise OSError("terminate failed")
+
+        fixture.servers[0].stop = explode
+        fixture.runtime.stop()
+
+        self.assertFalse(fixture.runtime.is_started)
+
+    def test_a_timeout_from_the_client_is_not_a_restart(self):
+        fixture = _RuntimeFixture(
+            replies=[CleanupResult(text="hello", skipped=True, reason="timed out after 3s")]
+        )
+
+        result = fixture.runtime.cleanup("hello", "SYSTEM")
+
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.reason, "timed out after 3s")
+        self.assertEqual(len(fixture.servers), 1)
+
+    def test_the_download_offer_names_the_model_and_reassures(self):
+        message = cleanup_model_missing_message("Ministral 3 3B Instruct")
+        self.assertIn("Ministral 3 3B Instruct", message)
+        self.assertIn("pasted", message)
+
+
+class AppCatalogTests(unittest.TestCase):
+    def test_the_store_carries_the_speech_models_and_the_cleanup_model(self):
+        ids = [spec.id for spec in APP_CATALOG]
+
+        self.assertIn(CLEANUP_MODEL_SPEC.id, ids)
+        for spec in CATALOG:
+            self.assertIn(spec.id, ids)
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_the_speech_catalog_itself_stays_speech_only(self):
+        self.assertNotIn(CLEANUP_MODEL_SPEC.id, [spec.id for spec in CATALOG])
 
 
 if __name__ == "__main__":

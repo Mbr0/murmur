@@ -21,6 +21,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from engines import ENGINE_IDS
 from engines.model_store import (
     DownloadCancelled,
     DownloadProgress,
@@ -434,7 +435,17 @@ class EngineSectionModel:
     # -- internals -------------------------------------------------------
 
     def _runs_here(self, spec: ModelSpec) -> bool:
-        """Voxtral is opt-in on eligible Apple Silicon (decision D1); everything else runs."""
+        """Which catalog entries this section may offer.
+
+        The store the app builds also carries the cleanup GGUF
+        (``cleanup.llama_server.CLEANUP_MODEL_SPEC``), which is not a speech
+        engine at all: offering it here would let a user "select" a chat model
+        as their transcriber. So the section lists only specs whose engine is a
+        registered speech engine, and Voxtral on top of that is opt-in on
+        eligible Apple Silicon (decision D1).
+        """
+        if spec.engine not in ENGINE_IDS:
+            return False
         if spec.engine == ENGINE_VOXTRAL_MLX:
             return voxtral_eligible(self._chip, self._ram_gb)
         return True

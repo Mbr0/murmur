@@ -7,14 +7,21 @@ every assertion is deterministic.
 
 import threading
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from cleanup.llama_server import CLEANUP_MODEL_SPEC
+from engines import ENGINE_IDS
 from engines.model_store import (
+    CATALOG,
     DownloadCancelled,
     DownloadProgress,
+    ModelStore,
     ModelStoreError,
     human_size,
     models_for_engine,
 )
+from services.model_profile_service import CHIP_APPLE_SILICON, VOXTRAL_MIN_RAM_GB
 from ui.download_sheet import (
     PHASE_CANCELLED,
     PHASE_DONE,
@@ -24,6 +31,7 @@ from ui.download_sheet import (
     PHASE_VERIFYING,
     DownloadController,
     DownloadSheetState,
+    EngineSectionModel,
 )
 
 GB = 1_000_000_000
@@ -269,6 +277,50 @@ class DownloadControllerTests(unittest.TestCase):
         self.assertTrue(finished.wait(timeout=5), "download thread never finished")
         self.assertEqual(controller.state.phase, PHASE_DONE)
         self.assertFalse(controller.is_running)
+
+
+class SpeechEngineFilterTests(unittest.TestCase):
+    """The section lists speech models only, never the cleanup GGUF.
+
+    The app composes one store out of ``engines.model_store.CATALOG`` plus
+    ``cleanup.llama_server.CLEANUP_MODEL_SPEC`` so both downloads share the same
+    resume, checksum and delete code. That store is also what Settings holds, so
+    without a filter the "Speech engine" popup would offer a chat model as a
+    transcriber.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _section(self, catalog):
+        store = ModelStore(root=Path(self._tmp.name), catalog=catalog)
+        return EngineSectionModel(
+            {},
+            store,
+            chip=CHIP_APPLE_SILICON,
+            ram_gb=VOXTRAL_MIN_RAM_GB,
+            default_engine="whispercpp",
+        )
+
+    def test_the_cleanup_model_is_not_a_speech_engine_choice(self):
+        section = self._section(CATALOG + (CLEANUP_MODEL_SPEC,))
+        offered = [choice.model_id for choice in section.choices]
+
+        self.assertNotIn(CLEANUP_MODEL_SPEC.id, offered)
+        self.assertEqual(offered, [spec.id for spec in CATALOG])
+        with self.assertRaises(AssertionError):
+            section.spec(CLEANUP_MODEL_SPEC.id)
+
+    def test_the_cleanup_model_engine_is_not_a_registered_engine(self):
+        # The filter is "is this a speech engine?", not a hard-coded model id.
+        self.assertNotIn(CLEANUP_MODEL_SPEC.engine, ENGINE_IDS)
+
+    def test_speech_models_are_unaffected(self):
+        self.assertEqual(
+            [choice.model_id for choice in self._section(CATALOG).choices],
+            [spec.id for spec in CATALOG],
+        )
 
 
 if __name__ == "__main__":

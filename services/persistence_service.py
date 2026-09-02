@@ -27,6 +27,28 @@ Config keys (defaults live in ``DEFAULT_CONFIG`` below):
 - ``onboarding_completed``, ``onboarding_version``: whether the first-run wizard
   has been finished, and which version of it (``ui/onboarding_window.py``).
 
+Wave 2 (the smart layer) adds:
+
+- ``cleanup_enabled``: whether the local cleanup pass runs at all. ``None`` in
+  the defaults means "not decided yet": the first load resolves it from
+  :func:`cleanup.llama_server.cleanup_default_for_current_machine` (off below
+  16 GB of RAM, per the plan's latency risk) and writes the answer back, so the
+  probe runs once per install and the file always states the real setting. See
+  :func:`resolve_cleanup_enabled`.
+- ``cleanup_mode``: ``"dictation" | "message" | "mail" | "notes" | "code"`` —
+  the fallback mode when the front app is not in the table (``cleanup/modes.py``).
+- ``cleanup_tone``: ``"neutral" | "warm" | "formal" | "terse"``.
+- ``mode_by_app``: ``{bundle_id: mode}`` user overrides, which always win over
+  the built-in table (``cleanup/context.py``).
+- ``context_awareness``: whether the built-in bundle-id → mode table applies.
+  Off means only ``mode_by_app`` and ``cleanup_mode`` decide.
+- ``include_selection``: whether the Accessibility selected-text probe runs when
+  capturing context. Off by default — no prompt consumes the selection yet, and
+  it is the most sensitive thing this app can read.
+- ``cleanup_model_id``: catalog id of the GGUF the cleanup server loads.
+- ``pill_enabled``: whether the floating pill is shown while dictating
+  (``ui/pill_window.py``).
+
 Writers that own only a few keys must go through :meth:`PersistenceService.update_config`
 rather than saving a whole config they loaded earlier: a snapshot save silently
 reverts every key another part of the app wrote in the meantime.
@@ -41,6 +63,8 @@ import os
 import shutil
 import threading
 from typing import Any
+
+from cleanup.llama_server import CLEANUP_MODEL_ID
 
 
 #: Serialises read-modify-write cycles on the config file. Module level rather
@@ -73,7 +97,44 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hints_notice_shown": {},
     "onboarding_completed": False,
     "onboarding_version": None,
+    # -- Wave 2: the smart layer ------------------------------------------
+    # None, not False: "nobody has decided yet". resolve_cleanup_enabled()
+    # turns it into a real bool on first load and the app stores that.
+    "cleanup_enabled": None,
+    "cleanup_mode": "dictation",
+    "cleanup_tone": "neutral",
+    "mode_by_app": {},
+    "context_awareness": True,
+    "include_selection": False,
+    "cleanup_model_id": CLEANUP_MODEL_ID,
+    "pill_enabled": True,
 }
+
+#: Key whose ``None`` means "ask the machine once"; see :func:`resolve_cleanup_enabled`.
+CLEANUP_ENABLED_KEY = "cleanup_enabled"
+
+
+def resolve_cleanup_enabled(config: dict[str, Any], *, probe: Any = None) -> bool:
+    """Whether cleanup is on, deciding it from this machine the first time.
+
+    A stored bool is the user's answer and is returned untouched, including an
+    explicit ``False``. Anything else (the ``None`` default, or a value some
+    older config never carried) means the question has not been asked yet, so
+    the RAM probe answers it — and the caller is expected to write the result
+    back, which is why this never guesses twice for the same install.
+
+    ``probe`` exists for the tests; the default is imported lazily so that
+    reading config on a machine without the cleanup runtime costs nothing.
+    """
+    assert config is not None, "config is required"
+    stored = config.get(CLEANUP_ENABLED_KEY)
+    if isinstance(stored, bool):
+        return stored
+    if probe is None:
+        from cleanup.llama_server import cleanup_default_for_current_machine
+
+        probe = cleanup_default_for_current_machine
+    return bool(probe())
 
 DEBUG_LOG_PATHS: tuple[str, ...] = (
     os.path.expanduser("~/Library/Logs/Murmur/murmur.log"),

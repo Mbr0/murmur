@@ -1,6 +1,6 @@
 # Murmur v2
 
-**Status:** ✅ approved 2026-09-02 · Wave 0 in PR #4 · Wave 1 next
+**Status:** ✅ approved 2026-09-02 · Waves 0–1 merged (PRs #4, #5) · Wave 2 wiring, Waves 3–4 modules in review
 **Plan:** [MASTER.md](./MASTER.md) · **Skill:** `@murmur-v2`
 **Study:** [`../2026-09-02-competitive-analysis/`](../2026-09-02-competitive-analysis/) (Part II is the source of this plan)
 
